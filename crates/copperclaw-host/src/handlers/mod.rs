@@ -30,6 +30,7 @@ pub mod destinations;
 pub mod dropped_messages;
 pub mod egress;
 pub mod groups;
+pub mod host_status;
 pub mod mcp;
 pub mod members;
 pub mod messaging_groups;

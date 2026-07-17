@@ -43,6 +43,10 @@ pub struct HandlerCtx {
     /// Data directory root for per-session file lookups (e.g. outbound.db
     /// paths used by the dead-letter replay handler).
     pub data_dir: std::path::PathBuf,
+    /// Live status of the M21 S1 background-loop supervisor, when this
+    /// process runs one (`copperclaw run` does; the fused test entry point
+    /// does not). Read by the `host.status` handler.
+    pub supervisor: Option<Arc<crate::supervisor::SupervisorStatus>>,
 }
 
 impl HandlerCtx {
@@ -57,6 +61,7 @@ impl HandlerCtx {
         Self {
             central,
             data_dir: std::path::PathBuf::from("data"),
+            supervisor: None,
         }
     }
 
@@ -64,7 +69,16 @@ impl HandlerCtx {
         Self {
             central,
             data_dir: data_dir.into(),
+            supervisor: None,
         }
+    }
+
+    /// Attach the background-loop supervisor's status view so the
+    /// `host.status` command can report per-loop liveness.
+    #[must_use]
+    pub fn with_supervisor(mut self, supervisor: Arc<crate::supervisor::SupervisorStatus>) -> Self {
+        self.supervisor = Some(supervisor);
+        self
     }
 }
 
@@ -192,6 +206,13 @@ impl CommandHandler for CallerFnHandler {
 
 /// In-memory mapping of dotted command names to their handler.
 pub type DispatchTable = HashMap<&'static str, Arc<dyn CommandHandler>>;
+
+/// Commands served by the host socket that are not (yet) in the cclaw
+/// client's [`copperclaw_cclaw::ALL_COMMANDS`] list. Kept explicit so the
+/// table / `ALL_COMMANDS` parity test still catches accidental drift in either
+/// direction. Currently only the M21 S1 supervisor status surface — O1
+/// (lane A) adds the client verb and moves it into `ALL_COMMANDS`.
+pub const HOST_LOCAL_COMMANDS: &[&str] = &["host.status"];
 
 /// Build the production dispatch table.
 #[allow(clippy::too_many_lines)] // Registration table; one line per command.
@@ -388,6 +409,12 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("budgets.set", handlers::budgets::set, true);
     ins!("usage.rollup", handlers::usage::rollup, false);
     ins!("schema.version", handlers::schema::version, false);
+
+    // M21 S1: per-loop liveness + restart counts from the background-loop
+    // supervisor. Read-only; requires the serving process to have attached
+    // a supervisor via `HandlerCtx::with_supervisor` (errors `unavailable`
+    // otherwise).
+    ins_ctx!("host.status", handlers::host_status::status, false);
 
     t
 }
@@ -800,10 +827,15 @@ pub async fn serve_listener(
     path: PathBuf,
     central: CentralDb,
     data_dir: PathBuf,
+    supervisor: Option<Arc<crate::supervisor::SupervisorStatus>>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let table = Arc::new(build_dispatch_table());
-    let ctx = Arc::new(HandlerCtx::with_data_dir(central, data_dir));
+    let mut ctx = HandlerCtx::with_data_dir(central, data_dir);
+    if let Some(sup) = supervisor {
+        ctx = ctx.with_supervisor(sup);
+    }
+    let ctx = Arc::new(ctx);
     let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let host_uid = host_effective_uid();
 
@@ -871,7 +903,7 @@ pub async fn run_server(
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let listener = bind_listener(&path)?;
-    serve_listener(listener, path, central, data_dir, shutdown).await
+    serve_listener(listener, path, central, data_dir, None, shutdown).await
 }
 
 /// Build a dispatch table populated with only the handlers in `commands`
@@ -986,7 +1018,21 @@ mod tests {
         for c in copperclaw_cclaw::ALL_COMMANDS {
             assert!(t.contains_key(*c), "missing handler for {c}");
         }
-        assert_eq!(t.len(), copperclaw_cclaw::ALL_COMMANDS.len());
+        // Every table entry beyond ALL_COMMANDS must be a declared
+        // host-local command (see HOST_LOCAL_COMMANDS) — anything else is
+        // drift.
+        let known: std::collections::HashSet<&str> = copperclaw_cclaw::ALL_COMMANDS
+            .iter()
+            .chain(HOST_LOCAL_COMMANDS.iter())
+            .copied()
+            .collect();
+        for c in t.keys() {
+            assert!(known.contains(c), "undeclared table entry {c}");
+        }
+        assert_eq!(
+            t.len(),
+            copperclaw_cclaw::ALL_COMMANDS.len() + HOST_LOCAL_COMMANDS.len()
+        );
     }
 
     #[test]

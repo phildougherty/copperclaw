@@ -678,7 +678,7 @@ pub async fn run_host(
     let registry = build_registry();
 
     // 8. Init channels.
-    let (inbound_tx, mut inbound_rx) = mpsc::channel(DEFAULT_INBOUND_BUFFER);
+    let (inbound_tx, inbound_rx) = mpsc::channel(DEFAULT_INBOUND_BUFFER);
     let initialized = init_channels(&registry, &cfg.channels, inbound_tx, &cfg.data_dir).await;
     let adapters: DashMap<copperclaw_types::ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
     for ch in &initialized {
@@ -724,29 +724,66 @@ pub async fn run_host(
     let host_ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
     install_modules(Arc::clone(&host_ctx), cfg.data_dir.clone()).await;
 
-    // 11. Inbound consumer.
-    let router_for_consumer = Arc::clone(&state.router);
-    let consumer_shutdown = shutdown.clone();
-    let consumer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = consumer_shutdown.cancelled() => break,
-                event = inbound_rx.recv() => {
-                    let Some(event) = event else { break; };
-                    if let Err(err) = router_for_consumer.route(event).await {
-                        warn!(?err, "router::route failed");
+    // 11-13c. Background loops, registered through the M21 S1 supervisor
+    // (`crate::supervisor`) instead of bare `tokio::spawn`s: a panic (or an
+    // unexpected return) in any of these used to silently kill that
+    // subsystem for the remaining life of the process. The supervisor
+    // restarts a dead loop on the decision-(e) backoff curve and exposes
+    // per-loop liveness + restart counts via the `host.status` admin-socket
+    // handler. Every loop still watches the same shutdown token it always
+    // did — the supervisor only changes what happens when a loop dies
+    // WITHOUT that token firing.
+    let mut supervisor = crate::supervisor::Supervisor::new(shutdown.clone());
+
+    // 11. Inbound consumer. The receiver survives restarts behind a shared
+    // Mutex: each incarnation locks it for its lifetime (a panic releases
+    // the lock through unwinding), so a restarted consumer resumes the same
+    // inbound stream with nothing lost.
+    let inbound_rx = Arc::new(tokio::sync::Mutex::new(inbound_rx));
+    {
+        let router = Arc::clone(&state.router);
+        let sd = shutdown.clone();
+        supervisor.register("inbound_consumer", move || {
+            let router = Arc::clone(&router);
+            let rx = Arc::clone(&inbound_rx);
+            let sd = sd.clone();
+            async move {
+                let mut inbound_rx = rx.lock().await;
+                loop {
+                    tokio::select! {
+                        () = sd.cancelled() => break,
+                        event = inbound_rx.recv() => {
+                            let Some(event) = event else { break; };
+                            if let Err(err) = router.route(event).await {
+                                warn!(?err, "router::route failed");
+                            }
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     // 12. Delivery loops.
-    let active = tokio::spawn(Arc::clone(&state.delivery).run_active_loop(shutdown.clone()));
-    let sweep_delivery = tokio::spawn(Arc::clone(&state.delivery).run_sweep_loop(shutdown.clone()));
+    {
+        let delivery = Arc::clone(&state.delivery);
+        let sd = shutdown.clone();
+        supervisor.register("delivery_active", move || {
+            Arc::clone(&delivery).run_active_loop(sd.clone())
+        });
+        let delivery = Arc::clone(&state.delivery);
+        let sd = shutdown.clone();
+        supervisor.register("delivery_sweep", move || {
+            Arc::clone(&delivery).run_sweep_loop(sd.clone())
+        });
+    }
 
     // 13. Sweep loop.
-    let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
+    {
+        let sweep = Arc::clone(&state.sweep);
+        let sd = shutdown.clone();
+        supervisor.register("sweep", move || Arc::clone(&sweep).run_loop(sd.clone()));
+    }
 
     // 13b. Typing ticker. Keeps the channel's "agent is working"
     // indicator visible every 4 sec for any session with an active
@@ -758,7 +795,13 @@ pub async fn run_host(
         state.delivery.dispatcher(),
         cfg.data_dir.clone(),
     ));
-    let typing_task = tokio::spawn(Arc::clone(&typing_ticker).run_loop(shutdown.clone()));
+    {
+        let ticker = Arc::clone(&typing_ticker);
+        let sd = shutdown.clone();
+        supervisor.register("typing_ticker", move || {
+            Arc::clone(&ticker).run_loop(sd.clone())
+        });
+    }
 
     // 13c. Todo watcher. Polls each running session's
     // `agent_todos.json` and emits chat notifications when a new plan
@@ -770,7 +813,19 @@ pub async fn run_host(
         state.delivery.dispatcher(),
         cfg.data_dir.clone(),
     ));
-    let todo_task = tokio::spawn(Arc::clone(&todo_watcher).run_loop(shutdown.clone()));
+    {
+        let watcher = Arc::clone(&todo_watcher);
+        let sd = shutdown.clone();
+        supervisor.register("todo_watcher", move || {
+            Arc::clone(&watcher).run_loop(sd.clone())
+        });
+    }
+
+    // Start the supervised loops + driver. `supervised` resolves only
+    // after shutdown once every registered loop has drained; the status
+    // Arc feeds the `host.status` handler on the admin socket below.
+    let supervisor_status = supervisor.status();
+    let supervised = supervisor.run();
 
     // 13b. Credential broker (Phase 0b). Opt-in via
     // `COPPERCLAW_CREDENTIAL_BROKER`. When enabled, this binds a loopback
@@ -881,6 +936,7 @@ pub async fn run_host(
     // path must never be used here.
     let socket_data_dir = cfg.data_dir.clone();
     let socket_cancel = shutdown.clone();
+    let socket_supervisor = Arc::clone(&supervisor_status);
     let listener = bind_listener(&socket_path).map_err(BootError::Socket)?;
     let socket_task = tokio::spawn(async move {
         serve_listener(
@@ -888,6 +944,7 @@ pub async fn run_host(
             socket_path,
             socket_central,
             socket_data_dir,
+            Some(socket_supervisor),
             socket_cancel,
         )
         .await
@@ -904,15 +961,13 @@ pub async fn run_host(
     info!("shutdown requested; cancelling tasks");
     shutdown.cancel();
 
-    // Await all tasks with a 30s deadline.
+    // Await all tasks with a 30s deadline. The supervisor's driver handle
+    // resolves once every supervised loop (inbound consumer, both delivery
+    // loops, sweep loop, typing ticker, todo watcher) has drained — the
+    // same set, on the same token, inside the same deadline as before.
     let deadline = Duration::from_secs(30);
     let _ = tokio::time::timeout(deadline, async {
-        let _ = consumer.await;
-        let _ = active.await;
-        let _ = sweep_delivery.await;
-        let _ = sweep_loop.await;
-        let _ = typing_task.await;
-        let _ = todo_task.await;
+        let _ = supervised.await;
         if let Some(t) = manager_task {
             let _ = t.await;
         }
