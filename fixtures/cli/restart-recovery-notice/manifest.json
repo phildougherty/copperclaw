@@ -1,0 +1,17 @@
+{
+  "name": "cli-restart-recovery-notice",
+  "channel": "cli",
+  "description": "M21 F3 (Wave-2 X-rider): baseline turn, then the registered test reproduces a host death mid-turn (session running, pending inbound with a Processing claim) and drives the REAL boot step `reset_stale_running_sessions` — exactly one recovery notice reaches the wire, a second boot pass and a sweep pass stay quiet, and the re-queued inbound processes normally.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "\"in_reply_to\":(\"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\"|null)": "\"in_reply_to\":\"<IRT>\"",
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

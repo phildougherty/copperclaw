@@ -3003,3 +3003,587 @@ async fn cli_delivery_retry_restart_resumes_and_dead_letters_once() {
         );
     }
 }
+
+// ─── M21 Wave-2 X-rider: feedback fixtures ───────────────────────────────────
+//
+// Lock the "user is never in the dark" wave into the replay test set.
+// Wave 2's third behavior (F2: question expiry -> terminal note ->
+// unblocked agent) was already pinned end to end by F2's own fixture
+// (`fixtures/cli/question-expiry/`,
+// `cli_question_expiry_surfaces_lapse_and_resumes_on_reply` above) — it
+// is folded into the coverage map, not duplicated here. The two tests
+// below pin the remaining Wave-2 behaviors:
+//
+// - F1 (`fixtures/cli/slow-spawn-notice/`): spawn-phase typing + the one
+//   slow-spawn notice, clock-advanced via a mid-test `tokio::time::pause()`
+//   section (the F1 timers run on HOST tokio time, which a fixture
+//   manifest cannot advance — see `fixtures/README-m21-wave2.md`).
+// - F3 (`fixtures/cli/restart-recovery-notice/`): the host-restart
+//   recovery notice, exactly once, through the REAL boot step
+//   (`boot::reset_stale_running_sessions`) and the real delivery service.
+
+/// Fixture-authoring gate for the M21 Wave-2 X-rider fixtures: when
+/// `COPPERCLAW_M21X2_GENERATE` is set, the tests dump the captured
+/// streams (via `dump_expected_jsonl`) instead of asserting the JSONL
+/// diff, so `expected/*.jsonl` can be regenerated from a real run.
+/// Never taken under a normal `cargo test`.
+fn m21x2_generate() -> bool {
+    std::env::var_os("COPPERCLAW_M21X2_GENERATE").is_some()
+}
+
+/// Container runtime whose `spawn` blocks until released — the mock
+/// stand-in for a slow first image build / pull (the exact shape F1's
+/// 20s threshold targets). `entered` signals the moment the runtime
+/// call begins; `release` lets it complete successfully.
+#[derive(Default)]
+struct HoldSpawnRuntime {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl copperclaw_container_rt::ContainerRuntime for HoldSpawnRuntime {
+    async fn ensure_running(&self) -> Result<(), copperclaw_container_rt::RtError> {
+        Ok(())
+    }
+    async fn cleanup_orphans(&self, _slug: &str) -> Result<(), copperclaw_container_rt::RtError> {
+        Ok(())
+    }
+    async fn spawn(
+        &self,
+        spec: copperclaw_container_rt::ContainerSpec,
+    ) -> Result<copperclaw_container_rt::ContainerHandle, copperclaw_container_rt::RtError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(copperclaw_container_rt::ContainerHandle::new(
+            format!("hold-{}-id", spec.name),
+            spec.name,
+        ))
+    }
+    async fn stop(
+        &self,
+        _name: &str,
+        _grace: std::time::Duration,
+    ) -> Result<(), copperclaw_container_rt::RtError> {
+        Ok(())
+    }
+    async fn build_image(
+        &self,
+        spec: copperclaw_container_rt::ImageBuildSpec,
+    ) -> Result<String, copperclaw_container_rt::RtError> {
+        Ok(spec.image_tag())
+    }
+}
+
+/// Typing-observation seam: wraps the harness delivery service's REAL
+/// dispatcher (the same `DeliveryDispatcher` handle boot hands the
+/// production ticker), records every `set_typing` target, and forwards
+/// everything to the inner dispatcher so the real adapter path still
+/// runs. Needed because `MockAdapter` does not record `set_typing`
+/// calls — the dispatcher seam is the closest observable point that
+/// still exercises the production wiring.
+struct RecordingTypingDispatcher {
+    inner: std::sync::Arc<dyn copperclaw_modules::DeliveryDispatcher>,
+    typing: std::sync::Mutex<Vec<copperclaw_modules::DispatchTarget>>,
+}
+
+impl RecordingTypingDispatcher {
+    fn new(inner: std::sync::Arc<dyn copperclaw_modules::DeliveryDispatcher>) -> Self {
+        Self {
+            inner,
+            typing: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    fn typing_targets(&self) -> Vec<copperclaw_modules::DispatchTarget> {
+        self.typing.lock().unwrap().clone()
+    }
+}
+
+impl copperclaw_modules::DeliveryDispatcher for RecordingTypingDispatcher {
+    fn set_typing(
+        &self,
+        target: &copperclaw_modules::DispatchTarget,
+    ) -> Option<tokio::sync::oneshot::Receiver<copperclaw_modules::TypingOutcome>> {
+        self.typing.lock().unwrap().push(target.clone());
+        self.inner.set_typing(target)
+    }
+    fn dispatch(
+        &self,
+        target: &copperclaw_modules::DispatchTarget,
+        message: &copperclaw_types::OutboundMessage,
+    ) {
+        self.inner.dispatch(target, message);
+    }
+    fn edit_message(
+        &self,
+        target: &copperclaw_modules::DispatchTarget,
+        platform_message_id: &str,
+        text: &str,
+    ) {
+        self.inner.edit_message(target, platform_message_id, text);
+    }
+}
+
+/// The stuck-tool / cold-start `ManagerConfig`, parameterized on the
+/// harness (same shape as the Wave-1 stuck-restart test's inline copy).
+fn m21x2_manager_cfg(harness: &ReplayHarness) -> copperclaw_host::container_manager::ManagerConfig {
+    use copperclaw_host::container_manager::{
+        DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS,
+        ManagerConfig,
+    };
+    ManagerConfig {
+        install_slug: "replay".into(),
+        data_dir: harness.tempdir.path().to_path_buf(),
+        default_image_tag: "copperclaw/session:replay".into(),
+        default_provider: "anthropic".into(),
+        default_model: "claude-sonnet-4-6".into(),
+        default_effort: None,
+        anthropic_api_key: Some("harness".into()),
+        anthropic_base_url: Some(harness.anthropic_server.uri()),
+        idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+        stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+        skills_dir: None,
+        groups_dir: None,
+        skills_mode: copperclaw_host::SkillsMode::default(),
+        gpu_passthrough: false,
+        forward_env: Vec::new(),
+        egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+    }
+}
+
+/// M21 F1 (X-rider W2): cold-start feedback, end to end through the
+/// replay pipeline over `fixtures/cli/slow-spawn-notice/` — the leg
+/// F1's own paused-clock crate tests (`cold_start.rs`,
+/// `typing_ticker.rs`) stop short of: a ROUTER-created session, the
+/// REAL `TypingTicker::run_loop` reading the manager's shared
+/// `SpawnActivity` registry through the harness delivery service's real
+/// dispatcher, and the slow-spawn notice reaching the WIRE through the
+/// real `DeliveryService`, with the same pending inbound then processed
+/// by the fixture's scripted turn.
+///
+/// Timing: F1's watchdog (20s `SLOW_SPAWN_NOTICE_AFTER`) and the
+/// ticker's 4s cadence run on HOST tokio time — no fixture manifest can
+/// advance them (the S6 `TestClock` reaches only the runner). The test
+/// therefore brackets the spawn-phase leg in a mid-test
+/// `tokio::time::pause()` section: everything inside it (the held
+/// runtime spawn, the ticker loop, the watchdog) is pure timer/DB work,
+/// so the paused clock auto-advances deterministically with zero real
+/// waits; the clock is resumed before the delivery + runner legs, which
+/// do real (wiremock) I/O.
+///
+/// Sequence pinned:
+/// 1. First message routed cold: session `Stopped`, due inbound,
+///    routing seeded (`ReplayHarness::route_step_cold`).
+/// 2. `maybe_spawn` held mid-runtime-call: typing pulses through the
+///    real dispatcher within one tick, BEFORE the runner is up; zero
+///    notices below the threshold.
+/// 3. Crossing 20s posts exactly ONE notice row; three more minutes
+///    held adds none (episode dedup).
+/// 4. Released spawn completes; the notice reaches the cli MockAdapter
+///    exactly once; the deferred turn answers the same inbound; a
+///    further delivery pass adds nothing; all four JSONL streams
+///    byte-stable.
+///
+/// Regenerate expected streams with
+/// `COPPERCLAW_M21X2_GENERATE=1 cargo test -p copperclaw-host --test replay cli_slow_spawn -- --nocapture`.
+#[tokio::test]
+async fn cli_slow_spawn_typing_and_single_notice_end_to_end() {
+    use copperclaw_db::session::{SessionPaths, open_outbound};
+    use copperclaw_db::tables::{messages_out, sessions};
+    use copperclaw_host::container_manager::ContainerManager;
+    use copperclaw_host::container_manager::cold_start::{
+        SLOW_SPAWN_NOTICE_AFTER, SLOW_SPAWN_NOTICE_TEXT, SpawnActivity,
+    };
+    use copperclaw_host::typing_ticker::TypingTicker;
+    use copperclaw_types::ContainerStatus;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// Outbound rows carrying the slow-spawn notice text.
+    fn notice_rows(paths: &SessionPaths) -> usize {
+        let conn = open_outbound(paths).unwrap();
+        messages_out::list_due(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.content.get("text").and_then(|v| v.as_str()) == Some(SLOW_SPAWN_NOTICE_TEXT)
+            })
+            .count()
+    }
+
+    let path = fixture_path("cli", "slow-spawn-notice");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load slow-spawn-notice fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+
+    // ── 1. Route the first message COLD: no runner, no delivery, no
+    // mark-running — the exact state the spawn classifier sees. ──
+    let (ag, sess) = harness.route_step_cold(0).await.expect("route cold");
+    let paths = SessionPaths::new(harness.tempdir.path(), ag, sess);
+    assert_eq!(
+        sessions::get(&harness.central, sess)
+            .unwrap()
+            .container_status,
+        ContainerStatus::Stopped,
+        "cold route must leave the session un-spawned"
+    );
+
+    // Production wiring in miniature (boot.rs hands the SAME registry to
+    // the manager and the ticker, and the SAME delivery dispatcher to
+    // the ticker): one shared SpawnActivity; a manager over a runtime
+    // that holds its spawn; the real run_loop ticker observing typing
+    // through a recorder that forwards to the harness delivery
+    // service's real dispatcher.
+    let activity = Arc::new(SpawnActivity::new());
+    let runtime = Arc::new(HoldSpawnRuntime::default());
+    let mgr = Arc::new(
+        ContainerManager::new(
+            harness.central.clone(),
+            Arc::clone(&runtime) as Arc<dyn copperclaw_container_rt::ContainerRuntime>,
+            m21x2_manager_cfg(&harness),
+        )
+        .with_spawn_activity(Arc::clone(&activity)),
+    );
+    let recorder = Arc::new(RecordingTypingDispatcher::new(
+        harness.delivery.dispatcher(),
+    ));
+    let ticker = Arc::new(
+        TypingTicker::new(
+            harness.central.clone(),
+            Arc::clone(&recorder) as Arc<dyn copperclaw_modules::DeliveryDispatcher>,
+            harness.tempdir.path(),
+        )
+        .with_spawn_activity(Arc::clone(&activity)),
+    );
+
+    // ── Paused-clock section: the spawn-phase leg. ──
+    tokio::time::pause();
+    let cancel = CancellationToken::new();
+    let ticker_task = tokio::spawn(Arc::clone(&ticker).run_loop(cancel.clone()));
+    let spawn_task = {
+        let mgr = Arc::clone(&mgr);
+        let session = sessions::get(&harness.central, sess).unwrap();
+        tokio::spawn(async move { mgr.maybe_spawn(&session).await })
+    };
+    runtime.entered.notified().await;
+
+    // 2. The runner is NOT up (the runtime call is blocked; the session
+    // is still Stopped) — one ticker interval in, typing has pulsed
+    // through the real dispatcher at the session's routed target, and
+    // no notice exists below the threshold.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        sessions::get(&harness.central, sess)
+            .unwrap()
+            .container_status,
+        ContainerStatus::Stopped,
+        "the spawn attempt must still be in flight"
+    );
+    let typed = recorder.typing_targets();
+    assert!(
+        !typed.is_empty(),
+        "mid-spawn session with pending inbound must pulse typing within one tick"
+    );
+    assert_eq!(
+        typed[0]
+            .channel_type
+            .as_ref()
+            .map(copperclaw_types::ChannelType::as_str),
+        Some("cli"),
+        "typing must land on the session's routed channel"
+    );
+    assert_eq!(typed[0].platform_id.as_deref(), Some("stdin"));
+    assert_eq!(notice_rows(&paths), 0, "no notice below the 20s threshold");
+
+    // 3. Cross the threshold: exactly one notice; minutes more of the
+    // same held spawn add none.
+    tokio::time::sleep(SLOW_SPAWN_NOTICE_AFTER).await;
+    assert_eq!(
+        notice_rows(&paths),
+        1,
+        "crossing the threshold posts the one slow-spawn notice"
+    );
+    tokio::time::sleep(Duration::from_secs(180)).await;
+    assert_eq!(
+        notice_rows(&paths),
+        1,
+        "a held spawn never posts a second notice"
+    );
+
+    // 4. Release: the spawn completes, the attempt unregisters.
+    runtime.release.notify_one();
+    assert!(
+        spawn_task.await.unwrap().unwrap(),
+        "released spawn completes"
+    );
+    assert!(activity.active_sessions().is_empty());
+    cancel.cancel();
+    ticker_task.await.unwrap();
+    tokio::time::resume();
+
+    // ── Real-time tail: the notice reaches the wire, then the deferred
+    // turn processes the SAME pending inbound. ──
+    let session = sessions::get(&harness.central, sess).unwrap();
+    harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .expect("deliver slow-spawn notice");
+    let mock = Arc::clone(mock_for(&harness, "cli"));
+    let on_wire = |mock: &copperclaw_channels_core::testing::MockAdapter| {
+        mock.deliveries()
+            .iter()
+            .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+            .filter(|t| *t == SLOW_SPAWN_NOTICE_TEXT)
+            .count()
+    };
+    assert_eq!(on_wire(&mock), 1, "exactly one notice on the wire");
+
+    harness
+        .run_turn_and_deliver(ag, sess)
+        .await
+        .expect("deferred turn");
+    let replies = mock
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("All set up and ready"))
+        .count();
+    assert_eq!(replies, 1, "the held-spawn inbound still gets its reply");
+    assert_eq!(on_wire(&mock), 1, "the notice stays exactly-once");
+
+    // A further delivery pass adds nothing.
+    let rpt = harness
+        .delivery
+        .process_session_once(&sessions::get(&harness.central, sess).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rpt.delivered, 0, "nothing left to deliver");
+
+    if m21x2_generate() {
+        harness.dump_expected_jsonl();
+        return;
+    }
+    let diff = harness.compare().expect("compare");
+    assert!(diff.is_clean(), "{diff}");
+}
+
+/// M21 F3 (X-rider W2): the host-restart recovery notice, end to end
+/// through the replay pipeline over
+/// `fixtures/cli/restart-recovery-notice/` — the leg F3's own boot
+/// crate tests (`boot.rs::tests::boot_recovery`) stop short of: a
+/// ROUTER-created session whose routing and baseline turn came off the
+/// real pipeline, the REAL boot step
+/// (`boot::reset_stale_running_sessions`) run over it, and the notice
+/// actually REACHING the channel adapter through the real
+/// `DeliveryService`, exactly once — with the interrupted inbound then
+/// processed normally by the respawned (deferred) turn.
+///
+/// The fixture drives one normal turn. The test then reproduces exactly
+/// the state a host death mid-turn leaves behind — this is state, not
+/// behavior (the harness cannot kill and re-run a host process):
+/// session `running`, one pending inbound old enough that the sweep's
+/// `pending_too_long` apology WOULD fire were the dedupe stamp absent,
+/// and a `Processing` claim (a runner had picked the turn up). Then:
+///
+/// 1. The real boot step emits exactly one notice row (crash-restart
+///    copy), flips the claim, stamps the row — and leaves it due.
+/// 2. A second boot pass (host restarted twice) emits nothing.
+/// 3. A real `SweepService` pass emits nothing either (the stamps keep
+///    both sweep apology paths out).
+/// 4. Delivery hands the notice to the cli `MockAdapter` exactly once;
+///    a second pass is quiet.
+/// 5. The re-queued inbound processes: the deferred turn answers it and
+///    the reply is delivered. All four JSONL streams byte-stable.
+///
+/// Regenerate expected streams with
+/// `COPPERCLAW_M21X2_GENERATE=1 cargo test -p copperclaw-host --test replay cli_restart_recovery -- --nocapture`.
+#[tokio::test]
+async fn cli_restart_recovery_notice_delivered_exactly_once() {
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::{messages_in, messages_out, processing_ack, sessions};
+    use copperclaw_host::boot::reset_stale_running_sessions;
+    use copperclaw_host_sweep::SweepService;
+    use copperclaw_host_sweep::service::FilesystemSessionRoot;
+    use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind};
+    use std::sync::Arc;
+
+    /// Chat rows carrying the recovery-notice copy (the crash-restart
+    /// apology text — `CRASH_RESTART_APOLOGY_TEXT` is crate-private, so
+    /// match on its stable "snag"/"restart" phrasing like the Wave-1
+    /// stuck-restart test does).
+    fn notice_rows(paths: &SessionPaths) -> Vec<copperclaw_types::MessageOutRow> {
+        let conn = open_outbound(paths).unwrap();
+        messages_out::list_due(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.kind == MessageKind::Chat
+                    && r.content
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t.contains("snag") && t.contains("restart"))
+            })
+            .collect()
+    }
+
+    let path = fixture_path("cli", "restart-recovery-notice");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load restart-recovery-notice fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+
+    // ── Baseline turn off the real pipeline. ──
+    harness.run_steps(0, 1).await.expect("baseline step");
+    let (ag, sess) = harness.touched_sessions[0];
+    let paths = SessionPaths::new(harness.tempdir.path(), ag, sess);
+    let mock = Arc::clone(mock_for(&harness, "cli"));
+    assert_eq!(mock.deliveries().len(), 1, "baseline reply delivered");
+
+    // ── Reproduce the host-death-mid-turn state. ──
+    sessions::mark_container_running(&harness.central, sess).unwrap();
+    let msg_id = MessageId::new();
+    {
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: MessageKind::Chat,
+                // Old enough that the sweep's pending_too_long apology
+                // WOULD fire were the boot path's tries stamp absent —
+                // making assertion 3 below meaningful.
+                timestamp: chrono::Utc::now() - chrono::Duration::minutes(10),
+                content: serde_json::json!({"text": "are you done with the report?"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ChannelType::new(ChannelType::CLI)),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+    }
+    {
+        let outbound = open_outbound(&paths).unwrap();
+        processing_ack::insert(
+            &outbound,
+            msg_id,
+            processing_ack::ProcessingStatus::Processing,
+        )
+        .unwrap();
+    }
+
+    // ── 1. The REAL boot step: reset + one recovery notice. ──
+    reset_stale_running_sessions(&harness.central, harness.tempdir.path());
+    assert_eq!(
+        sessions::get(&harness.central, sess)
+            .unwrap()
+            .container_status,
+        ContainerStatus::Stopped,
+        "boot reset must make the session spawnable again"
+    );
+    let notices = notice_rows(&paths);
+    assert_eq!(notices.len(), 1, "exactly one recovery notice row");
+    assert_eq!(
+        notices[0].in_reply_to,
+        Some(msg_id),
+        "the notice is routed at the interrupted inbound"
+    );
+    {
+        let outbound = open_outbound(&paths).unwrap();
+        let claim = processing_ack::get(&outbound, msg_id).unwrap().unwrap();
+        assert_eq!(
+            claim.status,
+            processing_ack::ProcessingStatus::Failed,
+            "the boot path owns the interrupted turn now"
+        );
+        let inbound = open_inbound(&paths).unwrap();
+        assert_eq!(
+            messages_in::count_due(&inbound).unwrap(),
+            1,
+            "the interrupted inbound stays due for the respawned runner"
+        );
+    }
+
+    // ── 2. Second boot pass (host restarted twice): byte-quiet. ──
+    sessions::mark_container_running(&harness.central, sess).unwrap();
+    reset_stale_running_sessions(&harness.central, harness.tempdir.path());
+    assert_eq!(
+        notice_rows(&paths).len(),
+        1,
+        "a repeat boot pass must not re-notice"
+    );
+
+    // ── 3. A real sweep pass: the dedupe stamps keep both sweep
+    // apology paths out (the row is past the pending_too_long
+    // threshold, so absent the stamp this WOULD add an apology). ──
+    let sweep = SweepService::new(
+        harness.central.clone(),
+        Arc::new(FilesystemSessionRoot::new(harness.tempdir.path())),
+    );
+    sweep.run_once().expect("sweep pass");
+    assert_eq!(
+        notice_rows(&paths).len(),
+        1,
+        "the sweep's apology paths must stay out"
+    );
+
+    // ── 4. The notice reaches the WIRE exactly once. ──
+    let session = sessions::get(&harness.central, sess).unwrap();
+    harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .expect("deliver recovery notice");
+    let on_wire = |mock: &copperclaw_channels_core::testing::MockAdapter| {
+        mock.deliveries()
+            .iter()
+            .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+            .filter(|t| t.contains("snag") && t.contains("restart"))
+            .count()
+    };
+    assert_eq!(on_wire(&mock), 1, "exactly one recovery notice on the wire");
+    harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .expect("second delivery pass");
+    assert_eq!(on_wire(&mock), 1, "the notice stays exactly-once");
+
+    // ── 5. The re-queued inbound processes normally. ──
+    harness
+        .run_turn_and_deliver(ag, sess)
+        .await
+        .expect("requeued turn");
+    let resumed = mock
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("picking your report right back up"))
+        .count();
+    assert_eq!(resumed, 1, "the interrupted turn resumes after the notice");
+    assert_eq!(on_wire(&mock), 1, "still exactly one notice after resume");
+
+    if m21x2_generate() {
+        harness.dump_expected_jsonl();
+        return;
+    }
+    let diff = harness.compare().expect("compare");
+    assert!(diff.is_clean(), "{diff}");
+}
