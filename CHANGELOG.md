@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 F4: external-MCP connection caching, 2026-07-17)
+
+- **External MCP connections are now reused across a session's tool
+  calls.** New per-session connection cache
+  `crates/copperclaw-mcp/src/external_cache.rs`
+  (`McpConnectionCache` / `call_external_tool_cached`): keyed by the
+  session scope crossed with a canonical (recursively key-sorted — the
+  workspace's `serde_json/preserve_order` makes raw serialization
+  key-order-sensitive) fingerprint of the `mcp_servers` entry, so every
+  host-proxied external tool call after the first skips the ~1-2s
+  connection setup (child-process spawn + MCP handshake for stdio, TCP +
+  SSE handshake for HTTP) that users felt as unexplained per-step latency
+  in long multi-tool tasks. This is the twice-deferred M17 B1b wish.
+  Idle connections are reaped after 5 minutes (`DEFAULT_IDLE_TTL`),
+  lazily on each access plus a background sweep; eviction is drop-based
+  (rmcp's `DropGuard` cancels the service and kills a stdio child), so
+  nothing lingers. Failure behavior is unchanged: a cache-miss first
+  call is byte-identical to the old fresh-connect path (same connect,
+  same errors, no retry), and only a transport-dead *cached* connection
+  (broken pipe / transport closed — e.g. the server restarted) is
+  retried exactly once on a fresh connection before erroring; `Timeout`
+  and remote/protocol/filter errors are never retried, since the remote
+  may already have executed a side-effecting tool. Proven by
+  paused-clock unit tests (zero real waits) and a real stdio stub-server
+  integration test (`crates/copperclaw-mcp/tests/external_cache_stub.rs`,
+  `harness = false` so the MCP stream owns stdout): N sequential calls
+  open exactly one connection, and a SIGKILLed server degrades to
+  reconnect-and-retry, not an error.
+
+### Changed (M21 F4: external-MCP connection caching, 2026-07-17)
+
+- **The host-proxied external tool-call executor uses the cache.**
+  `crates/copperclaw-host-delivery/src/service.rs::execute_mcp_call` now
+  calls `copperclaw_mcp::call_external_tool_cached` with the session id
+  as the cache scope (declared minimal out-of-lane touch: the per-call
+  client construction lived here, not in the runner), so connections are
+  reused within a session and never shared across sessions. The uncached
+  `copperclaw_mcp::call_external_tool` primitive remains for the
+  spawn-time manifest seam and one-shot callers.
+
 ### Fixed (M21 F3: host-restart recovery notice, 2026-07-17)
 
 - **A host restart mid-turn is no longer silent.** Boot's reset of stale
