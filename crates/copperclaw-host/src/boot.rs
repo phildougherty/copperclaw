@@ -790,11 +790,21 @@ pub async fn run_host(
     // container — fills the gap where `TypingModule` only fires on
     // inbound traffic, so users see a continuous bubble during long
     // tool loops rather than a 5-second flash then silence.
-    let typing_ticker = Arc::new(crate::typing_ticker::TypingTicker::new(
-        state.central.clone(),
-        state.delivery.dispatcher(),
-        cfg.data_dir.clone(),
-    ));
+    //
+    // M21 F1 (decision (c)): the ticker also holds the cold-start
+    // spawn-activity registry the container manager (built below) writes
+    // its in-flight spawn attempts into — so a first message to a fresh
+    // session pulses typing during the whole spawn (image build, boot,
+    // runner handshake) instead of dead air until the runner is up.
+    let spawn_activity = Arc::new(crate::container_manager::SpawnActivity::new());
+    let typing_ticker = Arc::new(
+        crate::typing_ticker::TypingTicker::new(
+            state.central.clone(),
+            state.delivery.dispatcher(),
+            cfg.data_dir.clone(),
+        )
+        .with_spawn_activity(Arc::clone(&spawn_activity)),
+    );
     {
         let ticker = Arc::clone(&typing_ticker);
         let sd = shutdown.clone();
@@ -899,6 +909,9 @@ pub async fn run_host(
         // manager live in the same host process, so this is a plain
         // in-process Notify — polling stays as the crash-safe fallback.
         state.router.inbound_wake(),
+        // M21 F1: the same spawn-activity registry the typing ticker
+        // reads, so mid-spawn sessions pulse typing from message one.
+        Arc::clone(&spawn_activity),
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -1113,6 +1126,7 @@ fn spawn_container_manager(
     broker: Option<(Arc<crate::container_manager::broker::BrokerState>, String)>,
     preview: Arc<crate::preview::PreviewManager>,
     inbound_wake: Arc<tokio::sync::Notify>,
+    spawn_activity: Arc<crate::container_manager::SpawnActivity>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -1191,7 +1205,8 @@ fn spawn_container_manager(
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
             .with_spawn_tracker(spawn_tracker)
             .with_preview(preview)
-            .with_wake_notify(inbound_wake);
+            .with_wake_notify(inbound_wake)
+            .with_spawn_activity(spawn_activity);
     if let Some((broker_state, broker_base_url)) = broker {
         manager = manager.with_broker(broker_state, broker_base_url);
     }

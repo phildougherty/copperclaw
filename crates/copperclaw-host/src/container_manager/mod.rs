@@ -38,6 +38,7 @@ pub mod broker;
 pub mod broker_server;
 pub mod budgets;
 pub mod classify;
+pub mod cold_start;
 pub mod config;
 pub mod crash_loop;
 pub mod egress;
@@ -74,6 +75,7 @@ pub use spawn::{
 pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
 
 pub use classify::ReconcileAction;
+pub use cold_start::{SLOW_SPAWN_NOTICE_AFTER, SLOW_SPAWN_NOTICE_TEXT, SpawnActivity};
 pub use crash_loop::{CrashCause, CrashLoopTracker, OOM_CARD_THRESHOLD};
 
 use self::config::read_env_file;
@@ -207,6 +209,13 @@ pub struct ContainerManager {
     /// worse, may be reassigned), so its proxies must not outlive it. `None`
     /// (the default, and every test constructor) is a no-op.
     pub(crate) preview: Option<Arc<crate::preview::PreviewManager>>,
+    /// M21 F1 cold-start feedback (decision (c)): registry of spawn
+    /// attempts currently in flight, shared with the typing ticker so
+    /// mid-spawn sessions with pending inbound pulse the typing
+    /// indicator from message one; also carries the per-episode
+    /// slow-spawn-notice dedup. In-memory only — a host restart resets
+    /// it, same posture as `crash_loop`.
+    pub(crate) spawn_activity: Arc<cold_start::SpawnActivity>,
     /// M21 S4 crash-loop bookkeeping (decision (e)): per-session
     /// exponential respawn backoff for crash restarts plus per-episode
     /// OOM counting/dedup for the single "keeps running out of memory"
@@ -251,6 +260,7 @@ impl ContainerManager {
             broker: None,
             broker_base_url: None,
             preview: None,
+            spawn_activity: Arc::new(cold_start::SpawnActivity::new()),
             crash_loop: crash_loop::CrashLoopTracker::new(),
             wake: None,
             cfg,
@@ -305,6 +315,22 @@ impl ContainerManager {
     /// sweep service.
     pub fn spawn_tracker(&self) -> &Arc<SpawnAttemptTracker> {
         &self.spawn_tracker
+    }
+
+    /// Wire a shared cold-start spawn-activity registry (M21 F1,
+    /// decision (c)) into the manager. The boot sequence hands the
+    /// same handle to the typing ticker so mid-spawn sessions pulse
+    /// the typing indicator. Mutates `self` so boot can attach it
+    /// after building the manager.
+    #[must_use]
+    pub fn with_spawn_activity(mut self, activity: Arc<cold_start::SpawnActivity>) -> Self {
+        self.spawn_activity = activity;
+        self
+    }
+
+    /// Access the shared cold-start spawn-activity registry.
+    pub fn spawn_activity(&self) -> &Arc<cold_start::SpawnActivity> {
+        &self.spawn_activity
     }
 
     /// The live sessions root all per-session bind sources live under

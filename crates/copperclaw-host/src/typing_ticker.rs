@@ -16,12 +16,23 @@
 //! actively processing would be a lie. The host's container-manager
 //! state transitions (`mark_container_running` / `_idle` / `_stopped`)
 //! are the source of truth.
+//!
+//! One deliberate widening (M21 F1, decision (c)): sessions that are
+//! **mid-spawn** with pending inbound also pulse typing. A first
+//! message to a fresh session used to get zero feedback for the entire
+//! container spawn (image build, boot, runner handshake); with the
+//! container manager's [`SpawnActivity`] registry wired in (see
+//! [`TypingTicker::with_spawn_activity`]), typing shows within one tick
+//! of the message landing — before the runner is up. Without the
+//! registry (the default, and every pre-F1 test), behavior for
+//! `Running` sessions is byte-identical to before.
 
+use crate::container_manager::SpawnActivity;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound_ro_no_mmap};
 use copperclaw_db::tables::{messages_in, messaging_groups, sessions};
 use copperclaw_modules::{DeliveryDispatcher, DispatchTarget, TypingOutcome};
-use copperclaw_types::SessionId;
+use copperclaw_types::{Session, SessionId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -71,6 +82,13 @@ pub struct TypingTicker {
     /// apply any cooldown. One in-flight receipt per session is enough —
     /// a newer dispatch supersedes the last.
     pending_receipts: Mutex<HashMap<SessionId, oneshot::Receiver<TypingOutcome>>>,
+    /// M21 F1 (decision (c)): the container manager's registry of spawn
+    /// attempts currently in flight. When wired (boot hands the same
+    /// handle to the manager), sessions mid-spawn with pending inbound
+    /// pulse typing too, so a cold start shows life from message one.
+    /// `None` (the default) keeps the `Running`-only gate exactly as it
+    /// was.
+    spawn_activity: Option<Arc<SpawnActivity>>,
 }
 
 impl TypingTicker {
@@ -87,7 +105,17 @@ impl TypingTicker {
             last_seen_pending: RwLock::new(HashMap::new()),
             cooldowns: RwLock::new(HashMap::new()),
             pending_receipts: Mutex::new(HashMap::new()),
+            spawn_activity: None,
         }
+    }
+
+    /// Wire the container manager's spawn-activity registry so the
+    /// ticker also covers sessions mid-spawn (M21 F1). See the module
+    /// docs for the widened-gate rationale.
+    #[must_use]
+    pub fn with_spawn_activity(mut self, activity: Arc<SpawnActivity>) -> Self {
+        self.spawn_activity = Some(activity);
+        self
     }
 
     /// How long a "pending=true" observation stays trusted before we
@@ -108,9 +136,10 @@ impl TypingTicker {
     }
 
     /// Drive one pass of the ticker — for every running session with a
-    /// channel-bound messaging group, fire a `set_typing` through the
-    /// dispatcher. Exposed `pub(crate)` so the loop and tests can call
-    /// it directly; the public surface is [`run_loop`].
+    /// channel-bound messaging group (plus, when a [`SpawnActivity`]
+    /// registry is wired, every session mid-spawn), fire a `set_typing`
+    /// through the dispatcher. Exposed `pub(crate)` so the loop and
+    /// tests can call it directly; the public surface is [`run_loop`].
     pub(crate) fn tick(&self) -> usize {
         // Apply any rate-limit feedback from the previous pass's dispatches
         // before deciding who to ping this time.
@@ -124,50 +153,94 @@ impl TypingTicker {
         };
         let now = Instant::now();
         let mut fired = 0usize;
-        for s in running {
-            let Some(mg_id) = s.messaging_group_id else {
-                continue;
-            };
-            // Gate on actual work-in-flight, not just container=Running:
-            // a session that's been Running for the whole idle-timeout
-            // window between user turns should NOT pulse typing
-            // continuously. Check via `has_pending_inbound`, which is
-            // backed by a short-lived per-session cache so we don't
-            // reopen sqlite on every tick of a continuously-busy
-            // session. If > 0, the agent has work it's about to
-            // process (or is processing); fire typing. If 0, stay
-            // quiet.
-            if !self.has_pending_inbound(s.agent_group_id, s.id) {
-                continue;
+        let running_ids: std::collections::HashSet<SessionId> =
+            running.iter().map(|s| s.id).collect();
+        for s in &running {
+            if self.try_fire(s, now) {
+                fired += 1;
             }
-            // Respect a live rate-limit cooldown: a prior tick's dispatch
-            // came back `RateLimited`, so stay quiet for this target until
-            // the backoff elapses instead of hammering the adapter again.
-            if self.in_cooldown(s.id, now) {
-                continue;
-            }
-            let mg = match messaging_groups::get(&self.central, mg_id) {
-                Ok(m) => m,
-                Err(err) => {
-                    debug!(
-                        ?err,
-                        session = %s.id.as_uuid(),
-                        "typing_ticker: messaging_groups::get failed; skipping",
-                    );
+        }
+        // M21 F1 (decision (c)): sessions whose container spawn is
+        // currently in flight get the same treatment — a cold start
+        // shows typing from message one instead of dead air for the
+        // whole image-build/boot/handshake window. The registry only
+        // ever holds sessions past the manager's pending-inbound,
+        // budget, and rate-limit gates, and every dispatch below still
+        // passes the identical pending-inbound / cooldown / routing
+        // gates as the `Running` arm. Sessions already covered above
+        // are skipped so a spawn racing `mark_container_running`
+        // can't double-fire.
+        if let Some(activity) = &self.spawn_activity {
+            for session_id in activity.active_sessions() {
+                if running_ids.contains(&session_id) {
                     continue;
                 }
-            };
-            let target = DispatchTarget::channel(mg.channel_type, mg.platform_id, s.thread_id);
-            if let Some(rx) = self.dispatcher.set_typing(&target) {
-                // Stash the outcome receiver so the next tick can apply any
-                // cooldown; a fresh dispatch supersedes an earlier pending one.
-                if let Ok(mut guard) = self.pending_receipts.lock() {
-                    guard.insert(s.id, rx);
+                let s = match sessions::get(&self.central, session_id) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        debug!(
+                            ?err,
+                            session = %session_id.as_uuid(),
+                            "typing_ticker: sessions::get failed for mid-spawn session; skipping",
+                        );
+                        continue;
+                    }
+                };
+                if self.try_fire(&s, now) {
+                    fired += 1;
                 }
             }
-            fired += 1;
         }
         fired
+    }
+
+    /// Gate + dispatch one session's typing pulse. Shared by the
+    /// `Running` arm and the mid-spawn arm of [`Self::tick`]; the check
+    /// order (messaging-group routing, pending inbound, rate-limit
+    /// cooldown, group lookup) is exactly the pre-F1 `Running`-arm
+    /// sequence. Returns whether a dispatch was fired.
+    fn try_fire(&self, s: &Session, now: Instant) -> bool {
+        let Some(mg_id) = s.messaging_group_id else {
+            return false;
+        };
+        // Gate on actual work-in-flight, not just container=Running:
+        // a session that's been Running for the whole idle-timeout
+        // window between user turns should NOT pulse typing
+        // continuously. Check via `has_pending_inbound`, which is
+        // backed by a short-lived per-session cache so we don't
+        // reopen sqlite on every tick of a continuously-busy
+        // session. If > 0, the agent has work it's about to
+        // process (or is processing); fire typing. If 0, stay
+        // quiet.
+        if !self.has_pending_inbound(s.agent_group_id, s.id) {
+            return false;
+        }
+        // Respect a live rate-limit cooldown: a prior tick's dispatch
+        // came back `RateLimited`, so stay quiet for this target until
+        // the backoff elapses instead of hammering the adapter again.
+        if self.in_cooldown(s.id, now) {
+            return false;
+        }
+        let mg = match messaging_groups::get(&self.central, mg_id) {
+            Ok(m) => m,
+            Err(err) => {
+                debug!(
+                    ?err,
+                    session = %s.id.as_uuid(),
+                    "typing_ticker: messaging_groups::get failed; skipping",
+                );
+                return false;
+            }
+        };
+        let target = DispatchTarget::channel(mg.channel_type, mg.platform_id, s.thread_id.clone());
+        if let Some(rx) = self.dispatcher.set_typing(&target) {
+            // Stash the outcome receiver so the next tick can apply any
+            // cooldown; a fresh dispatch supersedes an earlier pending one.
+            if let Ok(mut guard) = self.pending_receipts.lock() {
+                guard.insert(s.id, rx);
+            }
+        }
+        true
     }
 
     /// Drain the outcome receivers stashed by the previous tick's
@@ -813,6 +886,122 @@ mod tests {
             2,
             "exactly one more adapter call after the cooldown lapsed",
         );
+    }
+
+    /// M21 F1: a stopped session whose spawn attempt is registered in
+    /// the [`SpawnActivity`] registry pulses typing (pending inbound is
+    /// present), and stops pulsing the moment the attempt unregisters.
+    #[tokio::test]
+    async fn tick_fires_for_mid_spawn_session_and_stops_when_attempt_ends() {
+        let (tmp, central) = fresh_central();
+        let s_id = make_running_session_with_pending(&central, tmp.path(), "telegram");
+        // The cold-start shape: container Stopped, inbound pending.
+        sessions::mark_container_stopped(&central, s_id).unwrap();
+
+        let activity = StdArc::new(SpawnActivity::new());
+        let mock = StdArc::new(MockDispatcher::default());
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        )
+        .with_spawn_activity(StdArc::clone(&activity));
+
+        // No attempt registered yet: a stopped session stays quiet.
+        assert_eq!(
+            ticker.tick(),
+            0,
+            "stopped session without a spawn in flight"
+        );
+
+        let generation = activity.begin(s_id);
+        assert_eq!(ticker.tick(), 1, "mid-spawn session must pulse typing");
+        assert_eq!(
+            mock.typing_calls.lock().unwrap()[0]
+                .channel_type
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "telegram",
+        );
+
+        activity.finish(s_id, generation);
+        assert_eq!(ticker.tick(), 0, "typing stops when the attempt ends");
+    }
+
+    /// M21 F1: the mid-spawn arm keeps the work-in-flight gate — a
+    /// registered attempt for a session with no pending inbound must
+    /// not pulse (typing would be a lie).
+    #[test]
+    fn mid_spawn_session_without_pending_inbound_stays_quiet() {
+        let (tmp, central) = fresh_central();
+        let g = agent_groups::create(
+            &central,
+            CreateAgentGroup {
+                name: "spawn-idle".into(),
+                folder: "spawn-idle".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let mg = messaging_groups::upsert(
+            &central,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("telegram"),
+                platform_id: "chat-spawn-idle".into(),
+                name: Some("spawn-idle".into()),
+                is_group: false,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        let s = sessions::create(
+            &central,
+            CreateSession {
+                agent_group_id: g.id,
+                messaging_group_id: Some(mg.id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Empty inbound.db: no pending work.
+        let paths = copperclaw_db::session::SessionPaths::new(tmp.path(), g.id, s.id);
+        paths.ensure_dirs().unwrap();
+        let _conn = copperclaw_db::session::open_inbound(&paths).unwrap();
+
+        let activity = StdArc::new(SpawnActivity::new());
+        let _generation = activity.begin(s.id);
+        let mock = StdArc::new(MockDispatcher::default());
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        )
+        .with_spawn_activity(activity);
+        assert_eq!(
+            ticker.tick(),
+            0,
+            "mid-spawn session without pending inbound must NOT pulse typing",
+        );
+    }
+
+    /// M21 F1: a session that is both `Running` and (racily) still in
+    /// the spawn registry fires exactly once per tick, not twice.
+    #[test]
+    fn running_session_also_in_spawn_registry_fires_once() {
+        let (tmp, central) = fresh_central();
+        let s_id = make_running_session_with_pending(&central, tmp.path(), "telegram");
+        let activity = StdArc::new(SpawnActivity::new());
+        let _generation = activity.begin(s_id);
+        let mock = StdArc::new(MockDispatcher::default());
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        )
+        .with_spawn_activity(activity);
+        assert_eq!(ticker.tick(), 1, "overlap must not double-fire");
+        assert_eq!(mock.typing_calls.lock().unwrap().len(), 1);
     }
 
     #[test]

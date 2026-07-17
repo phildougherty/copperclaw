@@ -308,6 +308,15 @@ impl ContainerManager {
             return Ok(false);
         }
 
+        // M21 F1 (decision (c)): every pre-spawn gate has passed, so a
+        // real spawn attempt starts here — register it in the shared
+        // spawn-activity registry (typing ticker reads it: mid-spawn
+        // sessions with pending inbound pulse the typing indicator) and
+        // arm the one-per-episode slow-spawn notice watchdog. RAII: any
+        // return path below (rebuild failure, runtime spawn failure,
+        // success, even a cancelled future) unregisters the attempt.
+        let _spawn_attempt = self.begin_spawn_attempt(session);
+
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
         // E2: fleet-visibility gauge of each group's active image profile.
@@ -508,6 +517,9 @@ impl ContainerManager {
         // Successful spawn: clear any prior failure record so a future
         // crash doesn't immediately trip the apology threshold.
         self.spawn_tracker.record_success(session.id);
+        // M21 F1: the cold-start episode ends on success — the next cold
+        // start may post its own slow-spawn notice if it is slow too.
+        self.spawn_activity.end_episode(session.id);
         sessions::mark_container_running(&self.central, session.id).map_err(ManagerError::Db)?;
         copperclaw_metrics::inc_containers_spawned();
         copperclaw_metrics::observe_container_spawn_seconds(spawn_elapsed);
