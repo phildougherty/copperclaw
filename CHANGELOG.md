@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 F1: cold-start feedback — typing from message one, one slow-spawn notice, 2026-07-17)
+
+- **One slow-spawn notice.** A container spawn attempt that runs past
+  ~20s (`SLOW_SPAWN_NOTICE_AFTER`,
+  `crates/copperclaw-host/src/container_manager/cold_start.rs`) —
+  first-image-build/pull territory — now enqueues exactly one "Setting
+  things up — this can take a minute or two on the first message."
+  reply through the session's normal outbound path. Deduped per
+  cold-start episode: consecutive slow/failing attempts share one
+  notice and the flag re-arms only after a successful spawn — never
+  periodic, never repeated (the standing "no periodic status messages"
+  rejection holds). A failing spawn still feeds the existing
+  spawn-attempt-tracker -> sweep-apology path unchanged. This is a
+  default-behavior change (a new default-on notice on the slow-spawn
+  path); the default-change argument is recorded in the F1 commit/PR.
+- **`SpawnActivity` registry**
+  (`crates/copperclaw-host/src/container_manager/cold_start.rs`): the
+  container manager registers every real spawn attempt (only after the
+  pending-inbound, budget, and rate-limit gates, so deferred spawns
+  never register) for exactly as long as it runs, generation-tagged so
+  stale guards and late watchdogs can never clobber a newer attempt.
+  Boot (`crates/copperclaw-host/src/boot.rs`) shares one handle between
+  the manager and the typing ticker.
+
+### Changed (M21 F1, 2026-07-17)
+
+- **Typing from message one.** The typing ticker
+  (`crates/copperclaw-host/src/typing_ticker.rs`) widens its
+  `Running`-only gate to also cover sessions whose container spawn is
+  currently in flight (per the M21 decision-(c) architecture): a first
+  message to a fresh session now pulses the channel typing indicator
+  within one tick — through the whole image-build/boot/handshake window
+  — instead of dead air until the runner is up (previously the first
+  signal on a slow or failing spawn was the 300-second sweep apology).
+  The mid-spawn arm passes the identical pending-inbound / rate-limit
+  cooldown / routing gates as the `Running` arm; typing behavior for
+  `Running` sessions is byte-identical, and without the registry wired
+  (tests, embedders) the ticker behaves exactly as before.
+
 ### Added (M21 Wave-1 X-rider: recovery fixtures, 2026-07-17)
 
 - **Replay-level pin for the hung-tool recovery sequence.** New fixture
