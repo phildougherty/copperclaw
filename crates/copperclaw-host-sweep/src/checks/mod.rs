@@ -4,6 +4,7 @@
 
 pub mod apology;
 pub mod condition_checkin;
+pub mod goals;
 pub mod heartbeat;
 pub mod integrity;
 pub mod processing;

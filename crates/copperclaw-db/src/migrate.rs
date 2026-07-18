@@ -119,6 +119,14 @@ const CENTRAL: &[Migration] = &[
         name: "030_task_grants",
         sql: include_str!("../migrations/030_task_grants.sql"),
     },
+    // M22 A3: first-class long-running goals — the durable objective the sweep
+    // drives against (`goals`), plus its append-only progress log
+    // (`goal_progress`). Indexes over the tasks scheduler + memory store; does
+    // not replace them (decision (d)).
+    Migration {
+        name: "031_goals",
+        sql: include_str!("../migrations/031_goals.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -310,6 +318,8 @@ mod tests {
             "container_configs",
             "tasks",
             "task_grants",
+            "goals",
+            "goal_progress",
             "provider_profiles",
             "provider_health",
             "mcp_oauth_tokens",

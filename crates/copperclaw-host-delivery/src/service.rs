@@ -1347,6 +1347,17 @@ impl DeliveryService {
             self.raise_task_grant_approval(sess, row, target, inbound_pool, &action.payload)?;
             return Ok(());
         }
+        // `goal` (M22 A3): the runner emits this when the agent calls
+        // `create_goal` / `update_goal`. A goal is internal tracking state — it
+        // authorizes nothing on its own — so unlike `save_skill` / `task_grant`
+        // it applies IMMEDIATELY against the central `goals` table (mirroring
+        // `install_packages`), not via an approval card. Any external ACTION a
+        // goal check-in wake later takes stays gated by A2's grant machinery.
+        if action.name == "goal" {
+            let apply = apply_goal(&self.central, sess, &action.payload);
+            self.finish_self_mod("goal", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
 
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. The payload carries the new
@@ -4165,6 +4176,113 @@ fn apply_add_mcp_server(
     Ok(())
 }
 
+/// Apply a `goal` system payload against the central `goals` table (M22 A3).
+///
+/// Two ops:
+///   * `create` — INSERT a new goal for this session, computing the first
+///     `next_checkin` from `first_checkin` (absolute) or the `checkin_recurrence`
+///     cron; and
+///   * `update` — patch a goal by id: an `objective` refine, a `status`
+///     transition (validated by `goals::set_status`), and/or a `progress` note
+///     appended to the goal's log (accruing `progress_tokens`).
+///
+/// A goal is internal state (decision (d)), so this applies immediately — no
+/// approval gate. An unknown op / malformed payload surfaces as a
+/// `DbError::Invariant` so the delivery loop records a self-mod failure the
+/// agent can see, rather than silently dropping the row.
+fn apply_goal(
+    central: &copperclaw_db::central::CentralDb,
+    sess: &Session,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::goals::{self, GoalStatus, NewGoal, UpdateFields};
+    use copperclaw_modules::scheduling::{When, compute_next_fire};
+
+    let op = payload.get("op").and_then(serde_json::Value::as_str);
+    let body = payload.get("payload").unwrap_or(&serde_json::Value::Null);
+    let str_field = |key: &str| -> Option<String> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let i64_field =
+        |key: &str| -> Option<i64> { body.get(key).and_then(serde_json::Value::as_i64) };
+    let ts_field = |key: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+
+    match op {
+        Some("create") => {
+            let objective = str_field("objective").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("goal create: missing objective")
+            })?;
+            let checkin_recurrence = str_field("checkin_recurrence");
+            let now = chrono::Utc::now();
+            // First check-in: an explicit `first_checkin`, else derived from the
+            // recurrence, else none (a goal driven only by an external task).
+            let next_checkin = ts_field("first_checkin").or_else(|| {
+                checkin_recurrence
+                    .as_deref()
+                    .and_then(|rec| compute_next_fire(&When::At(now), now, Some(rec)))
+            });
+            goals::insert(
+                central,
+                NewGoal {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    agent_group_id: sess.agent_group_id,
+                    session_id: sess.id,
+                    objective,
+                    task_id: None,
+                    grant_id: None,
+                    token_budget: i64_field("token_budget"),
+                    checkin_recurrence,
+                    checkin_prompt: str_field("checkin_prompt"),
+                    next_checkin,
+                },
+            )?;
+            Ok(())
+        }
+        Some("update") => {
+            let id = str_field("id")
+                .ok_or_else(|| copperclaw_db::DbError::invariant("goal update: missing id"))?;
+            // Objective refine first, then status transition, then progress.
+            if let Some(objective) = str_field("objective") {
+                goals::update(
+                    central,
+                    &id,
+                    UpdateFields {
+                        objective: Some(objective),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            if let Some(status_str) = str_field("status") {
+                let status: GoalStatus = status_str
+                    .parse()
+                    .map_err(|e: String| copperclaw_db::DbError::invariant(e))?;
+                goals::set_status(central, &id, status)?;
+            }
+            if let Some(note) = str_field("progress") {
+                goals::record_progress(
+                    central,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &id,
+                    &note,
+                    i64_field("progress_tokens"),
+                )?;
+            }
+            Ok(())
+        }
+        other => Err(copperclaw_db::DbError::invariant(format!(
+            "goal: unknown op {other:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6024,6 +6142,118 @@ mod tests {
         )
         .unwrap();
         (db, ag.id)
+    }
+
+    /// A real session row over `central_with_ag`, so `apply_goal`'s FK
+    /// (`goals.agent_group_id`) resolves.
+    fn central_ag_session() -> (copperclaw_db::central::CentralDb, Session) {
+        let (db, ag) = central_with_ag();
+        let sess = copperclaw_db::tables::sessions::create(
+            &db,
+            copperclaw_db::tables::sessions::CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        (db, sess)
+    }
+
+    /// M22 A3: the host `goal` handler persists a `create` op into the central
+    /// `goals` table, computing the first check-in from the recurrence, then an
+    /// `update` op records progress + transitions the lifecycle — the full
+    /// create→progress→complete round-trip through the delivery-action payload.
+    #[test]
+    fn apply_goal_create_then_update_roundtrip() {
+        use copperclaw_db::tables::goals::{self, GoalStatus};
+        let (db, sess) = central_ag_session();
+
+        apply_goal(
+            &db,
+            &sess,
+            &json!({
+                "op": "create",
+                "payload": {
+                    "objective": "keep the docs current",
+                    "checkin_recurrence": "0 9 * * *",
+                    "token_budget": 5000
+                }
+            }),
+        )
+        .unwrap();
+
+        let created = goals::list_for_session(&db, sess.id).unwrap();
+        assert_eq!(created.len(), 1);
+        let goal = &created[0];
+        assert_eq!(goal.objective, "keep the docs current");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(goal.token_budget, Some(5000));
+        assert!(
+            goal.next_checkin.is_some(),
+            "first check-in derived from the recurrence"
+        );
+
+        // Report progress.
+        apply_goal(
+            &db,
+            &sess,
+            &json!({
+                "op": "update",
+                "payload": { "id": goal.id, "progress": "drafted README", "progress_tokens": 200 }
+            }),
+        )
+        .unwrap();
+        let after = goals::get(&db, &goal.id).unwrap().unwrap();
+        assert_eq!(after.tokens_consumed, 200);
+        assert_eq!(goals::list_progress(&db, &goal.id).unwrap().len(), 1);
+
+        // Complete it.
+        apply_goal(
+            &db,
+            &sess,
+            &json!({ "op": "update", "payload": { "id": goal.id, "status": "completed" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            goals::get(&db, &goal.id).unwrap().unwrap().status,
+            GoalStatus::Completed
+        );
+    }
+
+    #[test]
+    fn apply_goal_rejects_unknown_op_and_missing_objective() {
+        let (db, sess) = central_ag_session();
+        assert!(apply_goal(&db, &sess, &json!({ "op": "bogus", "payload": {} })).is_err());
+        assert!(
+            apply_goal(&db, &sess, &json!({ "op": "create", "payload": {} })).is_err(),
+            "create without an objective is refused"
+        );
+    }
+
+    #[test]
+    fn apply_goal_update_illegal_transition_errors() {
+        use copperclaw_db::tables::goals::{self, GoalStatus};
+        let (db, sess) = central_ag_session();
+        apply_goal(
+            &db,
+            &sess,
+            &json!({ "op": "create", "payload": { "objective": "x" } }),
+        )
+        .unwrap();
+        let id = goals::list_for_session(&db, sess.id).unwrap()[0].id.clone();
+        goals::set_status(&db, &id, GoalStatus::Completed).unwrap();
+        // Out of a terminal state is illegal → surfaces as an error the agent sees.
+        assert!(
+            apply_goal(
+                &db,
+                &sess,
+                &json!({ "op": "update", "payload": { "id": id, "status": "active" } })
+            )
+            .is_err()
+        );
     }
 
     #[test]
