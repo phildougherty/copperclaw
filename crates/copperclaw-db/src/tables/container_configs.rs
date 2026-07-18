@@ -88,7 +88,7 @@ impl SkillsSelector {
                 let limit = inner
                     .get("limit")
                     .and_then(serde_json::Value::as_u64)
-                    .map(|n| n as usize)
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
                     .ok_or_else(|| "relevant selector missing integer \"limit\"".to_string())?;
                 Ok(SkillsSelector::Relevant { query, limit })
             }
