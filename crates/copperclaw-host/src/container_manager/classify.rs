@@ -29,6 +29,26 @@ pub(crate) const CRASH_RESTART_APOLOGY_TEXT: &str = "Hit a snag mid-task and nee
 /// without bloating the session dir on a busy box.
 const CRASH_LOG_TAIL_LINES: u32 = 200;
 
+/// F2 poison-message quarantine threshold: how many times a single inbound
+/// may be in flight during a crash-restart before the host gives up on it,
+/// marks it terminally `failed` (so it is never re-processed), and emits the
+/// one-time [`POISON_QUARANTINE_APOLOGY_TEXT`]. Set low: a message that
+/// reliably crashes the runner three times running is poison (the canonical
+/// case: a huge base64 screenshot plus an oversized history), and every
+/// further retry is another guaranteed crash-loop iteration. Below this,
+/// the message is still retried on the next spawn — a genuinely transient
+/// crash (a provider blip mid-turn) recovers without losing the message.
+const QUARANTINE_CRASH_ATTEMPTS: i64 = 3;
+
+/// User-facing apology emitted exactly once when an inbound is quarantined
+/// after crashing the runner [`QUARANTINE_CRASH_ATTEMPTS`] times. Distinct
+/// from [`CRASH_RESTART_APOLOGY_TEXT`] (the transient-crash notice) so a user
+/// scanning chat understands this message was permanently skipped, not
+/// retried — and so an operator can tell the two apart in logs.
+pub(crate) const POISON_QUARANTINE_APOLOGY_TEXT: &str = "One of your recent messages repeatedly crashed the agent, so I'm \
+     skipping it to recover. If it had an attachment (like a large image or \
+     file), try resending a smaller version or describing it in text instead.";
+
 /// Title of the once-per-episode OOM `ErrorCard` (M21 S4).
 const OOM_CARD_TITLE: &str = "Task keeps running out of memory";
 
@@ -635,38 +655,104 @@ fn emit_crash_restart_apologies(
 
     let now = chrono::Utc::now();
     let mut emitted = 0u32;
+    let mut quarantined = 0u32;
     for message_id in processing {
+        // F2 poison-message quarantine: bump this inbound's per-message crash
+        // counter FIRST. `emit_crash_restart_apologies` runs exactly once per
+        // crash-restart (and is idempotent across reconcile-tick repeats — it
+        // scans `processing_ack.status='processing'` rows, which this pass
+        // flips to `Failed`), so the counter advances by exactly one per crash
+        // this message survives in flight. A missing row (already reaped /
+        // idempotent repeat) yields no counter but still falls through to the
+        // claim cleanup so we never spin on it.
+        let attempts = match messages_in::increment_crash_attempts(&inbound, message_id) {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    message = %message_id.as_uuid(),
+                    ?err,
+                    "could not bump crash_attempts (inbound row missing?); continuing"
+                );
+                0
+            }
+        };
+
         // Look up the inbound row's routing. If the row is missing or
         // lacks channel routing, fall through to the mark-as-Failed
         // step so we don't loop on the same row again.
         let routing = lookup_inbound_routing(&inbound, message_id)?;
 
-        if let Some(routing) = routing {
-            let apology = WriteOutbound {
-                id: MessageId::new(),
-                in_reply_to: Some(routing.message_id),
-                timestamp: now,
-                deliver_after: None,
-                recurrence: None,
-                kind: MessageKind::Chat,
-                channel_type: Some(routing.channel_type.clone()),
-                platform_id: Some(routing.platform_id.clone()),
-                thread_id: routing.thread_id.clone(),
-                content: serde_json::json!({ "text": CRASH_RESTART_APOLOGY_TEXT }),
-            };
-            insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
-            emitted += 1;
+        if attempts >= QUARANTINE_CRASH_ATTEMPTS {
+            // The message has crashed the runner K times: it is poison. Mark
+            // the inbound row terminally `failed` so `get_pending` /
+            // `count_due` (both `status='pending'`-scoped) stop returning it —
+            // the retry loop is broken here, at the exact lifecycle point that
+            // otherwise re-claims it on every respawn. Emit the distinct
+            // one-time quarantine apology (once — after this, the row is no
+            // longer pending, so no fresh claim and no repeat apology).
+            if let Err(err) = messages_in::mark_failed(&inbound, message_id) {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    message = %message_id.as_uuid(),
+                    ?err,
+                    "could not quarantine (mark inbound failed); poison may retry"
+                );
+            }
+            if let Some(routing) = &routing {
+                let apology = WriteOutbound {
+                    id: MessageId::new(),
+                    in_reply_to: Some(routing.message_id),
+                    timestamp: now,
+                    deliver_after: None,
+                    recurrence: None,
+                    kind: MessageKind::Chat,
+                    channel_type: Some(routing.channel_type.clone()),
+                    platform_id: Some(routing.platform_id.clone()),
+                    thread_id: routing.thread_id.clone(),
+                    content: serde_json::json!({ "text": POISON_QUARANTINE_APOLOGY_TEXT }),
+                };
+                insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
+            }
+            quarantined += 1;
+            warn!(
+                session = %session.id.as_uuid(),
+                message = %message_id.as_uuid(),
+                attempts,
+                "poison inbound quarantined: crashed the runner too many times; skipping it"
+            );
+        } else {
+            // Below the quarantine threshold: transient-crash path. Emit the
+            // generic restart apology (if routed) and stamp the inbound so the
+            // host-sweep `pending_too_long` apology path stays out. The row is
+            // left `pending`, so the respawned runner retries it.
+            if let Some(routing) = &routing {
+                let apology = WriteOutbound {
+                    id: MessageId::new(),
+                    in_reply_to: Some(routing.message_id),
+                    timestamp: now,
+                    deliver_after: None,
+                    recurrence: None,
+                    kind: MessageKind::Chat,
+                    channel_type: Some(routing.channel_type.clone()),
+                    platform_id: Some(routing.platform_id.clone()),
+                    thread_id: routing.thread_id.clone(),
+                    content: serde_json::json!({ "text": CRASH_RESTART_APOLOGY_TEXT }),
+                };
+                insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
+                emitted += 1;
+            }
+            // Stamp the inbound row so the host-sweep apology path won't
+            // also fire `pending_too_long` for it. We do this even when
+            // routing was missing — the row stays pending but won't get a
+            // second apology from the sweep.
+            mark_inbound_tries(&inbound, message_id)?;
         }
-
-        // Stamp the inbound row so the host-sweep apology path won't
-        // also fire `pending_too_long` for it. We do this even when
-        // routing was missing — the row stays pending but won't get a
-        // second apology from the sweep.
-        mark_inbound_tries(&inbound, message_id)?;
 
         // Flip the claim to Failed so the host-sweep `processing` reset
         // path won't also fire and create a duplicate retry. The
-        // runner-restart path owns this inbound from here on.
+        // runner-restart path owns this inbound from here on. Both the
+        // quarantine and the retry path do this.
         if let Err(err) =
             processing_ack::update_status(&outbound, message_id, ProcessingStatus::Failed)
         {
@@ -682,6 +768,7 @@ fn emit_crash_restart_apologies(
     info!(
         session = %session.id.as_uuid(),
         emitted,
+        quarantined,
         "crash-restart apologies emitted"
     );
     Ok(())
@@ -1402,6 +1489,179 @@ mod tests {
             chats2.len(),
             1,
             "second crash-restart tick must not emit a duplicate apology"
+        );
+    }
+
+    /// F2 (A) poison quarantine: an inbound that is in flight during
+    /// `QUARANTINE_CRASH_ATTEMPTS` successive crashes is quarantined — marked
+    /// terminally `failed` so it is never re-processed — and the user gets the
+    /// distinct one-time "repeatedly crashed" apology. Below the threshold the
+    /// message stays `pending` (still retried) and gets the transient-crash
+    /// apology. Drives `emit_crash_restart_apologies` directly, re-establishing
+    /// the `processing` claim between crashes exactly as a respawned runner
+    /// re-claiming the still-pending inbound would.
+    #[test]
+    fn poison_inbound_quarantined_after_k_crashes_but_retries_under_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+
+        let msg_id = copperclaw_types::MessageId::new();
+        let inbound = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &inbound,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "poison"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-42".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: Some("thread-7".into()),
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        let outbound = open_outbound(&paths).unwrap();
+        processing_ack::insert(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+
+        let read_status = |conn: &rusqlite::Connection| -> String {
+            conn.query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                params![msg_id.as_uuid().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Crashes 1..K-1: below threshold → message stays pending (retried),
+        // and it remains due for the next spawn.
+        for attempt in 1..QUARANTINE_CRASH_ATTEMPTS {
+            emit_crash_restart_apologies(&paths, &session).unwrap();
+            assert_eq!(
+                read_status(&inbound),
+                "pending",
+                "under K (attempt {attempt}) the message must stay pending for retry"
+            );
+            assert_eq!(
+                messages_in::count_due(&inbound).unwrap(),
+                1,
+                "under K the message is still due for the next spawn"
+            );
+            // The respawned runner re-claims the still-pending inbound.
+            processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+        }
+
+        // The K-th crash quarantines it.
+        emit_crash_restart_apologies(&paths, &session).unwrap();
+        assert_eq!(
+            read_status(&inbound),
+            "failed",
+            "at K crashes the poison message is quarantined (terminally failed)"
+        );
+        assert_eq!(
+            messages_in::count_due(&inbound).unwrap(),
+            0,
+            "a quarantined message is no longer processed"
+        );
+        let attempts: i64 = inbound
+            .query_row(
+                "SELECT crash_attempts FROM messages_in WHERE id = ?1",
+                params![msg_id.as_uuid().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, QUARANTINE_CRASH_ATTEMPTS);
+
+        // A distinct quarantine apology was emitted (not the transient one).
+        let chats: Vec<_> = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        let quarantine_apology = chats.iter().any(|r| {
+            r.content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t.contains("repeatedly crashed the agent"))
+        });
+        assert!(
+            quarantine_apology,
+            "expected the distinct poison-quarantine apology, got {chats:?}"
+        );
+    }
+
+    /// F2 (A) idempotency: once quarantined (inbound `failed`, claim `Failed`),
+    /// a further crash-restart pass finds no `processing` claim and neither
+    /// re-quarantines nor emits a duplicate apology.
+    #[test]
+    fn quarantine_is_idempotent_across_repeat_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+
+        let msg_id = copperclaw_types::MessageId::new();
+        let inbound = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &inbound,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "poison"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-9".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        let outbound = open_outbound(&paths).unwrap();
+        processing_ack::insert(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+
+        // Drive it to quarantine.
+        for _ in 0..QUARANTINE_CRASH_ATTEMPTS {
+            emit_crash_restart_apologies(&paths, &session).unwrap();
+            processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+        }
+        let chats_before = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .count();
+
+        // Now mark the claim Failed (the quarantine pass already did, but the
+        // loop above re-set it to Processing on its last turn). Simulate the
+        // sweep having reset it — a fresh pass with the message already
+        // `failed` must not re-quarantine or re-apologise.
+        processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Failed).unwrap();
+        emit_crash_restart_apologies(&paths, &session).unwrap();
+        let chats_after = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .count();
+        assert_eq!(
+            chats_after, chats_before,
+            "a repeat pass after quarantine must not emit more apologies"
         );
     }
 

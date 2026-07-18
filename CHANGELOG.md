@@ -8,6 +8,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Host-side self-recovery: no repeated crash can loop a session forever
+  (F2).** A poison inbound (the canonical case: a huge base64 screenshot plus
+  an oversized history) used to crash the runner on startup, get re-claimed on
+  every respawn, and crash-loop indefinitely (the 2026-07-18 incident: the
+  crash streak climbed past 15 on a flat backoff until an operator manually
+  cleared the history). Two host-side backstops close that class of failure:
+  - **Poison-message quarantine.** `emit_crash_restart_apologies`
+    (`crates/copperclaw-host/src/container_manager/classify.rs`) now bumps a
+    per-message `messages_in.crash_attempts` counter (new column, migration
+    `033_messages_in_crash_attempts.sql`) once per in-flight message per
+    crash-restart. After `QUARANTINE_CRASH_ATTEMPTS` (3) crashes it marks that
+    inbound row terminally `status='failed'` — so `get_pending` / `count_due`
+    (both `pending`-scoped) stop returning it, breaking the retry loop at the
+    exact lifecycle point that re-claimed it — and emits a distinct one-time
+    "your message repeatedly crashed the agent; skipping it" apology. Below the
+    threshold the message still retries, so a genuinely transient crash loses
+    nothing. New DB helper `messages_in::increment_crash_attempts`.
+  - **Safe-mode respawn after a crash streak.** When a session's
+    consecutive-crash streak reaches `RECOVERY_MODE_STREAK` (5) — read from the
+    existing per-session `CrashLoopTracker` via new `current_streak`
+    (`crates/copperclaw-host/src/container_manager/crash_loop.rs`) — the host
+    writes `recovery_mode: true` into `runner.json`
+    (`RunnerConfigForFile`, `runner_config.rs`). The runner reads it at startup
+    (`run_loop`, `crates/copperclaw-runner/src/run/mod.rs`) and aggressively
+    truncates its persisted `state.history` to a small recent window
+    (`RECOVERY_KEEP_MESSAGES` = 8, clearing the now-incompatible continuation)
+    via F1's LLM-free `compaction::truncate_to_recent` — self-healing a
+    persistent history/context problem instead of looping. The flag is
+    transient: it clears as soon as the streak resets after a spawn survives.
+  Both defaults are safe: a non-crashing session gets `crash_attempts = 0`,
+  no `recovery_mode` key in its `runner.json`, and byte-identical startup
+  behaviour. Config field carries `#[serde(default)]` for back-compat with
+  runner.json files written before F2.
 - **Preview links can advertise a stable off-LAN host (e.g. Tailscale).** When
   `preview_bind` is `0.0.0.0`, the shareable `__preview` URL previously always
   used the auto-detected `192.168.x` LAN IP, which is unreachable when the

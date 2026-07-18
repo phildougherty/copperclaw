@@ -1,0 +1,25 @@
+-- Per-session inbound: per-message crash accounting for poison-message
+-- quarantine (fix F2).
+--
+-- Background: a single inbound that reliably crashes the runner on startup
+-- (the canonical case: a huge base64 screenshot plus an oversized history)
+-- is re-claimed on every respawn, crashes again, and loops forever — the
+-- crash-restart path marks the in-flight `processing_ack` claim Failed but
+-- leaves the `messages_in` row `status='pending'`, so the next spawn simply
+-- retries the same poison. The 2026-07-18 incident looped past a
+-- crash_streak of 15 until an operator manually cleared the history.
+--
+-- This column records how many times THIS specific message has been in
+-- flight during a crash-restart. The host's crash-restart path increments
+-- it per message per crash; once it reaches the quarantine threshold K the
+-- host marks the row terminally `status='failed'` (so `get_pending` /
+-- `count_due` — both `status='pending'`-scoped — stop returning it) and
+-- emits a one-time "this message repeatedly crashed the agent; skipping it"
+-- apology. Distinct from `tries` (the APOLOGY_TRIES_MARKER=99 sentinel the
+-- host-sweep apology path overloads that column with), so the two dedupe
+-- mechanisms never collide.
+--
+-- Existing rows default to 0 (never crashed the runner) — byte-identical
+-- behaviour for every message on the healthy path.
+
+ALTER TABLE messages_in ADD COLUMN crash_attempts INTEGER NOT NULL DEFAULT 0;

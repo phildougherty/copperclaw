@@ -151,6 +151,14 @@ const SESSION_INBOUND: &[Migration] = &[
         name: "024_session_mcp_call_responses",
         sql: include_str!("../migrations/024_session_mcp_call_responses.sql"),
     },
+    // F2: per-message crash accounting for poison-message quarantine. The
+    // host's crash-restart path increments `messages_in.crash_attempts` per
+    // in-flight message per crash and quarantines (terminal `status='failed'`)
+    // a message that crashes the runner K times.
+    Migration {
+        name: "033_messages_in_crash_attempts",
+        sql: include_str!("../migrations/033_messages_in_crash_attempts.sql"),
+    },
 ];
 
 const SESSION_OUTBOUND: &[Migration] = &[

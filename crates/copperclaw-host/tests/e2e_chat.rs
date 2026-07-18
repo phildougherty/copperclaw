@@ -380,6 +380,8 @@ async fn run_one_turn(
         active_grant: Arc::new(std::sync::Mutex::new(
             copperclaw_runner::run::GrantGateState::default(),
         )),
+        // F2: healthy e2e turn — recovery mode off.
+        recovery_mode: false,
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

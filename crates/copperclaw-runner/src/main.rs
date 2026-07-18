@@ -253,6 +253,11 @@ async fn main() -> Result<()> {
         active_grant: std::sync::Arc::new(std::sync::Mutex::new(
             copperclaw_runner::run::GrantGateState::default(),
         )),
+        // F2 safe-mode respawn: the host flips `runner.json`'s `recovery_mode`
+        // on once a session's container crash streak reaches its threshold, so
+        // the runner truncates an oversized persisted history at startup rather
+        // than crash-looping on it. Default-false for the healthy path.
+        recovery_mode: cfg.recovery_mode,
     };
 
     tracing::info!(
@@ -472,6 +477,7 @@ mod build_provider_tests {
             check_command_override: None,
             verify_gate: true,
             failover_chain: Vec::new(),
+            recovery_mode: false,
         }
     }
 
