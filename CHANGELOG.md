@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M22 A5 — consolidate recurrence into the central tasks scheduler)
+
+- **One recurrence mechanism, not two.** The per-session `messages_in.recurrence`
+  self-replication engine
+  (`crates/copperclaw-host-sweep/src/checks/recurrence.rs`) duplicated the
+  central `tasks` scheduler (`checks/scheduling.rs`, migration 028) but — unlike
+  it — had no lifecycle surface (no `list` / `pause` / `resume` / `cancel`).
+  A5 turns `recurrence.rs` into a **deprecation shim**: instead of inserting a
+  fresh `messages_in` row at each next fire, it now forwards each legacy
+  recurring series into a central `tasks` row and clears the `recurrence` column
+  on the source rows so the old path never fires that series again. Recurrence
+  therefore gains the full task lifecycle (`list_tasks` / `pause_task` /
+  `resume_task` / `cancel_task`) for free — the whole point of the
+  consolidation.
+- **Idempotent, operator-safe forward.** The synthesised task id is derived
+  deterministically from the series
+  (`recurring:<session>:<series_key>`), so a series migrates exactly once; the
+  `recurring:` prefix cannot collide with an agent-authored `task_<uuid>` id;
+  and the presence check means a task an operator later cancelled or paused is
+  never resurrected by the shim. Because the migration clears the source rows'
+  `recurrence`, an already-migrated series no longer appears in the per-session
+  scan on the next pass.
+- **No migration added.** Legacy per-session recurrence lives in each session's
+  `inbound.db`, which a central-DB SQL migration cannot reach, so the data-path
+  conversion happens at runtime in the sweep the first time it observes an
+  existing recurring series (033 was the next free migration number but is left
+  unused by A5). Wiring: `crates/copperclaw-host-sweep/src/service.rs`'s
+  `run_once` now passes the central DB handle into `recurrence::check` (kept
+  alongside the A3 goal + A4 condition blocks). Behaviour note: a forwarded
+  series fires through the central scheduler with `platform_id` / `channel_type`
+  / `thread_id` unset, exactly as agent-scheduled tasks already do — recurring
+  self-wakes never carried a user venue in practice.
+
 ### Added (M22 A4 — revive condition/event check-ins)
 
 - **Conditions schema (`conditions` + `condition_flags` tables, migration
