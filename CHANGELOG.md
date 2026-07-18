@@ -22,6 +22,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`todo_watcher` background loop no longer restart-storms when disabled.**
+  The todo-notifications watcher is opt-in (`COPPERCLAW_TODO_NOTIFICATIONS`,
+  default off), but its `run_loop` *returned immediately* when the flag was
+  unset — and the supervisor classifies any return while the host is running
+  as an unexpected exit, so it restarted the loop forever (100+ restarts,
+  surfacing as a `todo_watcher (dead)` FAIL in `cclaw doctor`). It now PARKS on
+  the shutdown token when disabled, exiting only on real shutdown (an expected
+  drain). `crates/copperclaw-host/src/todo_watcher.rs`; regression test
+  `disabled_watcher_parks_until_shutdown_instead_of_returning`.
 - **Host-side self-recovery: no repeated crash can loop a session forever
   (F2).** A poison inbound (the canonical case: a huge base64 screenshot plus
   an oversized history) used to crash the runner on startup, get re-claimed on
