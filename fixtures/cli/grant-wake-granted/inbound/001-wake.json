@@ -1,0 +1,18 @@
+{
+  "channel_type": null,
+  "platform_id": null,
+  "thread_id": null,
+  "message": {
+    "id": "fixture-grant-wake-001",
+    "kind": "task",
+    "content": {
+      "text": "Post the morning standup digest.",
+      "task_id": "t-standup",
+      "task_name": "standup"
+    },
+    "timestamp": "2026-01-01T09:00:00Z"
+  },
+  "reply_to": null,
+  "sender": null,
+  "_note": "Scaffold: a scheduled fire is a kind:task row synthesised by the sweep straight into messages_in (it bypasses the router). The AX X-rider seeds the tasks row + fires it via the M21 test-clock seam rather than routing this as a channel event; this file documents the wake row's shape (content.task_id drives the runner's firing-task resolution)."
+}

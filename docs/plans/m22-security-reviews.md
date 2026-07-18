@@ -222,3 +222,145 @@ less, than reality once A2 records spend).
 every read, host-controlled task binding + granter identity, and a tight
 exhaustively-tested scope matcher. A1 adds authorization *data*, not an open
 gate; the gate itself is A2's review.
+
+## A2 — Enforce grants at the autonomy gate (Wave 2, lane N) — MARQUEE, MOST SECURITY-SENSITIVE
+
+**Scope.** A2 is the card that turns A1's stored authorization into the ability
+to *act*. It is the one place in the program that opens the autonomy brake, so
+this verdict is exhaustive. Files: `crates/copperclaw-runner/src/run/{mod.rs,
+blocker.rs,tool_dispatch.rs}` (+ a required `RunnerDeps.active_grant` field and
+its one construction line in `main.rs`). No changes to `policy.rs`, the DB, the
+host approval path, or the sweep — A2 consumes A1's `scope_permits` /
+`effective_grant` contract.
+
+### The exact condition under which `approved` becomes true
+
+There is no turn-wide "approved" flip. `set_turn_provenance(autonomous, false)`
+keeps the blanket taint-clearing bool wired `false` for every autonomous turn
+(as before). The *only* thing that admits a credentialed external action on an
+autonomous turn is, per-call in `tool_dispatch::invoke_tool`, a
+`AutonomyVerdict::Granted` from `autonomy_verdict(...)`, which is returned iff
+**all** of:
+
+1. the turn is autonomous (`is_autonomous_turn()`), AND
+2. the tool is in the credentialed-external set (`policy::is_credentialed_external`),
+   AND
+3. a grant snapshot is present on `RunnerDeps.active_grant`, AND
+4. that grant `is_live(now)` — not expired, fires_remaining not `Some(<=0)`,
+   tokens_remaining not `Some(<=0)` (a defence-in-depth re-check on top of the
+   host's `effective_grant`, evaluated against the runner's own clock), AND
+5. `grant.permits(required_capability(tool, input))` is true — A1's
+   case-sensitive, non-widening `scope_permits`.
+
+When granted, A2 drops **only** `trust.autonomous` for **that single call** (a
+locally-built `TurnTrust`), then runs the unchanged `policy.evaluate`. It does
+**not** set `trust.approved` — so the taint gate remains fully in force: a
+granted action on a web-tainted turn is still blocked as `untrusted-provenance`
+until a fresh human approval. A grant opens the *autonomy* gate for its scope,
+never the taint gate. (Test: `grant_opens_autonomy_but_not_the_taint_gate`.)
+
+### Proof that blanket approval never happens
+
+- `set_turn_provenance`'s second argument is a literal `false` at the only call
+  site (`run/mod.rs`); grep confirms no other caller passes `true` for an
+  autonomous turn.
+- The autonomy verdict is computed **per tool call** from `(tool_name,
+  structural args, live grant, now)`; there is no state that says "this whole
+  turn is approved."
+- The scope check is A1's `scope_permits`, which returns `false` for an empty
+  scope, requires an exact class/resource match, and never widens across
+  classes. An unrelated grant (`web_fetch`) does not authorize `install_packages`
+  (test `out_of_scope_grant_blocks_with_clear_reason_and_no_charge`).
+- A human (non-autonomous) turn is never gated and never consults the grant, so
+  a stray snapshot can't leak into a human turn
+  (`grant_does_not_affect_human_turns`).
+
+### The tool → required-capability mapping and why it can't be widened
+
+`required_capability(name, input)` is deliberately narrow and derives the token
+**only from the tool name and its structural arguments — never from model- or
+content-supplied free text**:
+
+- `mcp__<server>__<tool>` → `mcp:<server>` (server taken from the runtime
+  namespace, not the arguments).
+- `web_fetch` → `web_fetch:<host>` (host parsed from the `url` arg, userinfo +
+  port stripped, lower-cased) or bare `web_fetch` when unparseable.
+- every other credentialed-external tool → its own name as the bare class.
+
+A prompt-injected turn therefore cannot manufacture authorization: to run
+`install_packages` the grant must literally carry `install_packages` (or a bare
+class token that A1's matcher treats as class-level). The `required` token is
+never lifted from a fetched page, a memory hit, or a model-chosen string; the
+worst a poisoned turn controls is the URL host (which only *narrows* the token —
+a host-scoped grant still has to name that exact host). The mapping fails
+closed: an unmapped tool maps to its bare name, which a resource-scoped grant
+will not match. (Tests: `required_capability_maps_each_action`,
+`autonomy_verdict_gates_only_autonomous_credentialed_external`.)
+
+### Budget / expiry enforcement (block-not-charge)
+
+- **Fires** are the in-advance budget: one fire = one turn. `charge_grant_fire_once`
+  emits a `grant_consume { grant_id, task_id, fires: 1 }` System row to
+  `outbound.db` **once per turn** (latched on `GrantGateState.fire_consumed`,
+  reset each turn), and only **after** the action clears every policy layer and
+  is about to dispatch — so a taint-blocked or policy-denied action is never
+  charged (`grant_opens_autonomy_but_not_the_taint_gate`,
+  `out_of_scope_grant_..._no_charge`). Cross-fire enforcement: the host writes a
+  live snapshot only while `effective_grant` reports fires/tokens/expiry
+  remaining, and the delivery handler applies each `grant_consume` back to
+  central via `consume_fire` (companion plumbing, below) so `max_fires` bounds
+  across fires.
+- **Expiry / exhaustion**: an inert snapshot (expired, or `fires_remaining` /
+  `tokens_remaining` `Some(<=0)`) fails `is_live`, so `autonomy_verdict` returns
+  `NotGated` and the action falls to the policy layer's blanket autonomous deny —
+  it is **blocked, not allowed-then-charged** (tests
+  `autonomy_verdict_inert_grant_authorizes_nothing`,
+  `expired_grant_leaves_autonomous_action_blocked`,
+  `load_turn_grant_absent_or_inert_is_none`).
+
+### Out-of-scope actions still block + propose
+
+An autonomous credentialed-external action not covered by a live grant returns a
+model-facing deny naming the required capability and the grant scope, carrying
+the stable `autonomous (heartbeat/scheduled) turn` hint. `blocker.rs::classify`
+routes it (and the blanket policy deny) to `BlockerCategory::Autonomous`, whose
+wall card tells the user to send the request themselves or pre-authorize the
+task with a bounded, expiring grant. Read-then-propose is intact: memory search,
+`send_message`, and local tools always pass on an autonomous turn
+(`ungranted_autonomous_action_is_blocked_and_can_still_propose`).
+
+### No autonomous path bypasses the check
+
+The gate lives in `tool_dispatch::invoke_tool`, the single funnel every
+model-requested tool call passes through — first-party tools, external MCP
+(`mcp__*`), and the host-brokered preview verbs all route through it, and the
+credentialed-external classifier already covers each. Self-generated wakes never
+touch the router, so there is no router-side path to route around; the runner is
+the correct and only place for the gate (decision (b)). `web_search` (autonomy-
+gated, taint-exempt) and the LAN preview verbs are still autonomy-gated here, so
+the grant is the only opener for them too.
+
+### Residual risk / companion plumbing (out of A2's runner scope)
+
+A2 delivers the complete, tested **runner enforcement**. Two host-side seams are
+required for the *live* path and are documented as companion plumbing (they land
+outside A2's exclusive file scope — the sweep and host delivery are owned by
+other lanes): (1) a writer that snapshots `task_grants::effective_grant` to
+`<session>/grant.json` at fire/spawn time, and (2) a delivery handler that
+applies the runner's `grant_consume` rows to central via
+`consume_fire`/`consume_tokens`. **Until both land the gate stays closed** —
+`grant.json` is absent, so `load_turn_grant` returns `None` and every autonomous
+credentialed-external action is blocked (byte-identical to today's safe
+default). This is a fail-closed staging, not an open hole: the enforcement can
+only *deny*; it cannot *grant* until a host-written, human-approved snapshot
+exists. Precise cross-turn token decrement is likewise deferred to the delivery
+handler; within a turn, fires + expiry + the host's `effective_grant` are the
+hard bounds.
+
+**Verdict: PASS.** The gate opens only per-task, per-call, within an
+approved+live+in-scope grant, never blanket; the required-capability mapping is
+runtime-derived and un-widenable; budget/expiry are enforced block-not-charge;
+out-of-scope and ungranted actions stay blocked and fall to read-then-propose;
+and there is no autonomous path to an external sink that skips the check. The
+one caveat is the fail-closed staging of the two host companion seams, which
+cannot weaken the default (absent snapshot ⇒ closed brake).

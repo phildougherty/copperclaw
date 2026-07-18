@@ -44,6 +44,45 @@ adheres to [Semantic Versioning](https://semver.org/).
   immediately into the central `goals` table — a goal is internal state and
   authorizes nothing on its own, so it is not approval-gated (any action a
   check-in wake later takes stays gated by A2's grant machinery).
+### Added (M22 A2 — enforce capability grants at the autonomy gate, Wave 2 marquee)
+- The autonomy gate: a scheduled / heartbeat (autonomous) turn may now take a
+  credentialed external action, but **only** when the firing task carries a
+  live, human-approved capability grant (M22 A1) whose scope permits that
+  specific action. The brake stays closed by default (decision (b)); the grant
+  opens it per-task, bounded, and pre-authorized — never blanket. Anything
+  outside the grant stays blocked → read-then-propose (an approval / wall card).
+  - `crates/copperclaw-runner/src/run/tool_dispatch.rs`: new `TurnGrant` /
+    `GrantGateState` types (the runner-side view of A1's `effective_grant`),
+    `required_capability()` (the tool-call → required-capability-token mapping),
+    and `autonomy_verdict()` (the per-call grant consult). `invoke_tool` now
+    consults the firing task's grant before the policy layers: an in-scope
+    action drops the autonomous block for that call only (the taint gate still
+    applies independently) and charges **one fire** per turn via a
+    `grant_consume` outbound System row; an out-of-scope action returns a
+    clear, classifiable deny; an ungranted action falls through to the existing
+    blanket autonomous deny. Why: self-generated wakes bypass the router, so the
+    gate has to live where every autonomous dispatch funnels through.
+  - `crates/copperclaw-runner/src/run/mod.rs`: at turn start `run_loop` resolves
+    the firing task id from the `kind: task` wake row (`content.task_id`, then
+    `series_id`) and loads the host-written grant snapshot
+    (`<data_root>/grant.json`, the firing task's `effective_grant`) into the new
+    `RunnerDeps::active_grant`, verifying the snapshot's `task_id` matches the
+    firing task and re-checking liveness (fail-closed). `set_turn_provenance`'s
+    blanket `approved` stays `false` — scoping is per-call.
+  - `crates/copperclaw-runner/src/run/blocker.rs`: the out-of-scope-grant deny
+    classifies to `BlockerCategory::Autonomous`, and its wall card now points the
+    user at pre-authorizing the task with a bounded, expiring grant.
+- `fixtures/cli/grant-wake-granted/` + `fixtures/cli/grant-wake-ungranted/`:
+  scaffold wake transcripts (granted-act vs ungranted-propose) with the grant
+  snapshot + READMEs specifying the task-fire / grant plumbing and `replay.rs`
+  registration the AX X-rider consolidates.
+- **Companion plumbing required for the live path** (documented in
+  `docs/plans/m22-security-reviews.md` §A2, out of A2's runner scope): a host
+  writer that snapshots `task_grants::effective_grant` to
+  `<session>/grant.json` at fire/spawn time, and a delivery handler that applies
+  the runner's `grant_consume` System rows back to central via
+  `task_grants::consume_fire`. Until those land the gate stays closed
+  (secure-by-default).
 
 ### Added (M22 CX — Wave-1 coding replay fixtures)
 - `fixtures/cli/post-edit-digest/` + `tests/replay.rs::cli_post_edit_digest_feeds_diagnostics_back`:

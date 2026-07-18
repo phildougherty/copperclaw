@@ -1,0 +1,8 @@
+{
+  "grant_id": "grant-standup-001",
+  "task_id": "t-standup",
+  "capability_scope": "web_fetch",
+  "tokens_remaining": 100000,
+  "fires_remaining": 30,
+  "expires_at": "2099-01-01T00:00:00Z"
+}

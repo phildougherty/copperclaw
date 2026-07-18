@@ -93,8 +93,10 @@ impl BlockerCategory {
             Self::Autonomous => (
                 "Blocked: this needs a person",
                 "I couldn't take an action that reaches outside the sandbox on an \
-                 automatic (scheduled) run — no one was here to approve it. Send the \
-                 request yourself and I'll do it.",
+                 automatic (scheduled) run — it isn't covered by an approved grant. \
+                 Send the request yourself and I'll do it, or pre-authorize it when \
+                 you schedule the task (a bounded, expiring capability grant) so I \
+                 can act next time.",
             ),
             Self::Policy => (
                 "Blocked: that action isn't permitted here",
@@ -123,7 +125,13 @@ pub(super) fn classify(content: &str) -> Option<BlockerCategory> {
         Some(BlockerCategory::VerifyGate)
     } else if content.contains("untrusted-provenance") {
         Some(BlockerCategory::Provenance)
-    } else if content.contains("autonomous (heartbeat/scheduled) turn") {
+    } else if content.contains("autonomous (heartbeat/scheduled) turn")
+        || content.contains("approved grant")
+    {
+        // Both the policy layer's blanket autonomous deny and M22 A2's
+        // "outside this task's approved grant" deny land here — an autonomous
+        // fire whose action isn't pre-authorized surfaces the same "needs a
+        // person / pre-authorize it" wall.
         Some(BlockerCategory::Autonomous)
     } else if content.contains("tool profile.")
         || content.contains("(read-only).")
@@ -239,6 +247,28 @@ mod tests {
         assert_eq!(
             classify("Tool `shell` is not in the active skill's allowed-tools list."),
             Some(BlockerCategory::Policy)
+        );
+    }
+
+    #[test]
+    fn classify_maps_grant_scope_deny_to_autonomous() {
+        // M22 A2: an autonomous action outside the firing task's approved grant
+        // is the read-then-propose wall — classified Autonomous, same as the
+        // policy layer's blanket autonomous deny.
+        assert_eq!(
+            classify(
+                "Tool `install_packages` takes a credentialed external action requiring \
+                 capability `install_packages`, which is outside this task's approved grant \
+                 (scope: `web_fetch`) on this autonomous (heartbeat/scheduled) turn. Search \
+                 memory and propose the action for a human turn to approve instead."
+            ),
+            Some(BlockerCategory::Autonomous)
+        );
+        // The `approved grant` hint alone also classifies (defensive against the
+        // policy wording drifting).
+        assert_eq!(
+            classify("blocked: not covered by an approved grant"),
+            Some(BlockerCategory::Autonomous)
         );
     }
 

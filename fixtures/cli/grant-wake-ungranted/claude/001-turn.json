@@ -1,0 +1,23 @@
+{
+  "_note": "Ungranted-propose: turn 1 the model attempts a credentialed-external action (web_fetch) which the autonomy gate blocks (no grant); turn 2 it proposes the action to a human via send_message instead of silently giving up.",
+  "turns": [
+    {
+      "events": [
+        {"type": "message_start", "message": {"id": "msg_replay_grant_ung_001"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_ung_1", "name": "web_fetch", "input": {}}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"url\": \"https://board.example/report\"}"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_stop"}
+      ]
+    },
+    {
+      "events": [
+        {"type": "message_start", "message": {"id": "msg_replay_grant_ung_002"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I can't send that on a scheduled run without approval. Approve it (or pre-authorize this task with a bounded grant) and I'll do it."}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_stop"}
+      ]
+    }
+  ]
+}

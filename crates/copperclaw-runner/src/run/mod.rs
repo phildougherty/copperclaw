@@ -27,6 +27,11 @@ pub(super) mod provider_call;
 pub(super) mod reaction;
 pub(super) mod tool_dispatch;
 
+// M22 A2: the autonomy-gate types appear in [`RunnerDeps`]'s public
+// `active_grant` field, so re-export them at the (public) `run` module path to
+// keep the type publicly reachable (the runner binary constructs the field).
+pub use tool_dispatch::{GrantGateState, TurnGrant};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -498,6 +503,17 @@ pub struct RunnerDeps {
     /// inject a [`crate::clock::TestClock`] and advance it by hand so
     /// timed legs no longer need real waits.
     pub clock: Arc<dyn crate::clock::Clock>,
+    /// M22 A2 autonomy gate: the capability grant governing the current
+    /// autonomous (scheduled / heartbeat) turn, plus its per-turn
+    /// fire-consumed latch. [`run_loop`] rewrites it at the top of every turn
+    /// from the host-written `<data_root>/grant.json` snapshot (the firing
+    /// task's `effective_grant` — see [`tool_dispatch::TurnGrant`]); the
+    /// dispatch gate ([`tool_dispatch::invoke_tool`]) reads it per call to
+    /// decide whether a credentialed external action is pre-authorized. Shared
+    /// behind an `Arc<Mutex>` because `invoke_tool` only holds `&RunnerDeps`
+    /// yet must latch the fire. Default (`minimal`, and every human turn) is an
+    /// empty state that authorizes nothing — the brake stays closed.
+    pub active_grant: Arc<std::sync::Mutex<tool_dispatch::GrantGateState>>,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -591,6 +607,11 @@ impl RunnerDeps {
             // Real time by default — the S6 seam only changes behaviour
             // when a test injects a TestClock explicitly.
             clock: Arc::new(crate::clock::SystemClock),
+            // A2: the brake starts closed — no grant authorizes anything until
+            // `run_loop` loads a live grant snapshot for an autonomous fire.
+            active_grant: Arc::new(std::sync::Mutex::new(
+                tool_dispatch::GrantGateState::default(),
+            )),
         }
     }
 }
@@ -778,18 +799,39 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
 
-        // PROVENANCE / autonomy gate (Phase 3): classify this turn as
-        // autonomous when nothing in the batch is a human channel message
-        // (Chat) — i.e. it was driven by a scheduled `Task` fire or a wake.
-        // Autonomous turns may search memory and propose but may NOT take a
-        // credentialed external action (read-then-propose). `approved` is
-        // wired `false` here: the live fresh-approval grant is a host
-        // follow-up (see the policy / memory module docs) — until then a
-        // tainted turn stays blocked, which is the safe default.
+        // PROVENANCE / autonomy gate: classify this turn as autonomous when
+        // nothing in the batch is a human channel message (Chat) — i.e. it was
+        // driven by a scheduled `Task` fire or a wake. Autonomous turns may
+        // search memory and propose but may NOT take a credentialed external
+        // action UNLESS a live, human-approved capability grant (M22 A1) for the
+        // firing task permits that specific action (M22 A2, decision (b)).
+        //
+        // `set_turn_provenance`'s `approved` stays wired `false`: it is the
+        // *blanket* taint-clearing bool and must never be flipped on for an
+        // autonomous turn. The grant is capability-scoped, never blanket — the
+        // per-call decision (which action is pre-authorized, and consuming its
+        // fire) lives in `tool_dispatch::invoke_tool`, which reads
+        // `deps.active_grant`. Here we resolve the firing task's grant snapshot
+        // and stash it (or clear it for a human turn).
         let autonomous = !formatted
             .rows
             .iter()
             .any(|r| r.kind == copperclaw_types::MessageKind::Chat);
+        {
+            let grant = if autonomous {
+                let task_id = firing_task_id(&formatted.rows);
+                load_turn_grant(&deps.compaction.data_root, task_id.as_deref(), Utc::now())
+            } else {
+                None
+            };
+            let mut gate = match deps.active_grant.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Reset the per-turn fire latch, then install this turn's grant.
+            gate.fire_consumed = false;
+            gate.grant = grant;
+        }
         deps.tool_ctx.set_turn_provenance(autonomous, false);
 
         // Surface child-agent failure notices to the user channel
@@ -941,6 +983,57 @@ fn build_inbound_context_block(
         history.len()
     };
     self::prompt::render_conversation_context(rows, depth)
+}
+
+/// M22 A2: filename of the host-written capability-grant snapshot, sitting
+/// alongside `tasks.json` under the session data root (`/data` in-container).
+/// The host writes the firing task's `effective_grant` here at fire/spawn time
+/// (companion plumbing — see the A2 security review); the runner reads it at
+/// turn start. Absent file ⇒ no grant ⇒ the autonomy brake stays closed.
+pub(super) const GRANT_SNAPSHOT_FILENAME: &str = "grant.json";
+
+/// The task id that fired this autonomous turn, if any. A scheduled fire is a
+/// `kind: Task` inbound row carrying `content.task_id` (and `series_id = task
+/// id`) — see the sweep's `checks/scheduling.rs`. We read `content.task_id`
+/// first and fall back to `series_id` so either encoding resolves.
+fn firing_task_id(rows: &[MessageInRow]) -> Option<String> {
+    rows.iter()
+        .find(|r| r.kind == copperclaw_types::MessageKind::Task)
+        .and_then(|r| {
+            r.content
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| r.series_id.clone())
+        })
+}
+
+/// Load the live capability grant for `task_id` from the host-written snapshot
+/// under `data_root`, or `None` when there is no usable grant. Returns `Some`
+/// only when the snapshot exists, parses, its `task_id` matches the firing task
+/// (a stale snapshot for a *different* task can never authorize this fire), and
+/// it is still live at `now` ([`tool_dispatch::TurnGrant::is_live`] — a
+/// defence-in-depth re-check on top of the host's `effective_grant`). Every
+/// failure path returns `None` — the brake fails closed.
+fn load_turn_grant(
+    data_root: &std::path::Path,
+    task_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<tool_dispatch::TurnGrant> {
+    let path = data_root.join(GRANT_SNAPSHOT_FILENAME);
+    let bytes = std::fs::read(&path).ok()?;
+    let grant: tool_dispatch::TurnGrant = serde_json::from_slice(&bytes).ok()?;
+    if let Some(tid) = task_id {
+        if grant.task_id != tid {
+            tracing::warn!(
+                snapshot_task = %grant.task_id,
+                firing_task = %tid,
+                "grant snapshot task id does not match the firing task; ignoring"
+            );
+            return None;
+        }
+    }
+    grant.is_live(now).then_some(grant)
 }
 
 /// Inputs for one end-of-turn `usage_report` system row.
@@ -4001,5 +4094,107 @@ mod tests {
         // The generic terminal-failure card, unchanged by F2.
         assert_eq!(card.title, "I couldn't finish that reply");
         assert!(!card.title.starts_with("Blocked:"));
+    }
+
+    // ── M22 A2: firing-task resolution + grant snapshot load ──────────────
+
+    fn task_row(task_id: Option<&str>, series: Option<&str>) -> MessageInRow {
+        MessageInRow {
+            id: MessageId::new(),
+            seq: 1,
+            kind: MessageKind::Task,
+            timestamp: Utc::now(),
+            status: "pending".into(),
+            process_after: None,
+            recurrence: None,
+            series_id: series.map(str::to_string),
+            tries: 0,
+            trigger: true,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            content: match task_id {
+                Some(t) => serde_json::json!({"text": "do it", "task_id": t}),
+                None => serde_json::json!({"text": "do it"}),
+            },
+            source_session_id: None,
+            on_wake: true,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    #[test]
+    fn firing_task_id_reads_content_then_series() {
+        // The sweep writes both `content.task_id` and `series_id`; content wins.
+        assert_eq!(
+            firing_task_id(&[task_row(Some("t-42"), Some("t-99"))]),
+            Some("t-42".to_string())
+        );
+        // Falls back to series_id when content lacks task_id.
+        assert_eq!(
+            firing_task_id(&[task_row(None, Some("t-99"))]),
+            Some("t-99".to_string())
+        );
+        // No Task row → no firing task.
+        assert_eq!(firing_task_id(&[]), None);
+    }
+
+    /// Write a grant snapshot into `dir` and return it.
+    fn write_grant_snapshot(dir: &std::path::Path, grant: &tool_dispatch::TurnGrant) {
+        let bytes = serde_json::to_vec_pretty(grant).unwrap();
+        std::fs::write(dir.join(GRANT_SNAPSHOT_FILENAME), bytes).unwrap();
+    }
+
+    fn snapshot_grant(task_id: &str, scope: &str) -> tool_dispatch::TurnGrant {
+        tool_dispatch::TurnGrant {
+            grant_id: "g-1".into(),
+            task_id: task_id.into(),
+            capability_scope: scope.into(),
+            tokens_remaining: Some(1000),
+            fires_remaining: Some(5),
+            expires_at: Some(Utc::now() + chrono::Duration::days(30)),
+        }
+    }
+
+    #[test]
+    fn load_turn_grant_matches_task_and_liveness() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_grant_snapshot(
+            tmp.path(),
+            &snapshot_grant("t-1", "web_fetch send_message:telegram"),
+        );
+        let now = Utc::now();
+        // Matching task id + live → loaded.
+        let g = load_turn_grant(tmp.path(), Some("t-1"), now).unwrap();
+        assert_eq!(g.grant_id, "g-1");
+        assert!(g.permits("web_fetch"));
+        assert!(g.permits("send_message:telegram"));
+        assert!(!g.permits("send_email"));
+    }
+
+    #[test]
+    fn load_turn_grant_rejects_task_id_mismatch() {
+        // A stale snapshot for a DIFFERENT task must never authorize this fire.
+        let tmp = tempfile::tempdir().unwrap();
+        write_grant_snapshot(tmp.path(), &snapshot_grant("t-other", "web_fetch"));
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+    }
+
+    #[test]
+    fn load_turn_grant_absent_or_inert_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No file → None (brake stays closed).
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+        // Expired snapshot → None (defence-in-depth liveness re-check).
+        let mut g = snapshot_grant("t-1", "web_fetch");
+        g.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        write_grant_snapshot(tmp.path(), &g);
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+        // Exhausted fires → None.
+        let mut g = snapshot_grant("t-1", "web_fetch");
+        g.fires_remaining = Some(0);
+        write_grant_snapshot(tmp.path(), &g);
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
     }
 }
