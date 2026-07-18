@@ -247,6 +247,12 @@ async fn main() -> Result<()> {
         // M21 S6: production always runs the real clock; only tests and
         // the replay harness inject a TestClock.
         clock: std::sync::Arc::new(copperclaw_runner::SystemClock),
+        // M22 A2 autonomy gate: `run_loop` loads the firing task's grant
+        // snapshot (`<data_root>/grant.json`) into this each turn. Starts empty
+        // — the brake is closed until a live grant is loaded.
+        active_grant: std::sync::Arc::new(std::sync::Mutex::new(
+            copperclaw_runner::run::GrantGateState::default(),
+        )),
     };
 
     tracing::info!(

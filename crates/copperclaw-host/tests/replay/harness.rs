@@ -933,6 +933,13 @@ impl ReplayHarness {
             // cadence and softening) without real waits. `Arc<TestClock>`
             // unsizes to the `Arc<dyn Clock>` the deps carry.
             clock: self.clock.clone(),
+            // M22 A2: the autonomy-gate grant state. The replay harness can
+            // seed this (or the `<data_root>/grant.json` snapshot the runner
+            // loads) once the AX X-rider wires the grant-wake fixtures; default
+            // empty keeps every existing replay byte-identical (closed brake).
+            active_grant: std::sync::Arc::new(std::sync::Mutex::new(
+                copperclaw_runner::run::GrantGateState::default(),
+            )),
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS

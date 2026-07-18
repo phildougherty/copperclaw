@@ -8,6 +8,245 @@ use super::RunnerDeps;
 use super::drive_turn::PendingToolCall;
 use super::provider_call::HeartbeatTicker;
 
+use chrono::{DateTime, Utc};
+
+/// M22 A2 — the autonomy gate.
+///
+/// A scheduled / heartbeat (autonomous) turn is blocked from every
+/// credentialed external action by default (`policy.rs` layer 4). This card
+/// opens that gate — but **only** per-task, bounded, and pre-authorized: an
+/// autonomous fire may take a credentialed external action ONLY when the
+/// firing task carries a live, human-approved capability grant (M22 A1) whose
+/// scope permits *that specific action*. Everything else stays blocked and
+/// falls to read-then-propose (an approval/wall card).
+///
+/// # Why the runner
+///
+/// Self-generated wakes bypass the router (decision **b**), so the gate lives
+/// in the runner where every autonomous turn's tool dispatch is funnelled
+/// through [`invoke_tool`]. There is no path from an autonomous turn to an
+/// external sink that does not pass this function.
+///
+/// # How the grant reaches the runner
+///
+/// The runner runs in-container and cannot reach the central `task_grants`
+/// table directly (it lives outside the bind mount — the same reason
+/// `tasks.json` is a host-written snapshot). So the host writes the firing
+/// task's *effective* grant — the exact output of
+/// `copperclaw_db::tables::task_grants::effective_grant` — into
+/// `<data_root>/grant.json` at fire/spawn time (see the A2 security review for
+/// the required companion writer + budget-writeback plumbing). `run_loop`
+/// loads it at turn start via [`super::load_turn_grant`] and stashes it on
+/// [`RunnerDeps::active_grant`]; this dispatch gate consults it per call.
+///
+/// The on-disk shape is exactly this struct. `effective_grant` only ever
+/// produces a *live* grant, but the runner re-checks liveness ([`Self::is_live`])
+/// as defence-in-depth against a stale snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TurnGrant {
+    /// The `task_grants.id` this snapshot came from (for the consume writeback).
+    pub grant_id: String,
+    /// The firing task this grant belongs to. `run_loop` verifies it matches
+    /// the turn's originating task so a stale snapshot for a *different* task
+    /// can never authorize this fire.
+    pub task_id: String,
+    /// Space-separated scope tokens; the A1 `class` / `class:resource` grammar.
+    pub capability_scope: String,
+    /// Tokens left before the grant reads inert. `None` = unbounded.
+    #[serde(default)]
+    pub tokens_remaining: Option<i64>,
+    /// Fires left before the grant reads inert. `None` = unbounded.
+    #[serde(default)]
+    pub fires_remaining: Option<i64>,
+    /// Hard expiry. `None` = no expiry.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl TurnGrant {
+    /// Does this grant's scope permit an action requiring capability
+    /// `required`? Reuses A1's authoritative matcher — case-sensitive, no
+    /// cross-class widening, empty scope permits nothing.
+    pub(crate) fn permits(&self, required: &str) -> bool {
+        copperclaw_db::tables::task_grants::scope_permits(&self.capability_scope, required)
+    }
+
+    /// Defence-in-depth liveness re-check against the runner's own clock: not
+    /// expired, and budget/fires (when bounded) not exhausted. The host only
+    /// writes a live grant, but a snapshot can go stale between spawn and a
+    /// long turn, and a bug in the writer must fail *closed*.
+    pub(crate) fn is_live(&self, now: DateTime<Utc>) -> bool {
+        if let Some(exp) = self.expires_at {
+            if now >= exp {
+                return false;
+            }
+        }
+        if matches!(self.fires_remaining, Some(f) if f <= 0) {
+            return false;
+        }
+        if matches!(self.tokens_remaining, Some(t) if t <= 0) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Per-turn autonomy-gate state stashed on [`RunnerDeps::active_grant`].
+/// `run_loop` rewrites it at the top of every turn (the grant for an
+/// autonomous fire, or `None` for a human turn), resetting `fire_consumed` so
+/// each fire is charged at most once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GrantGateState {
+    /// The live grant governing this autonomous turn, or `None` when the turn
+    /// is human-driven or has no usable grant.
+    pub grant: Option<TurnGrant>,
+    /// Set once this turn has charged its one fire against the grant, so a
+    /// multi-action turn consumes exactly one fire (a fire = one turn).
+    pub fire_consumed: bool,
+}
+
+/// Map a model-requested tool call to the capability token the autonomy gate
+/// requires the grant to permit. **The token is derived only from the tool
+/// name and its structural arguments — never from model- or content-supplied
+/// free text** — so a prompt-injected turn cannot widen its own authorization:
+/// to run `install_packages` the grant must literally carry `install_packages`
+/// (or a bare class token), and `mcp__gh__*` requires `mcp:gh`.
+///
+/// The mapping is intentionally narrow and fail-closed: a tool with no special
+/// case maps to its bare tool name as the required class, so a resource-scoped
+/// grant that does not name it never matches.
+fn required_capability(name: &str, input: &serde_json::Value) -> String {
+    // External MCP tools (`mcp__<server>__<tool>`) → `mcp:<server>`: the grant
+    // authorizes a whole external server, keyed off the runtime-controlled
+    // namespace, never the tool arguments.
+    if let Some(rest) = name.strip_prefix(crate::policy::EXTERNAL_MCP_PREFIX) {
+        let server = rest.split("__").next().unwrap_or(rest);
+        return format!("mcp:{server}");
+    }
+    match name {
+        // `web_fetch` → `web_fetch:<host>` when the URL host is parseable, so a
+        // grant can be scoped to one host (`web_fetch:example.com`) while a bare
+        // `web_fetch` class grant still covers it. An unparseable URL falls back
+        // to the bare class — which a host-scoped grant deliberately will NOT
+        // match (fail closed).
+        "web_fetch" => match url_host(input) {
+            Some(host) => format!("web_fetch:{host}"),
+            None => "web_fetch".to_string(),
+        },
+        // Every other credentialed-external tool maps to its own name as the
+        // required capability class.
+        other => other.to_string(),
+    }
+}
+
+/// Extract a lower-cased host from a tool call's `url` argument, if present and
+/// parseable with a minimal, dependency-free parse. Userinfo and port are
+/// stripped so `https://user:pw@Example.com:8443/x` → `example.com`.
+fn url_host(input: &serde_json::Value) -> Option<String> {
+    let url = input.get("url").and_then(|v| v.as_str())?;
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    // Strip any userinfo (`user:pw@host`), then the port.
+    let host_port = authority.rsplit('@').next()?;
+    let host = host_port.split(':').next()?.trim();
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// The outcome of consulting the autonomy grant for one autonomous
+/// credentialed-external call.
+enum AutonomyVerdict {
+    /// Not gated here (not autonomous, or not a credentialed external action).
+    /// The existing policy layers decide.
+    NotGated,
+    /// A live grant permits this exact action: open the autonomy gate for THIS
+    /// call only (the taint gate still applies independently). Carries the
+    /// grant so the fire can be charged when the action actually dispatches.
+    Granted(TurnGrant),
+    /// An autonomous credentialed-external action that is present-but-out-of-
+    /// scope on a live grant: stays blocked with a model-facing, classifiable
+    /// reason (read-then-propose).
+    Blocked(String),
+}
+
+/// Consult the per-turn autonomy grant for `call`. See [`AutonomyVerdict`].
+/// Pure over the gate state + the current time so it is unit-testable without a
+/// live turn.
+fn autonomy_verdict(
+    autonomous: bool,
+    grant: Option<&TurnGrant>,
+    call_name: &str,
+    input: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> AutonomyVerdict {
+    // Only autonomous turns are gated, and only for the credentialed-external
+    // action set (the exact set `policy.rs` blocks outright on an autonomous
+    // turn). Everything else — memory search, messaging, local tools — always
+    // passes so an autonomous turn can still read-then-propose.
+    if !autonomous || !crate::policy::is_credentialed_external(call_name) {
+        return AutonomyVerdict::NotGated;
+    }
+    let required = required_capability(call_name, input);
+    match grant {
+        Some(g) if g.is_live(now) && g.permits(&required) => AutonomyVerdict::Granted(g.clone()),
+        Some(g) if g.is_live(now) => AutonomyVerdict::Blocked(format!(
+            "Tool `{call_name}` takes a credentialed external action requiring capability \
+             `{required}`, which is outside this task's approved grant (scope: `{}`) on this \
+             autonomous (heartbeat/scheduled) turn. Search memory and propose the action for a \
+             human turn to approve instead.",
+            g.capability_scope
+        )),
+        // No grant, or the snapshot is present but inert (expired / exhausted).
+        // Fall through to the existing policy autonomous deny, which carries the
+        // same stable `autonomous (heartbeat/scheduled) turn` hint the blocker
+        // classifier keys on.
+        _ => AutonomyVerdict::NotGated,
+    }
+}
+
+/// Charge one fire against the active grant, at most once per turn. Called when
+/// a granted autonomous action is about to actually dispatch (a fire is
+/// happening). Emits a `grant_consume` System row to `outbound.db`; the host's
+/// delivery loop applies it to the central grant via
+/// `task_grants::consume_fire` (companion plumbing — see the A2 security
+/// review). Best-effort: a failed emit must not abort the turn.
+async fn charge_grant_fire_once(deps: &RunnerDeps, grant: &TurnGrant) {
+    use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
+    {
+        // Dedupe within the turn: a fire is one *turn*, not one action.
+        let mut gate = match deps.active_grant.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if gate.fire_consumed {
+            return;
+        }
+        gate.fire_consumed = true;
+    }
+    let payload = serde_json::json!({
+        "grant_consume": {
+            "grant_id": grant.grant_id,
+            "task_id": grant.task_id,
+            "fires": 1,
+        }
+    });
+    let row = WriteOutbound {
+        id: copperclaw_types::MessageId::new(),
+        in_reply_to: None,
+        timestamp: Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: copperclaw_types::MessageKind::System,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        content: payload,
+    };
+    let outbound = deps.outbound.lock().await;
+    if let Err(err) = insert_out(&outbound, &row) {
+        tracing::warn!(?err, grant_id = %grant.grant_id, "grant_consume insert failed");
+    }
+}
+
 /// Execute one tool call against the runner's tool map. Returns
 /// `(content, images, is_error)`: the text for the `HistoryMessage::Tool`
 /// row, any image blocks the tool returned (each becomes a follow-on
@@ -34,11 +273,49 @@ pub(super) async fn invoke_tool(
     // is blocked until fresh approval. An autonomous (heartbeat) turn blocks
     // those actions outright. We read the live signals off the context and
     // stamp them onto the per-call policy alongside the active-skill scope.
-    let trust = crate::policy::TurnTrust {
+    let mut trust = crate::policy::TurnTrust {
         tainted: deps.tool_ctx.is_context_tainted(),
         approved: deps.tool_ctx.external_action_approved(),
         autonomous: deps.tool_ctx.is_autonomous_turn(),
     };
+    // M22 A2 — the autonomy gate. On an autonomous (scheduled/heartbeat) turn a
+    // credentialed external action is blocked by default; the ONLY thing that
+    // opens it is a live, human-approved capability grant (M22 A1) whose scope
+    // permits THIS specific action. `external_action_approved()` (the blanket
+    // taint-clearing bool) is deliberately NOT consulted for the autonomy
+    // decision — that bool never flips `true` for an autonomous turn. Consulting
+    // the grant per call is what makes the approval capability-scoped rather
+    // than blanket. See [`TurnGrant`] / [`autonomy_verdict`].
+    let active_grant = {
+        let gate = match deps.active_grant.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        gate.grant.clone()
+    };
+    let mut granted_fire: Option<TurnGrant> = None;
+    match autonomy_verdict(
+        trust.autonomous,
+        active_grant.as_ref(),
+        &call.name,
+        &call.input,
+        Utc::now(),
+    ) {
+        AutonomyVerdict::NotGated => {}
+        AutonomyVerdict::Granted(g) => {
+            // Scoped autonomy approval for THIS call only: drop the autonomous
+            // block so the policy layers admit the action. The taint gate still
+            // applies independently (a grant opens autonomy, not taint), so a
+            // granted action on a web-tainted turn stays blocked until fresh
+            // approval — exactly as before.
+            trust.autonomous = false;
+            granted_fire = Some(g);
+        }
+        AutonomyVerdict::Blocked(reason) => {
+            tracing::info!(tool = %call.name, %reason, "autonomous action outside task grant scope");
+            return (reason, Vec::new(), true);
+        }
+    }
     let policy = deps
         .policy
         .clone()
@@ -47,6 +324,13 @@ pub(super) async fn invoke_tool(
     if let PolicyDecision::Deny(reason) = policy.evaluate(&call.name) {
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
         return (reason, Vec::new(), true);
+    }
+    // A2: a granted autonomous action survived every policy layer and is about
+    // to dispatch — charge one fire against the grant (once per turn). Placed
+    // AFTER the policy allow so an action the taint gate still blocks is never
+    // charged (block-not-charge).
+    if let Some(grant) = &granted_fire {
+        charge_grant_fire_once(deps, grant).await;
     }
     // M17 session-preview tools (`expose_preview` / `close_preview`) are
     // host-owned but ride the SAME host-broker relay as external MCP: the
@@ -622,6 +906,284 @@ mod tests {
         assert!(
             !mem.contains("autonomous"),
             "memory search must stay reachable; got: {mem}"
+        );
+    }
+
+    // ── M22 A2: the autonomy gate (capability grants) ─────────────────────
+
+    /// A grant with the given scope, unbounded budget/fires and no expiry.
+    fn live_grant(scope: &str) -> TurnGrant {
+        TurnGrant {
+            grant_id: "g-1".into(),
+            task_id: "t-1".into(),
+            capability_scope: scope.into(),
+            tokens_remaining: None,
+            fires_remaining: None,
+            expires_at: None,
+        }
+    }
+
+    /// Install (or clear) the turn grant on `deps`, resetting the fire latch.
+    fn install_grant(deps: &RunnerDeps, grant: Option<TurnGrant>) {
+        let mut gate = deps.active_grant.lock().unwrap();
+        gate.grant = grant;
+        gate.fire_consumed = false;
+    }
+
+    /// Count `grant_consume` fire rows the runner emitted to `outbound`.
+    async fn grant_consume_rows(deps: &RunnerDeps) -> usize {
+        let conn = deps.outbound.lock().await;
+        messages_out::list_due(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.content.get("grant_consume").is_some())
+            .count()
+    }
+
+    #[test]
+    fn required_capability_maps_each_action() {
+        use serde_json::json;
+        assert_eq!(
+            required_capability("install_packages", &json!({})),
+            "install_packages"
+        );
+        assert_eq!(required_capability("web_search", &json!({})), "web_search");
+        assert_eq!(
+            required_capability("make_preview_public", &json!({})),
+            "make_preview_public"
+        );
+        // External MCP → `mcp:<server>`, keyed off the runtime namespace.
+        assert_eq!(
+            required_capability("mcp__gh__create_issue", &json!({})),
+            "mcp:gh"
+        );
+        // web_fetch → host-scoped when the URL parses (userinfo/port stripped,
+        // lower-cased), bare class otherwise.
+        assert_eq!(
+            required_capability("web_fetch", &json!({"url": "https://Example.com/x?y"})),
+            "web_fetch:example.com"
+        );
+        assert_eq!(
+            required_capability(
+                "web_fetch",
+                &json!({"url": "https://user:pw@Host.Example:8443/p"})
+            ),
+            "web_fetch:host.example"
+        );
+        assert_eq!(required_capability("web_fetch", &json!({})), "web_fetch");
+    }
+
+    #[test]
+    fn autonomy_verdict_gates_only_autonomous_credentialed_external() {
+        use serde_json::json;
+        let now = Utc::now();
+        let g = live_grant("web_fetch");
+        // A human (non-autonomous) turn is never gated here.
+        assert!(matches!(
+            autonomy_verdict(false, Some(&g), "web_fetch", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+        // An autonomous turn's non-credentialed tool is never gated.
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "read_file", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+        // In scope → Granted.
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "web_fetch", &json!({}), now),
+            AutonomyVerdict::Granted(_)
+        ));
+        // Live grant, out of scope → Blocked (read-then-propose).
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "install_packages", &json!({}), now),
+            AutonomyVerdict::Blocked(_)
+        ));
+        // No grant → NotGated, so the policy layer's blanket autonomous deny
+        // fires downstream (still blocked, just not by this gate).
+        assert!(matches!(
+            autonomy_verdict(true, None, "install_packages", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+    }
+
+    #[test]
+    fn autonomy_verdict_inert_grant_authorizes_nothing() {
+        use serde_json::json;
+        let now = Utc::now();
+        // Expired.
+        let mut g = live_grant("web_fetch");
+        g.expires_at = Some(now - chrono::Duration::minutes(1));
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "web_fetch", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+        // Fires exhausted.
+        let mut g = live_grant("web_fetch");
+        g.fires_remaining = Some(0);
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "web_fetch", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+        // Token budget exhausted.
+        let mut g = live_grant("web_fetch");
+        g.tokens_remaining = Some(0);
+        assert!(matches!(
+            autonomy_verdict(true, Some(&g), "web_fetch", &json!({}), now),
+            AutonomyVerdict::NotGated
+        ));
+    }
+
+    #[tokio::test]
+    async fn granted_autonomous_action_dispatches_and_charges_one_fire() {
+        // Headline A2 acceptance (granted-act): an autonomous turn whose firing
+        // task carries a grant permitting `web_fetch` may take that action —
+        // the autonomy block is cleared for it — and the fire is charged once.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false); // autonomous, no blanket approval
+        install_grant(&deps, Some(live_grant("web_fetch")));
+
+        let (out, _i, _e) = invoke_tool(&deps, &call("web_fetch")).await;
+        // Not blocked by the autonomy gate (it fails downstream without a
+        // network stub / url, but NOT with an autonomy or grant-scope deny).
+        assert!(
+            !out.contains("autonomous (heartbeat/scheduled) turn"),
+            "a granted action must clear the autonomy block; got: {out}"
+        );
+        assert!(
+            !out.contains("outside this task's approved grant"),
+            "a granted in-scope action must not be scope-blocked; got: {out}"
+        );
+        assert_eq!(
+            grant_consume_rows(&deps).await,
+            1,
+            "a granted autonomous action must charge exactly one fire"
+        );
+
+        // A SECOND granted action in the SAME turn charges no additional fire —
+        // a fire is one turn, not one action.
+        let _ = invoke_tool(&deps, &call("web_fetch")).await;
+        assert_eq!(
+            grant_consume_rows(&deps).await,
+            1,
+            "a second granted action in the same turn must not re-charge the fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn ungranted_autonomous_action_is_blocked_and_can_still_propose() {
+        // Headline A2 acceptance (ungranted-propose): an autonomous turn with no
+        // grant is blocked from a credentialed external action, charges no fire,
+        // and can still read memory + message to propose.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false);
+        install_grant(&deps, None);
+
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("autonomous (heartbeat/scheduled) turn"),
+            "an ungranted autonomous action must be blocked; got: {blocked}"
+        );
+        // Read-then-propose survives.
+        let (mem, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query": "x"})),
+        )
+        .await;
+        assert!(!mem.contains("autonomous"), "memory must stay reachable");
+        assert_eq!(
+            grant_consume_rows(&deps).await,
+            0,
+            "a blocked action must never charge a fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_grant_blocks_with_clear_reason_and_no_charge() {
+        // A grant that covers `web_fetch` does NOT authorize `install_packages`:
+        // the action stays blocked with a clear, classifiable reason and no fire
+        // is charged.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false);
+        install_grant(&deps, Some(live_grant("web_fetch")));
+
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("outside this task's approved grant"),
+            "an out-of-scope action must name the grant; got: {blocked}"
+        );
+        assert!(
+            blocked.contains("web_fetch"),
+            "the deny must show the grant scope; got: {blocked}"
+        );
+        // The blocker classifier routes it to the Autonomous wall card.
+        assert_eq!(
+            crate::run::blocker::classify(&blocked),
+            Some(crate::run::blocker::BlockerCategory::Autonomous)
+        );
+        assert_eq!(grant_consume_rows(&deps).await, 0);
+    }
+
+    #[tokio::test]
+    async fn grant_opens_autonomy_but_not_the_taint_gate() {
+        // A grant clears the AUTONOMY block for its scope, but the taint gate is
+        // independent: a granted `web_fetch` on a web-tainted turn stays blocked
+        // until fresh approval, and no fire is charged (block-not-charge).
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false);
+        ctx.mark_untrusted_context("web_fetch:https://evil.example");
+        install_grant(&deps, Some(live_grant("web_fetch")));
+
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_fetch")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("untrusted-provenance"),
+            "a grant opens autonomy, not taint; got: {blocked}"
+        );
+        assert_eq!(
+            grant_consume_rows(&deps).await,
+            0,
+            "a taint-blocked action must not charge a fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_grant_leaves_autonomous_action_blocked() {
+        // An inert (expired) snapshot authorizes nothing — the action falls back
+        // to the policy layer's blanket autonomous deny.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false);
+        let mut g = live_grant("web_fetch");
+        g.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        install_grant(&deps, Some(g));
+
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_fetch")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("autonomous (heartbeat/scheduled) turn"),
+            "an expired grant must not authorize; got: {blocked}"
+        );
+        assert_eq!(grant_consume_rows(&deps).await, 0);
+    }
+
+    #[tokio::test]
+    async fn grant_does_not_affect_human_turns() {
+        // Non-autonomous (human-driven) turns are unchanged: a credentialed
+        // external action passes without consulting the grant and charges no
+        // fire, even if a grant happens to be present.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(false, false); // human turn
+        install_grant(&deps, Some(live_grant("web_fetch")));
+        let (out, _i, _e) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(
+            !out.contains("autonomous") && !out.contains("approved grant"),
+            "a human turn must not be autonomy-gated; got: {out}"
+        );
+        assert_eq!(
+            grant_consume_rows(&deps).await,
+            0,
+            "a human turn must never charge a grant fire"
         );
     }
 

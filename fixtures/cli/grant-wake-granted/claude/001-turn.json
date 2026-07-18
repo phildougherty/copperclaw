@@ -1,0 +1,10 @@
+{
+  "_note": "Granted-act: the model takes the pre-authorized credentialed-external action (web_fetch), then reports. The autonomy gate opens for this action because grant.json permits `web_fetch`; one fire is charged. Swap the tool for mcp__<server>__post_message + a `mcp:<server>` grant for the 'send the granted message' framing.",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_grant_granted_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_grant_1", "name": "web_fetch", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"url\": \"https://standup.example/digest\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

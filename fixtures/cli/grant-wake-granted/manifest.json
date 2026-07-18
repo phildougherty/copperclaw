@@ -1,0 +1,17 @@
+{
+  "name": "cli-grant-wake-granted",
+  "channel": "cli",
+  "description": "M22 A2 scaffold. A scheduled task fires an autonomous turn whose firing task carries a live capability grant; the agent takes the pre-authorized credentialed-external action and one fire is charged (grant_consume). Registration + task-fire/grant plumbing finished by the AX X-rider — see README.md.",
+  "schema": 1,
+  "scaffold": true,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

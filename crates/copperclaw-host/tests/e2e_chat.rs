@@ -376,6 +376,10 @@ async fn run_one_turn(
         failover_chain: Vec::new(),
         // Real time — this e2e doesn't exercise the S6 timed legs.
         clock: Arc::new(copperclaw_runner::SystemClock),
+        // M22 A2: no grant plumbed for this human-turn e2e.
+        active_grant: Arc::new(std::sync::Mutex::new(
+            copperclaw_runner::run::GrantGateState::default(),
+        )),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

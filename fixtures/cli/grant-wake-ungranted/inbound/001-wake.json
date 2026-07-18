@@ -1,0 +1,18 @@
+{
+  "channel_type": null,
+  "platform_id": null,
+  "thread_id": null,
+  "message": {
+    "id": "fixture-grant-wake-ung-001",
+    "kind": "task",
+    "content": {
+      "text": "Email the quarterly report to the board.",
+      "task_id": "t-report",
+      "task_name": "quarterly-report"
+    },
+    "timestamp": "2026-01-01T09:00:00Z"
+  },
+  "reply_to": null,
+  "sender": null,
+  "_note": "Scaffold: same task-fire caveat as grant-wake-granted/inbound/001-wake.json. There is deliberately no grant.json for this task, so the autonomy brake stays closed."
+}
