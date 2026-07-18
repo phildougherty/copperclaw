@@ -780,6 +780,18 @@ real call site in the crate that owns the signal — no dangling metrics.
   (`READONLY_TOOLS`), so it is available under the messaging profile and to
   guest senders. Why: agents could author and load skills but never enumerate
   them, so re-saving meant guessing at existing names.
+### Changed (F3: coding-task skill — avoid SQLite WAL on bind-mounted `/data`, 2026-07-18)
+
+- `skills/coding-task/SKILL.md` now tells the agent NOT to enable
+  `journal_mode = WAL` on a `/data`-backed SQLite DB (better-sqlite3,
+  Prisma, rusqlite, python sqlite3, etc.) and to keep the default
+  rollback journal (`journal_mode = DELETE`). A hard container kill
+  (crash-restart) truncates a bind-mounted WAL into an unrecoverable
+  `SQLITE_IOERR_SHORT_READ`; the DELETE journal commits atomically via
+  the main file and recovers cleanly. Real incident 2026-07-18: a
+  vite+API app's WAL DB on `/data` was destroyed by a crash-restart.
+  Existing prose in the skill was tightened to keep the body under its
+  ~8192-byte cap (no tool-name mentions or section meaning lost).
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 

@@ -73,6 +73,12 @@ can safely edit in parallel.
 Probe before depending on an image tool (`command -v eslint`) — an
 absent tool just fails cold.
 
+- **SQLite on `/data`: no WAL.** Keep the default rollback journal
+  (`journal_mode = DELETE`) for any embedded/file DB (better-sqlite3,
+  Prisma, rusqlite, python sqlite3) — a hard container kill truncates a
+  bind-mounted WAL to unrecoverable `SQLITE_IOERR_SHORT_READ`. Need WAL?
+  Checkpoint on shutdown; know it's fragile on a bind mount.
+
 ## Robustness: handle what a user can actually hit
 
 Skip handling only for genuinely impossible inputs — "impossible"
@@ -97,7 +103,7 @@ not vibes. Run it — `python3 x.py` (exit 0), `node x.js` + `curl` for a
 server, `pytest`/`npm test` for tests ("it compiles" is not the bar) —
 via the project's *canonical* build (`cargo build`, `go build ./...`,
 `npm run build`), never an ad-hoc per-file check. Couldn't run it? Say
-so — "wrote X, couldn't run it, because Y" beats a fabricated "done".
+so — that beats a fabricated "done".
 
 Verification is also *enforced*. Write
 `/data/<project>/.copperclaw/verify` **at scaffold time**, one stage
