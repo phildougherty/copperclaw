@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 SX — Wave-3 skills fixtures: materialized-script + relevance + versioning)
+
+- **The Wave-3 X-rider — deterministic replay/integration coverage for the
+  three skills behaviors, registered where the seam they exercise actually
+  lives.** No production `src/**` change; verification-only.
+- **S1/S1M materialized-script — fixture coherence guard.**
+  `crates/copperclaw-host/tests/replay.rs` gains
+  `sx_runnable_helper_skill_fixture_is_coherent`, a coherence guard (mirroring
+  the CX visual-regression fixture guard) over the committed
+  `fixtures/skills/runnable-helper/`. It pins the properties the in-crate
+  materialize/mount tests depend on: frontmatter `name == dir`, a substantive
+  description (S2 relevance input), and an **executable** `scripts/greet.sh`.
+  The full materialize → read-only-mount → exec path is not replay-harness-
+  drivable (the `materialize_session_skills` / `build_spec` seams are
+  host-crate-internal `pub(super)`, and the harness never spawns a container),
+  so those two halves stay asserted in-crate
+  (`cold_start::tests::materialize_makes_fixture_helper_executable`,
+  `spawn::tests::build_spec_mounts_skills_source_read_only_when_configured`);
+  this guard fails first if the fixture they share drifts or loses its exec bit.
+- **S2 relevance selection — library-seam integration test + fixture set.**
+  New `fixtures/skill_selection/` (four topically-disjoint skills:
+  `bread-baking`, `astronomy-observing`, `tax-filing`, `garden-care`) plus
+  `crates/copperclaw-skills/tests/coverage.rs::relevant_selector_narrows_inlined_skill_set`:
+  scans the set through `SkillRegistry`, and asserts `SkillsSelector::Relevant`
+  with an off-topic (bread-only) query returns a strict, smaller, subset of
+  `SkillsSelector::All`, led by the on-topic skill and costing fewer inlined
+  description bytes — the prompt-shrink decision (e) promises.
+- **S3 versioning — author→list→reload round-trip integration test.**
+  `crates/copperclaw-skills/tests/coverage.rs::author_list_reload_roundtrip_bumps_version_on_resave`
+  ties the S3 public seams together: `save_group_skill` (author) →
+  `list_group_skills` (version 1) → `SkillRegistry::scan` (re-discovery, the
+  scan a container spawn performs) → re-save durably bumps the version to 2 in
+  both the listing and the on-disk frontmatter.
+- **Honest boundary.** Relevance selection and versioning are library-level
+  concerns owned by `copperclaw-skills` (selector resolution + prompt assembly
+  run host-side before any spawn; the harness never spawns), so their
+  integration tests live in the crate that owns the seam rather than in the
+  replay harness — noted inline, mirroring how CX flagged the chromium boundary.
+- **Metric wish (for the M1 rider).** A
+  `copperclaw_skills_relevance_filtered_total` counter (skills dropped by a
+  `Relevant` selection vs `All`) would let operators see the prompt-shrink S2
+  buys per spawn — the companion to S1's `copperclaw_skills_materialized_total`
+  wish already recorded in `cold_start.rs`.
+
 ### Added (M22 S4 — activate `tools:` frontmatter + inline-mode active-skill narrowing)
 
 - **`tools:` frontmatter is now a working tool allowlist.**
