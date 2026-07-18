@@ -166,6 +166,33 @@ pub fn mark_failed(conn: &Connection, id: MessageId) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Increment the per-message crash counter for poison-message quarantine
+/// (F2) and return the new value. Called by the host's crash-restart path
+/// once per in-flight message per crash: a message that has been in flight
+/// during `crash_attempts >= K` crashes is quarantined (marked terminally
+/// `status='failed'` via [`mark_failed`]) so a poison inbound that reliably
+/// crashes the runner stops being re-claimed on every respawn.
+///
+/// Deliberately distinct from `tries` (which the host-sweep apology path
+/// overloads with the `APOLOGY_TRIES_MARKER = 99` sentinel): the crash
+/// counter must increment cleanly from 0 without colliding with that magic
+/// value. Returns [`DbError::NotFound`] if the row is gone.
+pub fn increment_crash_attempts(conn: &Connection, id: MessageId) -> Result<i64, DbError> {
+    let n = conn.execute(
+        "UPDATE messages_in SET crash_attempts = crash_attempts + 1 WHERE id = ?1",
+        params![id.as_uuid().to_string()],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    let count: i64 = conn.query_row(
+        "SELECT crash_attempts FROM messages_in WHERE id = ?1",
+        params![id.as_uuid().to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
 /// Highest `seq` currently in the table, or `0` if empty. Used by the
 /// M18 R2 mid-turn steering check: the runner snapshots this once at
 /// `drive_turn` entry as the "known at turn start" ceiling, then any row
@@ -370,6 +397,36 @@ mod tests {
         assert_eq!(seq1 % 2, 0, "expected even, got {seq1}");
         assert_eq!(seq2 % 2, 0, "expected even, got {seq2}");
         assert!(seq2 > seq1);
+    }
+
+    #[test]
+    fn crash_attempts_starts_at_zero_and_increments() {
+        // F2: the per-message crash counter defaults to 0 (healthy path)
+        // and increments by 1 per call, returning the new value. Quarantine
+        // (marking the row failed) is the host's decision at threshold K.
+        let (_tmp, conn) = fresh_inbound();
+        let msg = make_msg();
+        let id = msg.id;
+        insert(&conn, &msg).unwrap();
+        // Fresh row: counter is 0 (never crashed).
+        let start: i64 = conn
+            .query_row(
+                "SELECT crash_attempts FROM messages_in WHERE id = ?1",
+                params![id.as_uuid().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(increment_crash_attempts(&conn, id).unwrap(), 1);
+        assert_eq!(increment_crash_attempts(&conn, id).unwrap(), 2);
+        assert_eq!(increment_crash_attempts(&conn, id).unwrap(), 3);
+    }
+
+    #[test]
+    fn increment_crash_attempts_missing_row_is_not_found() {
+        let (_tmp, conn) = fresh_inbound();
+        let err = increment_crash_attempts(&conn, MessageId::new()).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
     }
 
     #[test]

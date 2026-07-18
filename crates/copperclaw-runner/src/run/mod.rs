@@ -514,6 +514,15 @@ pub struct RunnerDeps {
     /// yet must latch the fire. Default (`minimal`, and every human turn) is an
     /// empty state that authorizes nothing — the brake stays closed.
     pub active_grant: Arc<std::sync::Mutex<tool_dispatch::GrantGateState>>,
+    /// F2 safe-mode respawn: when `true`, [`run_loop`] truncates the loaded
+    /// `state.history` to a small recent window ([`RECOVERY_KEEP_MESSAGES`])
+    /// at startup — bypassing normal compaction — so a persistent
+    /// history/context problem self-heals instead of crash-looping. The host
+    /// sets it (via `runner.json`'s `recovery_mode`) once a session's
+    /// crash streak reaches its threshold; it clears as soon as a spawn
+    /// survives. Default `false` (healthy path): startup is byte-identical to
+    /// pre-F2 behaviour.
+    pub recovery_mode: bool,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -612,6 +621,9 @@ impl RunnerDeps {
             active_grant: Arc::new(std::sync::Mutex::new(
                 tool_dispatch::GrantGateState::default(),
             )),
+            // F2: recovery mode off by default — the host only turns it on
+            // for a session that has crashed N times in a row.
+            recovery_mode: false,
         }
     }
 }
@@ -625,6 +637,14 @@ impl RunnerDeps {
 /// turns (`User, Assistant, ToolUse, Tool, ToolUse, Tool, ...`)
 /// without paying for a full-history walk on every poll.
 const RESUME_DEDUP_LOOKBACK: usize = 10;
+
+/// F2 safe-mode respawn: how many of the most-recent `state.history` entries
+/// the runner keeps when the host has flipped `recovery_mode` on. Deliberately
+/// small — the whole point is to shed an oversized / poison history that was
+/// crash-looping the session, keeping only enough recent context (roughly the
+/// last couple of turns) for the resumed session to stay coherent. Reused by
+/// [`crate::compaction::truncate_to_recent`] at startup; see `run_loop`.
+const RECOVERY_KEEP_MESSAGES: usize = 8;
 
 /// Returns true iff the most-recent `User` entry within the last
 /// [`RESUME_DEDUP_LOOKBACK`] history entries has the same content as
@@ -684,6 +704,46 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         let g = deps.outbound.lock().await;
         load_state(&g).context("load runner state")?
     };
+
+    // F2 safe-mode respawn: when the host has flipped `recovery_mode` on
+    // (this session's container crashed N times in a row), aggressively
+    // truncate the loaded history to a small recent window BEFORE the poll
+    // loop — bypassing the provider-driven compaction below — so a persistent
+    // oversized-history / poison-context problem self-heals instead of
+    // crash-looping forever. Reuses F1's deterministic, LLM-free
+    // `truncate_to_recent` (never a provider call — the summariser might be
+    // the very thing that was crashing). The truncated history is persisted
+    // immediately, with the continuation cleared: a shrunk transcript is
+    // incompatible with a continuation handle anchored to the pre-truncation
+    // prefix, and persisting now means a re-crash before the first turn saves
+    // still leaves the poison history off disk. A no-op when `recovery_mode`
+    // is off (the healthy path) or the history is already within the window.
+    if deps.recovery_mode {
+        let before = state.history.len();
+        state.history = crate::compaction::truncate_to_recent(
+            std::mem::take(&mut state.history),
+            RECOVERY_KEEP_MESSAGES,
+        );
+        let after = state.history.len();
+        if after != before {
+            state.continuation = None;
+            let g = deps.outbound.lock().await;
+            if let Err(err) = save_state(&g, &state.history, state.continuation.as_deref()) {
+                // Best-effort: even if the persist fails, the in-memory
+                // history is already truncated for this run, so the recovery
+                // still takes effect this spawn. Log and continue rather than
+                // bail — bailing here would itself crash-loop the runner.
+                tracing::warn!(error = %err, "recovery mode: failed to persist truncated history; continuing with in-memory truncation");
+            }
+        }
+        tracing::warn!(
+            history_before = before,
+            history_after = after,
+            keep = RECOVERY_KEEP_MESSAGES,
+            "F2 recovery mode: truncated persisted history to a recent window at startup (safe-mode respawn)"
+        );
+    }
+
     let mut turns_run: usize = 0;
     let mut first_poll = true;
 
@@ -893,9 +953,32 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             // token count at the trigger point.
             copperclaw_metrics::inc_compaction_triggered(deps.policy.profile().as_str());
             copperclaw_metrics::observe_compaction_estimated_tokens(est_tokens as u64);
-            state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
-                .await
-                .context("compaction failed")?;
+            // F1 (2026-07-18 incident): compaction must NEVER crash the
+            // runner. An empty/failed summary used to `bail!`, which
+            // propagated here as a fatal `?` and exited `run_loop`; the host
+            // respawned into the same oversized history and the same empty
+            // summary — an infinite crash-loop that bricked the session until
+            // an operator cleared history. `compact()` now degrades every
+            // failure (empty summary, provider error, archive write) to
+            // deterministic truncation and returns Ok. The `HeartbeatTicker`
+            // keeps the container marked alive across the (possibly slow)
+            // summary provider call so the host supervisor doesn't SIGKILL a
+            // healthy compaction as "stale". The Err arm is defense-in-depth:
+            // if some future internal error ever escaped `compact()`, continue
+            // with a truncated tail rather than exiting the loop.
+            state.history = {
+                let _hb = provider_call::HeartbeatTicker::start(deps.heartbeat_path.clone());
+                match compact(state.history, deps.provider.as_ref(), &deps.compaction).await {
+                    Ok(compacted) => compacted,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "compaction returned an unexpected error; continuing with truncated history"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
         }
 
         // Resume-after-crash guard — see `is_prompt_already_in_history`.
@@ -2941,6 +3024,74 @@ mod tests {
         // the on-disk state, so dropping it after the call is fine.
         std::mem::forget(tmp);
         deps
+    }
+
+    /// F2 (B): a runner spawned with `recovery_mode = true` truncates its
+    /// oversized persisted history to the small recent window at startup —
+    /// before any turn — and clears the continuation (a shrunk transcript is
+    /// incompatible with a continuation anchored to the old prefix).
+    /// `max_turns = Some(0)` returns right after the startup truncation, so
+    /// the provider is never queried.
+    #[tokio::test]
+    async fn recovery_mode_truncates_history_at_startup() {
+        let provider = PlanProvider::new(vec![]);
+        let mut deps = deps_with_provider(provider, Duration::from_secs(5));
+        deps.recovery_mode = true;
+        deps.max_turns = Some(0);
+        let outbound = deps.outbound.clone();
+        // Seed a large persisted history + a continuation token.
+        let big: Vec<HistoryMessage> = (0..50)
+            .map(|i| HistoryMessage::User {
+                content: format!("m{i}"),
+            })
+            .collect();
+        {
+            let g = outbound.lock().await;
+            save_state(&g, &big, Some("cont-token")).unwrap();
+        }
+        run_loop(deps).await.unwrap();
+        let g = outbound.lock().await;
+        let st = load_state(&g).unwrap();
+        assert_eq!(
+            st.history.len(),
+            RECOVERY_KEEP_MESSAGES,
+            "recovery mode must truncate to the recent window"
+        );
+        assert!(
+            st.continuation.is_none(),
+            "truncation must clear the continuation handle"
+        );
+        // The tail was kept (most-recent messages survive).
+        assert!(matches!(
+            st.history.last(),
+            Some(HistoryMessage::User { content }) if content == "m49"
+        ));
+    }
+
+    /// F2 (B) default-safe guard: with `recovery_mode` off (the healthy path)
+    /// the persisted history and continuation are byte-identical after
+    /// startup — no truncation happens for a non-crashing session.
+    #[tokio::test]
+    async fn no_recovery_mode_leaves_history_untouched() {
+        let provider = PlanProvider::new(vec![]);
+        let mut deps = deps_with_provider(provider, Duration::from_secs(5));
+        // recovery_mode stays false (RunnerDeps::minimal default).
+        deps.max_turns = Some(0);
+        let outbound = deps.outbound.clone();
+        let big: Vec<HistoryMessage> = (0..50)
+            .map(|i| HistoryMessage::User {
+                content: format!("m{i}"),
+            })
+            .collect();
+        {
+            let g = outbound.lock().await;
+            save_state(&g, &big, Some("cont-token")).unwrap();
+        }
+        run_loop(deps).await.unwrap();
+        let g = outbound.lock().await;
+        let st = load_state(&g).unwrap();
+        assert_eq!(st.history.len(), 50, "healthy path: history untouched");
+        assert_eq!(st.continuation.as_deref(), Some("cont-token"));
     }
 
     #[tokio::test]

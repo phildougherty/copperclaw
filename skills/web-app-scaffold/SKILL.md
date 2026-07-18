@@ -74,9 +74,16 @@ what you see — that skill (landing separately) is the depth reference for
 fixing the worst offenders. Ship the final screenshot alongside the
 prototype-ready card with `send_file` per [[coding-task]]'s delivery ritual.
 
+## When it needs a backend
+
+The moment the app must persist data, serve multiple users, or expose an API,
+it's no longer just a scaffold — load [[web-backend]] for choosing a datastore
+(not always SQLite), designing endpoints that don't 500 on the caller, and
+laying out server + frontend as separate, wired-together pieces.
+
 ## Related skills
 
 [[coding-task]] (the verify gate + delivery ritual this plugs into),
-[[preview]] (serving the dev build to the operator), [[testing]] (reading
-verify output), [[frontend-design]] (the critique checklist `ui_screenshot`
-feeds).
+[[web-backend]] (the server/API/database half), [[preview]] (serving the dev
+build to the operator), [[testing]] (reading verify output), [[frontend-design]]
+(the critique checklist `ui_screenshot` feeds).

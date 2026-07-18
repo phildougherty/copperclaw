@@ -145,6 +145,17 @@ pub(crate) struct RunnerConfigForFile {
     /// [`ContainerManager::resolve_failover_chain_for_file`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failover_chain: Option<Vec<FailoverEntryForFile>>,
+    /// F2 safe-mode respawn: emitted as `Some(true)` only when this session's
+    /// consecutive-crash streak has reached
+    /// [`super::crash_loop::RECOVERY_MODE_STREAK`], signalling the runner to
+    /// aggressively truncate its persisted history at startup so a persistent
+    /// history/context problem self-heals instead of crash-looping. Skipped
+    /// (None) on the healthy path so an unconfigured/non-crashing session's
+    /// `runner.json` shape stays bit-identical to the pre-F2 shape. Transient:
+    /// re-evaluated on every spawn from the live crash tracker, so it clears
+    /// as soon as the streak resets after a spawn survives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_mode: Option<bool>,
 }
 
 /// One alternate provider in [`RunnerConfigForFile::failover_chain`].
@@ -532,6 +543,19 @@ impl ContainerManager {
             api_key_env.as_deref(),
         );
 
+        // F2 safe-mode respawn: when this session's consecutive-crash streak
+        // has reached the recovery threshold, tell the runner to truncate its
+        // persisted history at startup. Read from the live per-session crash
+        // tracker (the same one that gates the respawn backoff), so it clears
+        // automatically once the streak resets after a spawn survives. Skipped
+        // entirely (None) for the healthy path — the overwhelming case — so a
+        // non-crashing session's `runner.json` is byte-identical to pre-F2.
+        let recovery_mode = (self
+            .crash_loop
+            .current_streak(session.id, tokio::time::Instant::now())
+            >= super::crash_loop::RECOVERY_MODE_STREAK)
+            .then_some(true);
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -559,6 +583,7 @@ impl ContainerManager {
             check_command,
             verify_gate,
             failover_chain,
+            recovery_mode,
         }
     }
 
@@ -866,6 +891,73 @@ mod tests {
         assert_eq!(
             cfg.api_base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    /// F2 (B) default-safe guard: a session with no recorded crashes must
+    /// NOT get `recovery_mode` in its `runner.json` — the field is skipped
+    /// entirely so the healthy-path shape stays bit-identical to pre-F2.
+    #[test]
+    fn recovery_mode_absent_for_healthy_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cfg = mgr.runner_config_for(&session, None, None);
+        assert_eq!(cfg.recovery_mode, None);
+        // And the serialized JSON carries no `recovery_mode` key.
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            json.get("recovery_mode").is_none(),
+            "healthy-path runner.json must omit recovery_mode"
+        );
+    }
+
+    /// F2 (B): once a session's consecutive-crash streak reaches
+    /// [`RECOVERY_MODE_STREAK`], the written config flips `recovery_mode` on.
+    /// Below the threshold it stays off — a transient double-crash must not
+    /// trip safe-mode.
+    #[test]
+    fn recovery_mode_set_when_crash_streak_reaches_threshold() {
+        use super::super::crash_loop::{CrashCause, RECOVERY_MODE_STREAK};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let now = tokio::time::Instant::now();
+        // One crash: below threshold → recovery mode still off.
+        mgr.crash_loop
+            .record_crash(session.id, CrashCause::Generic, now);
+        assert_eq!(
+            mgr.runner_config_for(&session, None, None).recovery_mode,
+            None,
+            "a single crash must not trip recovery mode"
+        );
+        // Drive the streak up to the threshold (same instant keeps it inside
+        // the healthy window so the streak accumulates).
+        for _ in 1..RECOVERY_MODE_STREAK {
+            mgr.crash_loop
+                .record_crash(session.id, CrashCause::Generic, now);
+        }
+        let cfg = mgr.runner_config_for(&session, None, None);
+        assert_eq!(
+            cfg.recovery_mode,
+            Some(true),
+            "reaching the crash-streak threshold must set recovery_mode"
+        );
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json.get("recovery_mode")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

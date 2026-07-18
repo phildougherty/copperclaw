@@ -40,6 +40,15 @@ use tokio::time::{Duration, Instant};
 /// "keeps running out of memory" `ErrorCard`.
 pub const OOM_CARD_THRESHOLD: u32 = 3;
 
+/// F2 safe-mode respawn: consecutive crashes in the current episode before
+/// the host spawns the runner in recovery mode (forcing aggressive
+/// history truncation at startup — see the runner's `recovery_mode`). Set
+/// higher than the first couple of backoff steps so a transient double-crash
+/// doesn't trip it, but low enough that a genuinely stuck session self-heals
+/// within a few minutes of backoff rather than looping on a flat curve
+/// forever (the 2026-07-18 incident, where the streak climbed past 15).
+pub const RECOVERY_MODE_STREAK: u32 = 5;
+
 /// Why a container crash-restarted, as classified from the runtime's
 /// exit-status inspection at capture time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +186,27 @@ impl CrashLoopTracker {
         }
     }
 
+    /// The current consecutive-crash streak for `session`, reset-aware:
+    /// returns `0` when the session has never crashed OR when the last crash
+    /// is older than [`HEALTHY_RESET_WINDOW`] (the episode has ended and a
+    /// fresh spawn earned its clean slate). Read at spawn time by the host's
+    /// runner-config assembly to decide whether to flip `recovery_mode` on
+    /// (F2 safe-mode respawn). Never mutates state — the actual reset is
+    /// applied lazily by the next [`Self::record_crash`].
+    #[must_use]
+    pub fn current_streak(&self, session: SessionId, now: Instant) -> u32 {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.get(&session) {
+            Some(entry) if now.duration_since(entry.last_crash) < HEALTHY_RESET_WINDOW => {
+                entry.streak
+            }
+            _ => 0,
+        }
+    }
+
     /// How much longer `session`'s respawn is deferred, or `None` when
     /// a spawn is allowed (never crashed, or the backoff elapsed).
     #[must_use]
@@ -244,6 +274,38 @@ mod tests {
         assert_eq!(
             tracker.spawn_delay_remaining(s, now + Duration::from_secs(5)),
             None
+        );
+    }
+
+    #[test]
+    fn current_streak_tracks_record_crash_and_resets_with_window() {
+        // F2: the recovery-mode decision reads this at spawn time.
+        let tracker = CrashLoopTracker::new();
+        let s = SessionId::new();
+        let now = t0();
+        // Never crashed: streak 0 → recovery mode stays off.
+        assert_eq!(tracker.current_streak(s, now), 0);
+        // Walk the streak up to the recovery threshold; each crash lands
+        // right when the previous backoff elapsed (inside the healthy
+        // window), so the streak accumulates.
+        let mut when = now;
+        for expect in 1..=RECOVERY_MODE_STREAK {
+            let rec = tracker.record_crash(s, CrashCause::Generic, when);
+            assert_eq!(tracker.current_streak(s, when), expect);
+            assert_eq!(rec.streak, expect);
+            when += rec.delay;
+        }
+        assert!(
+            tracker.current_streak(s, when) >= RECOVERY_MODE_STREAK,
+            "streak reached the recovery threshold"
+        );
+        // After the healthy window with no crash, the read reports 0 even
+        // though the entry still holds the old streak (reset is lazy).
+        let later = when + HEALTHY_RESET_WINDOW;
+        assert_eq!(
+            tracker.current_streak(s, later),
+            0,
+            "a healthy window ends the episode from the reader's view"
         );
     }
 

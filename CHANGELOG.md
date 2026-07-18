@@ -6,8 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **New `web-backend` skill** (`skills/web-backend/SKILL.md`): the backend
+  counterpart to `web-app-scaffold`, for apps that go past static files.
+  Covers choosing a datastore deliberately (SQLite for single-node prototypes
+  with the kill-safe `journal_mode = DELETE` caveat, Postgres for concurrent /
+  production-shaped data, and when NOT to hand-roll over a JSON blob), designing
+  HTTP endpoints that return proper status codes + validated input + structured
+  errors instead of raw 500s, laying out `server/` (db/data-access layer,
+  routes, seed) separately from the frontend with env-based config, and wiring
+  the two via the vite `/api` proxy. Motivated by a real build that shipped
+  SQLite-only with WAL-on-bind-mount and an API that 500'd the caller. Cross-
+  linked from `web-app-scaffold`.
+
 ### Fixed
 
+- **Host-side self-recovery: no repeated crash can loop a session forever
+  (F2).** A poison inbound (the canonical case: a huge base64 screenshot plus
+  an oversized history) used to crash the runner on startup, get re-claimed on
+  every respawn, and crash-loop indefinitely (the 2026-07-18 incident: the
+  crash streak climbed past 15 on a flat backoff until an operator manually
+  cleared the history). Two host-side backstops close that class of failure:
+  - **Poison-message quarantine.** `emit_crash_restart_apologies`
+    (`crates/copperclaw-host/src/container_manager/classify.rs`) now bumps a
+    per-message `messages_in.crash_attempts` counter (new column, migration
+    `033_messages_in_crash_attempts.sql`) once per in-flight message per
+    crash-restart. After `QUARANTINE_CRASH_ATTEMPTS` (3) crashes it marks that
+    inbound row terminally `status='failed'` — so `get_pending` / `count_due`
+    (both `pending`-scoped) stop returning it, breaking the retry loop at the
+    exact lifecycle point that re-claimed it — and emits a distinct one-time
+    "your message repeatedly crashed the agent; skipping it" apology. Below the
+    threshold the message still retries, so a genuinely transient crash loses
+    nothing. New DB helper `messages_in::increment_crash_attempts`.
+  - **Safe-mode respawn after a crash streak.** When a session's
+    consecutive-crash streak reaches `RECOVERY_MODE_STREAK` (5) — read from the
+    existing per-session `CrashLoopTracker` via new `current_streak`
+    (`crates/copperclaw-host/src/container_manager/crash_loop.rs`) — the host
+    writes `recovery_mode: true` into `runner.json`
+    (`RunnerConfigForFile`, `runner_config.rs`). The runner reads it at startup
+    (`run_loop`, `crates/copperclaw-runner/src/run/mod.rs`) and aggressively
+    truncates its persisted `state.history` to a small recent window
+    (`RECOVERY_KEEP_MESSAGES` = 8, clearing the now-incompatible continuation)
+    via F1's LLM-free `compaction::truncate_to_recent` — self-healing a
+    persistent history/context problem instead of looping. The flag is
+    transient: it clears as soon as the streak resets after a spawn survives.
+  Both defaults are safe: a non-crashing session gets `crash_attempts = 0`,
+  no `recovery_mode` key in its `runner.json`, and byte-identical startup
+  behaviour. Config field carries `#[serde(default)]` for back-compat with
+  runner.json files written before F2.
 - **Preview links can advertise a stable off-LAN host (e.g. Tailscale).** When
   `preview_bind` is `0.0.0.0`, the shareable `__preview` URL previously always
   used the auto-detected `192.168.x` LAN IP, which is unreachable when the
@@ -780,6 +827,52 @@ real call site in the crate that owns the signal — no dangling metrics.
   (`READONLY_TOOLS`), so it is available under the messaging profile and to
   guest senders. Why: agents could author and load skills but never enumerate
   them, so re-saving meant guessing at existing names.
+### Changed (F3: coding-task skill — avoid SQLite WAL on bind-mounted `/data`, 2026-07-18)
+
+- `skills/coding-task/SKILL.md` now tells the agent NOT to enable
+  `journal_mode = WAL` on a `/data`-backed SQLite DB (better-sqlite3,
+  Prisma, rusqlite, python sqlite3, etc.) and to keep the default
+  rollback journal (`journal_mode = DELETE`). A hard container kill
+  (crash-restart) truncates a bind-mounted WAL into an unrecoverable
+  `SQLITE_IOERR_SHORT_READ`; the DELETE journal commits atomically via
+  the main file and recovers cleanly. Real incident 2026-07-18: a
+  vite+API app's WAL DB on `/data` was destroyed by a crash-restart.
+  Existing prose in the skill was tightened to keep the body under its
+  ~8192-byte cap (no tool-name mentions or section meaning lost).
+### Fixed (F1: compaction never crash-loops on an empty summary, 2026-07-18)
+
+- **Safety-critical self-recovery fix.** A large-enough session history
+  triggers compaction, which asks the model to summarise the oldest half.
+  When the model returned an **empty** summary, `compact()` in
+  `crates/copperclaw-runner/src/compaction.rs` did
+  `bail!("provider returned an empty summary")`, which propagated through the
+  `run_loop` call site in `crates/copperclaw-runner/src/run/mod.rs` as a fatal
+  `?` and **crashed the runner process**. The host respawned it into the same
+  oversized history → the same empty summary → an **infinite crash-loop that
+  bricked the session** until an operator manually cleared the history. A
+  session must NEVER brick this way.
+- **`compaction.rs`: retry then truncate, never bail.** `summarise` no longer
+  treats an empty response as an error (it returns the possibly-empty text). A
+  new `summarise_with_retry` asks the provider once more on an empty/errored
+  summary; if the retry also yields nothing, `compact()` falls back to
+  **deterministic, LLM-free truncation** — it keeps the recent split it already
+  computes (`history[pivot..]`) plus the verbatim pinned project-facts header
+  (todos / verify stages / DECISIONS / file inventory), drops the oldest
+  messages, and emits an honest `compact_boundary` marker noting the summary
+  was unavailable and history was truncated. Losing old context is vastly
+  better than bricking. Archive-write failure is likewise now non-fatal
+  (logged, compaction continues) for the same reason.
+- **`run/mod.rs`: the auto-compaction call site can no longer exit `run_loop`.**
+  The `.context("compaction failed")?` is replaced with a match that degrades
+  an (now unreachable) unexpected error to a truncated tail instead of
+  propagating. The call is wrapped in a `HeartbeatTicker` so the container's
+  heartbeat is refreshed every 5s across the possibly-slow summary provider
+  call — the host supervisor no longer misreads a healthy compaction as a
+  stale/crashed container and SIGKILLs it.
+- Regression tests in `compaction.rs`: empty summary → truncation (no error,
+  run continues); provider error → truncation; retry path uses the second
+  summary; truncation keeps recent + pins, drops oldest, and fits back under
+  the threshold. The happy-path summary is unchanged.
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
