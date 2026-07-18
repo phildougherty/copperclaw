@@ -34,11 +34,11 @@ pub use context::{
     DelegateBatchRequest, DelegateBatchWorker, DelegateSpec, EditMessageSpec, EmitTodoListSpec,
     GoalSummary, InstallScope, InstallSpec, MAX_DELEGATE_BATCH_TIMEOUT_SECS,
     MAX_DELEGATE_BATCH_WIDTH, MemoryHitView, MemorySaveOutcome, MemorySaveSpec, MemorySearchSpec,
-    MockToolContext, OriginatingChannel, OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT,
-    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, SaveSkillSpec, ScheduleSpec, SendCardSpec,
-    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary,
-    ToolContext, ToolEffectAck, UpdateGoalSpec, UpdateTaskSpec, WorkerOutcome, WorkerStatus,
-    resolve_save_provenance,
+    MockToolContext, OriginatingChannel, OutboundToolEffect, Recipient, RegisterConditionSpec,
+    SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, SaveSkillSpec,
+    ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec, SetConditionFlagSpec,
+    SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext, ToolEffectAck,
+    UpdateGoalSpec, UpdateTaskSpec, WorkerOutcome, WorkerStatus, resolve_save_provenance,
 };
 pub use error::{McpError, ToolError};
 pub use external::{call_external_tool, connect_filtered};

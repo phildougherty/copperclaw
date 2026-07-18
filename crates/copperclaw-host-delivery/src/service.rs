@@ -1358,6 +1358,18 @@ impl DeliveryService {
             self.finish_self_mod("goal", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
+        // `condition` (M22 A4): the runner emits this when the agent calls
+        // `register_condition` / `set_condition_flag`. Like `goal` it is
+        // internal tracking state — it authorizes nothing on its own (any
+        // autonomous action a condition-driven wake later takes stays gated by
+        // A2's grant machinery at fire time) — so it applies IMMEDIATELY against
+        // the central `conditions` / `condition_flags` tables, not via an
+        // approval card.
+        if action.name == "condition" {
+            let apply = apply_condition(&self.central, sess, &action.payload);
+            self.finish_self_mod("condition", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
 
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. The payload carries the new
@@ -4279,6 +4291,86 @@ fn apply_goal(
         }
         other => Err(copperclaw_db::DbError::invariant(format!(
             "goal: unknown op {other:?}"
+        ))),
+    }
+}
+
+/// Apply a `{"condition": {...}}` system row (M22 A4): register / deregister a
+/// durable HEARTBEAT-style condition, or set / clear a per-session flag latch.
+/// Mirrors [`apply_goal`] — internal tracking state applied immediately.
+fn apply_condition(
+    central: &copperclaw_db::central::CentralDb,
+    sess: &Session,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::conditions::{self, NewCondition};
+
+    let op = payload.get("op").and_then(serde_json::Value::as_str);
+    let body = payload.get("payload").unwrap_or(&serde_json::Value::Null);
+    let str_field = |key: &str| -> Option<String> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let i64_field =
+        |key: &str| -> Option<i64> { body.get(key).and_then(serde_json::Value::as_i64) };
+
+    match op {
+        Some("register") => {
+            let id = str_field("id").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing id")
+            })?;
+            let kind = str_field("kind").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing kind")
+            })?;
+            let prompt = str_field("prompt").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing prompt")
+            })?;
+            conditions::upsert(
+                central,
+                NewCondition {
+                    id,
+                    agent_group_id: sess.agent_group_id,
+                    session_id: sess.id,
+                    kind,
+                    threshold: i64_field("threshold"),
+                    flag: str_field("flag"),
+                    prompt,
+                    grant_id: str_field("grant_id"),
+                },
+            )?;
+            Ok(())
+        }
+        Some("remove") => {
+            let id = str_field("id")
+                .ok_or_else(|| copperclaw_db::DbError::invariant("condition remove: missing id"))?;
+            conditions::soft_remove(central, &id, chrono::Utc::now())?;
+            Ok(())
+        }
+        Some("set_flag") => {
+            let flag = str_field("flag").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition set_flag: missing flag")
+            })?;
+            let value = body
+                .get("value")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if value {
+                conditions::set_flag(
+                    central,
+                    sess.agent_group_id,
+                    sess.id,
+                    &flag,
+                    chrono::Utc::now(),
+                )?;
+            } else {
+                conditions::clear_flag(central, sess.id, &flag)?;
+            }
+            Ok(())
+        }
+        other => Err(copperclaw_db::DbError::invariant(format!(
+            "condition: unknown op {other:?}"
         ))),
     }
 }

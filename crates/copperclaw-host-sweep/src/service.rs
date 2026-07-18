@@ -566,14 +566,24 @@ impl SweepService {
         }
     }
 
-    /// Sample the observable [`ConditionContext`] for one session: the
-    /// count of pending, due inbound messages waiting on its queue. A
-    /// failure to open the per-session inbound DB degrades to a quiet
-    /// context (no signal) rather than aborting the pass — a condition
-    /// simply will not fire for a session we cannot sample, which is the
-    /// safe default. `idle_secs` / operator flags are left unset here;
-    /// the host can layer those in via a richer sampler if it wires one.
-    fn sample_condition_context(&self, session_id: &SessionId) -> ConditionContext {
+    /// Sample the observable [`ConditionContext`] for one session — the input
+    /// all three [`crate::checks::condition_checkin::ConditionKind`]s evaluate
+    /// against. A failure to read any one signal degrades that signal to its
+    /// quiet default rather than aborting the pass — a condition simply will
+    /// not fire for a signal we cannot sample, the safe default.
+    ///
+    /// M22 A4 populates the two signals the revived condition check needs
+    /// beyond `pending_inbound`:
+    ///   * `idle_secs` — seconds since the session's `last_active` (drives
+    ///     [`IdleForAtLeastSecs`](crate::checks::condition_checkin::ConditionKind::IdleForAtLeastSecs));
+    ///   * `flags_set` — the session's currently-set `condition_flags`
+    ///     latches (drives
+    ///     [`FlagSet`](crate::checks::condition_checkin::ConditionKind::FlagSet)).
+    fn sample_condition_context(
+        &self,
+        session_id: &SessionId,
+        now: DateTime<Utc>,
+    ) -> ConditionContext {
         // We need the agent_group_id to open the per-session DB. The
         // condition store carries it, so look it up there.
         let Some(cond) = self
@@ -593,10 +603,23 @@ impl SweepService {
             })
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
+        // M22 A4: idle duration since the session's last recorded activity.
+        // A session with `last_active` in the future (clock skew) reads as 0
+        // idle, never negative.
+        let idle_secs = copperclaw_db::tables::sessions::get(&self.central, *session_id)
+            .ok()
+            .map(|s| {
+                let secs = now.signed_duration_since(s.last_active).num_seconds();
+                u64::try_from(secs.max(0)).unwrap_or(0)
+            });
+        // M22 A4: operator/agent-set flag latches for this session.
+        let flags_set =
+            copperclaw_db::tables::conditions::list_flags_for_session(&self.central, *session_id)
+                .unwrap_or_default();
         ConditionContext {
             pending_inbound: pending,
-            idle_secs: None,
-            flags_set: Vec::new(),
+            idle_secs,
+            flags_set,
         }
     }
 
@@ -720,14 +743,37 @@ impl SweepService {
             ),
         }
 
+        // M22 A4: reload the durable `conditions` table into the shared
+        // in-memory `ConditionStore` before evaluating. This is what revives
+        // the previously-dormant check — a registered condition survives a
+        // restart (the store is rebuilt from the DB each pass) and a
+        // deregistered one stops firing. `reconcile` preserves the rising-edge
+        // latch of an unchanged condition so a still-true condition does not
+        // re-fire every pass. Errors are logged and swallowed (an empty reload
+        // leaves the store as-is) so a sqlite hiccup never aborts the pass.
+        match copperclaw_db::tables::conditions::list_active(&self.central) {
+            Ok(rows) => {
+                let desired = rows
+                    .into_iter()
+                    .filter_map(condition_checkin::Condition::from_stored)
+                    .collect();
+                self.condition_store.reconcile(desired);
+            }
+            Err(e) => tracing::warn!(
+                target: "copperclaw_host_sweep",
+                error = %e,
+                "condition reload from central DB failed; keeping prior store",
+            ),
+        }
+
         // Global: HEARTBEAT-style condition check-ins. Distinct from the
         // time-based scheduling above — these fire when a *stored
         // condition currently holds*, not when a clock deadline elapses.
         // The sampler builds each session's observable context (pending
-        // inbound count) from its per-session DB; the check fires a wake
-        // inbound only on a condition's rising edge and audits each fire.
-        // Default-empty store => zero conditions => no-op.
-        let sampler = |sid: &SessionId| self.sample_condition_context(sid);
+        // inbound count, idle duration, set flags — M22 A4) from the central
+        // + per-session DBs; the check fires a wake inbound only on a
+        // condition's rising edge and audits each fire. Empty store => no-op.
+        let sampler = |sid: &SessionId| self.sample_condition_context(sid, now);
         match condition_checkin::check(
             self.condition_store.as_ref(),
             &self.central,
@@ -1469,6 +1515,164 @@ mod tests {
         clock.advance(ChDuration::hours(24));
         let r = svc.run_once().unwrap();
         assert!(r.central_integrity_checked, "daily cadence re-fires");
+    }
+
+    /// M22 A4 acceptance (unit): the condition sampler populates ALL THREE
+    /// observable signals — pending-inbound count, idle duration, and the set
+    /// flag latches — from the central + per-session DBs, so every
+    /// `ConditionKind` has real input to evaluate against.
+    #[test]
+    fn sample_condition_context_populates_all_three_kinds() {
+        use crate::checks::condition_checkin::{Condition, ConditionKind};
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let sess = seed_running_session(&central);
+
+        // pending_inbound: two pending inbound rows.
+        crate::test_support::insert_inbound_message(&root, &sess);
+        crate::test_support::insert_inbound_message(&root, &sess);
+        // flags_set: one set latch for the session.
+        copperclaw_db::tables::conditions::set_flag(
+            &central,
+            sess.agent_group_id,
+            sess.id,
+            "deploying",
+            Utc::now(),
+        )
+        .unwrap();
+
+        let now = chrono::Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let svc = SweepService::new(central, root);
+        // The sampler resolves the session's agent_group_id via a registered
+        // condition, so register one for this session first.
+        svc.condition_store().register(Condition {
+            id: "c".into(),
+            agent_group_id: sess.agent_group_id,
+            session_id: sess.id,
+            kind: ConditionKind::FlagSet {
+                flag: "deploying".into(),
+            },
+            prompt: "x".into(),
+        });
+        // idle_secs: force last_active one hour before `now`.
+        svc.central()
+            .conn()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET last_active = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    (now - ChDuration::hours(1)).to_rfc3339(),
+                    sess.id.as_uuid().to_string()
+                ],
+            )
+            .unwrap();
+
+        let ctx = svc.sample_condition_context(&sess.id, now);
+        assert_eq!(ctx.pending_inbound, 2, "pending_inbound populated");
+        assert_eq!(ctx.idle_secs, Some(3600), "idle_secs populated");
+        assert_eq!(
+            ctx.flags_set,
+            vec!["deploying".to_string()],
+            "flags_set populated"
+        );
+    }
+
+    /// M22 A4 acceptance (integration): a durable idle condition persisted in
+    /// the central `conditions` table fires a `kind:task` check-in wake once the
+    /// session has been idle past its floor — driven entirely through
+    /// `run_once` (reload → sample → rising-edge fire), reusing the sweep's
+    /// test-clock seam for timing rather than any real wait.
+    #[tokio::test]
+    async fn run_once_fires_persisted_idle_condition_wake() {
+        use copperclaw_db::tables::conditions::{self, NewCondition};
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let sess = seed_running_session(&central);
+        // Materialise the inbound DB so the fire can write into it.
+        let _ = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+
+        // Register a durable idle condition: fire when idle >= 300s.
+        conditions::upsert(
+            &central,
+            NewCondition {
+                id: "idle-watchdog".into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                kind: crate::checks::condition_checkin::KIND_IDLE.into(),
+                threshold: Some(300),
+                flag: None,
+                prompt: "you've gone quiet — check in".into(),
+                grant_id: None,
+            },
+        )
+        .unwrap();
+
+        // Clock: two hours after last_active (set at seed time) → well idle.
+        let now = Utc::now() + ChDuration::hours(2);
+        let clock = Arc::new(MockClock::new(now));
+        let svc = SweepService::with_clock(central, root.clone(), clock.clone());
+
+        // First pass: reload from DB → rising edge → one fire.
+        let report = svc.run_once().unwrap();
+        assert_eq!(report.condition_checkins_fired.len(), 1, "idle wake fires");
+        assert_eq!(
+            report.condition_checkins_fired[0].series_id,
+            "idle-watchdog"
+        );
+        let count: i64 = root
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap()
+            .conn_mut()
+            .query_row("SELECT COUNT(*) FROM messages_in", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "a wake inbound landed in the session");
+
+        // Second pass: still idle (holding) → no re-fire (edge-triggered).
+        let report = svc.run_once().unwrap();
+        assert!(
+            report.condition_checkins_fired.is_empty(),
+            "holding condition fires once, not every pass",
+        );
+    }
+
+    /// A soft-removed (deregistered) condition stops firing on the next pass —
+    /// `run_once`'s reconcile drops it from the store.
+    #[tokio::test]
+    async fn run_once_stops_firing_after_deregister() {
+        use copperclaw_db::tables::conditions::{self, NewCondition};
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let sess = seed_running_session(&central);
+        let _ = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        conditions::set_flag(&central, sess.agent_group_id, sess.id, "go", Utc::now()).unwrap();
+        conditions::upsert(
+            &central,
+            NewCondition {
+                id: "flag-cond".into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                kind: crate::checks::condition_checkin::KIND_FLAG.into(),
+                threshold: None,
+                flag: Some("go".into()),
+                prompt: "flag raised".into(),
+                grant_id: None,
+            },
+        )
+        .unwrap();
+
+        let clock = Arc::new(MockClock::new(Utc::now()));
+        let svc = SweepService::with_clock(central.clone(), root.clone(), clock);
+        assert_eq!(svc.run_once().unwrap().condition_checkins_fired.len(), 1);
+
+        // Deregister → next pass reloads without it → clear the flag would also
+        // stop it, but here we prove the reconcile-driven removal path.
+        conditions::soft_remove(&central, "flag-cond", Utc::now()).unwrap();
+        let report = svc.run_once().unwrap();
+        assert!(report.condition_checkins_fired.is_empty());
+        assert!(
+            svc.condition_store().all().is_empty(),
+            "reconcile dropped it"
+        );
     }
 
     #[tokio::test]

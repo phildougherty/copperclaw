@@ -62,9 +62,10 @@ use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, AuthorTaskGrantSpec, CreateAgentSpec,
     CreateGoalSpec, DelegateBatchOutcome, DelegateBatchRequest, DelegateSpec, EditMessageSpec,
-    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec,
-    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary,
-    ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateGoalSpec, UpdateTaskSpec,
+    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, RegisterConditionSpec,
+    SaveSkillSpec, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec, SetConditionFlagSpec,
+    SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck, ToolEntry, ToolError,
+    UpdateGoalSpec, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1215,6 +1216,12 @@ fn apply_effect(
         // persists into the central `goals` table.
         OutboundToolEffect::CreateGoal(spec) => apply_goal_create(conn, spec),
         OutboundToolEffect::UpdateGoal(spec) => apply_goal_update(conn, spec),
+        // M22 A4: condition registration + flag latch. Like the `goal` ops these
+        // land as `{"condition": {...}}` system rows the host's delivery
+        // `condition` handler persists into the central `conditions` /
+        // `condition_flags` tables.
+        OutboundToolEffect::RegisterCondition(spec) => apply_register_condition(conn, spec),
+        OutboundToolEffect::SetConditionFlag(spec) => apply_set_condition_flag(conn, spec),
     }
 }
 
@@ -1906,6 +1913,50 @@ fn apply_goal_update(
                 "progress": spec.progress,
                 "progress_tokens": spec.progress_tokens,
                 "objective": spec.objective,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_register_condition(
+    conn: &mut Connection,
+    spec: RegisterConditionSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's delivery `condition` handler parses this row and upserts /
+    // soft-removes a `conditions` row (M22 A4). A condition is internal tracking
+    // state — not approval-gated (it authorizes nothing on its own) — so it
+    // applies immediately host-side like `goal`.
+    let payload = serde_json::json!({
+        "condition": {
+            "op": if spec.remove { "remove" } else { "register" },
+            "payload": {
+                "id": spec.id,
+                "kind": spec.kind,
+                "threshold": spec.threshold,
+                "flag": spec.flag,
+                "prompt": spec.prompt,
+                "grant_id": spec.grant_id,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_set_condition_flag(
+    conn: &mut Connection,
+    spec: SetConditionFlagSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    let payload = serde_json::json!({
+        "condition": {
+            "op": "set_flag",
+            "payload": {
+                "flag": spec.flag,
+                "value": spec.value,
             }
         }
     });

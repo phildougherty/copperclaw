@@ -118,6 +118,13 @@ const SCHEDULING_MUTATION_TOOLS: &[&str] = &[
     // [`READONLY_TOOLS`].
     "create_goal",
     "update_goal",
+    // M22 A4: condition/event-trigger authoring + the settable flag latch.
+    // Registering an event-driven wake (and toggling the latch it fires on)
+    // mutates the same autonomy-affecting sweep state the scheduler/goal verbs
+    // do, so it rides here — reachable from the messaging profile up, denied to
+    // a guest sender via the mutating floor.
+    "register_condition",
+    "set_condition_flag",
 ];
 
 /// Filesystem-mutation, shell, and agent-spawning tools layered on by the

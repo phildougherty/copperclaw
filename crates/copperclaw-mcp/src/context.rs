@@ -289,6 +289,43 @@ pub struct GoalSummary {
     pub tokens_consumed: i64,
 }
 
+/// Spec for `register_condition` (M22 A4). Registers — or, when `remove` is
+/// set, deregisters — a durable HEARTBEAT-style condition the sweep fires a
+/// `kind:task` check-in wake for on the RISING edge of its predicate. Persisted
+/// host-side into the central `conditions` table (mirroring the `create_goal`
+/// path). A condition is internal tracking state — it authorizes nothing on its
+/// own; any autonomous ACTION the woken turn takes stays gated by A2's grant
+/// machinery at fire time (`grant_id` records the optional linkage).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterConditionSpec {
+    /// Agent-chosen stable key. Re-registering the same id replaces it.
+    pub id: String,
+    /// `pending_inbound` | `idle` | `flag` — the observable tested.
+    pub kind: String,
+    /// `min` pending count (`pending_inbound`) or idle-seconds floor (`idle`);
+    /// `None` for `flag`.
+    pub threshold: Option<i64>,
+    /// Watched flag name for `flag`; `None` otherwise.
+    pub flag: Option<String>,
+    /// Prompt delivered to the woken agent on a fire (required for register).
+    pub prompt: Option<String>,
+    /// Optional A2 fire-time grant linkage.
+    pub grant_id: Option<String>,
+    /// When true, deregister the condition `id` instead of registering.
+    pub remove: bool,
+}
+
+/// Spec for `set_condition_flag` (M22 A4). Sets or clears a named per-session
+/// latch the `flag` condition kind watches — the settable signal that lets a
+/// `flag` condition fire. Persisted host-side into `condition_flags`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetConditionFlagSpec {
+    /// The flag name to set or clear.
+    pub flag: String,
+    /// `true` = raise the flag (set), `false` = lower it (clear).
+    pub value: bool,
+}
+
 /// One memory hit surfaced to the `memory_search` / `memory_get` tools.
 ///
 /// `provenance` is the wire form (`"trusted"` / `"untrusted"`) of the stored
@@ -527,6 +564,12 @@ pub enum OutboundToolEffect {
     /// `update_goal` (M22 A3) — record progress and/or transition a goal's
     /// lifecycle state host-side.
     UpdateGoal(UpdateGoalSpec),
+    /// `register_condition` (M22 A4) — persist / deregister a durable
+    /// HEARTBEAT-style condition in the central `conditions` table.
+    RegisterCondition(RegisterConditionSpec),
+    /// `set_condition_flag` (M22 A4) — set / clear a per-session flag latch the
+    /// `flag` condition kind watches.
+    SetConditionFlag(SetConditionFlagSpec),
 }
 
 impl OutboundToolEffect {
@@ -554,6 +597,8 @@ impl OutboundToolEffect {
             Self::UpdateTask(_) => "update_task",
             Self::CreateGoal(_) => "create_goal",
             Self::UpdateGoal(_) => "update_goal",
+            Self::RegisterCondition(_) => "register_condition",
+            Self::SetConditionFlag(_) => "set_condition_flag",
         }
     }
 }
