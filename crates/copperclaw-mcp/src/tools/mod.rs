@@ -32,6 +32,7 @@ pub mod diagnostics;
 pub(crate) mod diff_util;
 pub mod edit_file;
 pub mod explore;
+pub mod find_symbol;
 pub mod git_blame;
 pub(crate) mod git_common;
 pub mod git_diff;
@@ -142,6 +143,10 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         git_status::entry(),
         glob::entry(),
         grep::entry(),
+        // M22 C3: read-only symbol navigation (go-to-def / find-refs / hover)
+        // backed by the container-local ctags/LSP index bridge, degrading to
+        // on-demand ctags then a scoped definition scan.
+        find_symbol::entry(),
         web_search::entry(),
         explore::entry(),
         load_skill::entry(),
@@ -270,6 +275,7 @@ mod tests {
             "git_status",
             "glob",
             "grep",
+            "find_symbol",
             "web_search",
             "explore",
             "load_skill",
