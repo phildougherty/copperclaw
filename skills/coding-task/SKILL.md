@@ -6,18 +6,16 @@ description: Disciplines for doing real coding work — editing files, running t
 # coding-task
 
 How to do coding work as a Copperclaw agent. The base session image
-ships `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`, `jq`, and
-`build-essential` via `shell`. The *prototyping* profile also bakes
+ships `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`, `jq`,
+`build-essential` via `shell`; the *prototyping* profile also bakes
 `typescript`, `eslint`, `prettier`, `tailwindcss`, `ruff`, `sqlite3`,
-and `create-vite`/`vite` — probe first (`command -v eslint`), since not
-every group runs that profile.
+`create-vite`/`vite` — probe first (`command -v eslint`).
 
-Need a toolchain in neither list (Go, Rust, a JVM)? Don't call
-`install_packages` and wait — it only rebuilds the image for a
-*future* session, so the binary never appears this turn. Download it
-into `/data` instead (e.g. Go: `curl -fsSL <tarball-url> | tar -C
-/data -xz`, then `export PATH=/data/go/bin:$PATH`) — no root, no apt.
-See [[install-packages]].
+Need a toolchain in neither (Go, Rust, a JVM)? Don't call
+`install_packages` and wait — it only rebuilds the image for a *future*
+session. Download into `/data` instead (Go: `curl -fsSL <tarball-url> |
+tar -C /data -xz`, then `export PATH=/data/go/bin:$PATH`) — no root, no
+apt. See [[install-packages]].
 
 ## Every project is a git repo (do this first)
 
@@ -32,6 +30,17 @@ just the end. `create_agent` siblings only get a WRITABLE worktree
 (see [[create-agent]]) of the repo you're `cd`'d into — outside a
 repo they drop to read-only. An existing checkout: use it as-is.
 
+## Changing an *existing* repo — clone, it auto-attaches
+
+Changing an existing codebase, not building one? Clone with `shell` git
+(no clone/commit tool — plain git, same egress guard): `cd /data && git
+clone <url> <project>`. Next turn the runtime auto-attaches any cloned
+`/data` repo (has an `origin` remote a prototype lacks): it **infers
+`.copperclaw/verify` stages** from its manifests (Cargo, `package.json`
+scripts, Makefile, pyproject) so the verify gate below covers it from
+turn one, seeds `.copperclaw/DECISIONS.md`, and marks it attached.
+Refine the inferred `.copperclaw/verify` — you own it after attach.
+
 ## Decompose before you build
 
 Name the modules/files and each one's single responsibility BEFORE
@@ -44,8 +53,8 @@ can safely edit in parallel.
   size. Split on job collision (two features fighting over one file),
   not line count — a 40-line script cut into three files is
   decomposition theater, not craft.
-- Put the module list in your first `todo_add` batch — the plan the
-  build follows, not a mental note.
+- Put the module list in your first `todo_add` batch — the plan, not a
+  mental note.
 - **Read before you write**, match the surrounding style; prefer
   editing existing files; no drive-by cleanup; comment only the
   non-obvious *why*.
@@ -61,18 +70,18 @@ can safely edit in parallel.
    hashing) — don't hand-roll bcrypt.
 3. **Hand-rolled last**, only for glue logic specific to this app.
 
-Probe before depending on an image tool (`command -v eslint`,
-`python3 -c "import <pkg>"`) — an absent tool just fails cold.
+Probe before depending on an image tool (`command -v eslint`) — an
+absent tool just fails cold.
 
 ## Robustness: handle what a user can actually hit
 
 Skip handling only for genuinely impossible inputs — "impossible"
 means **no code path can produce it**, not merely unlikely. A
-user-typed, user-submitted, or wrong-app-usage path is in scope, even
-in a prototype:
+user-typed / user-submitted / wrong-usage path is in scope, even in a
+prototype:
 
-- **Bad input** — empty string, wrong type, out-of-range value. Fail
-  at the boundary with a message the user can act on, not a stack trace.
+- **Bad input** — empty string, wrong type, out-of-range. Fail at the
+  boundary with an actionable message, not a stack trace.
 - **Empty state** — zero-item list, no-results search, no data yet.
   Design it; don't render a blank screen.
 - **Network/IO failure** — timed-out fetch, missing file, denied
@@ -91,32 +100,26 @@ via the project's *canonical* build (`cargo build`, `go build ./...`,
 so — "wrote X, couldn't run it, because Y" beats a fabricated "done".
 
 Verification is also *enforced*. Write
-`/data/<project>/.copperclaw/verify` **at scaffold time**, not as a
-wrap-up step, as one or more stages, one per line:
+`/data/<project>/.copperclaw/verify` **at scaffold time**, one stage
+per line (an optional `name:` prefix names it; an unprefixed line gets
+`stage1`, ...):
 
     lint: npx eslint .
     typecheck: tsc --noEmit
     test: npm test
 
-An optional `name:` prefix names a stage; an unprefixed line gets a
-derived name (`stage1`, ...) and is enforced the same way — a single
-unprefixed line is exactly today's one-command check. **Probe before
-writing a stage that needs a tool** (`command -v eslint`) — only write
-stages for tools confirmed on the image; an absent binary just fails
-the stage cold. `check_command` (per-group config) overrides the whole
-file with one command.
+**Probe before writing a stage that needs a tool** (`command -v
+eslint`) — an absent binary just fails the stage cold. `check_command`
+(per-group config) overrides the whole file with one command.
 
 Any edit marks the project **dirty**, resetting every stage. While
-dirty, `todo_update(status="completed")` refuses, naming the
-missing/failing stage(s), the exact command, and fix-cycles left.
-Clear a stage by running **exactly** its command via `shell` with
-`cwd` set to the project — exit 0 records green, nonzero records a fix
-cycle and names the broken stage in `last_failure`. **2** failed
-cycles auto-blocks the todo. Every stage must be green since the last
-dirty mark, not just the one you last ran; no file → the error says
-so. A group that never touches a project never trips the gate.
-Truncated log tail: [[testing]]/[[debug]] (`tail_bytes`, paged
-`read_file`).
+dirty, `todo_update(status="completed")` refuses, naming the failing
+stage(s), the exact command, and fix-cycles left. Clear a stage by
+running **exactly** its command via `shell` with `cwd` set to the
+project — exit 0 records green, nonzero records a fix cycle (named in
+`last_failure`); **2** failures auto-block the todo. Every stage must
+be green since the last dirty mark. Truncated log tail:
+[[testing]]/[[debug]] (`tail_bytes`, paged `read_file`).
 
 ## See it, then fix it — before the delivery todo
 
@@ -130,9 +133,9 @@ there is genuinely no UI to look at:
 4. Fix the worst two things the checklist surfaces.
 5. `ui_screenshot` again to confirm the fix landed.
 
-One full cycle minimum before the delivery todo. See
-[[web-app-scaffold]] for when a scaffolded app first has something on
-screen worth looking at.
+One full cycle minimum before the delivery todo; see
+[[web-app-scaffold]] for when a scaffolded app first has something worth
+looking at.
 
 ## Delivering artifacts to the operator
 
@@ -148,10 +151,9 @@ the operator can use — `/data` is the *container*'s path, not theirs.
 **Open preview** `url` button (exact `expose_preview` URL, only if the
 app serves HTTP), a **Download** button (`value: "download"` — ships
 the `git archive` zip via `send_file` next turn), `artifact_path` in a
-footer field, and the agent-taken screenshot via its own `send_file`
-— omit only when there's genuinely no UI. Degrades by capability — no
-preview → no button, never a dead link. Full card: [[send-card]]; zip:
-[[send-file]].
+footer field, and the screenshot via its own `send_file`. Degrades by
+capability — no preview → no button, never a dead link. Full card:
+[[send-card]]; zip: [[send-file]].
 
 ## Don't fabricate
 
