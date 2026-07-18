@@ -35,6 +35,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use copperclaw_db::tables::messages_in;
+use copperclaw_mcp::tools::agents::delegate_batch::{
+    REVIEWER_ROLE_SENTINEL, ReviewVerdict, parse_review_verdict,
+};
 use copperclaw_mcp::{DelegateBatchOutcome, DelegateBatchWorker, WorkerOutcome, WorkerStatus};
 use copperclaw_types::MessageId;
 use rusqlite::Connection;
@@ -155,8 +158,47 @@ pub(crate) async fn join_workers(
         sleep(Duration::from_millis(DELEGATE_BATCH_POLL_MS)).await;
     }
 
+    // M22 C5: a review-role worker is a plain `delegate` on the wire, so gate
+    // the merge at the join layer by recognizing it via the sentinel the
+    // `delegate_batch` tool embedded in its instructions.
+    apply_review_gate(&mut joins, workers);
+
     DelegateBatchOutcome {
         workers: joins.into_iter().map(finalize_worker).collect(),
+    }
+}
+
+/// M22 C5: annotate any REVIEW-role worker whose report carries a blocking
+/// verdict. The reviewer is dispatched as a normal `delegate`, so the join
+/// recognizes it by the [`REVIEWER_ROLE_SENTINEL`] that `tools/agents.rs`
+/// prefixed onto its instructions, parses its report with the SHARED
+/// [`parse_review_verdict`], and — on a `Block`/`Unknown` verdict — records
+/// the block in the worker's `error`, so the merge gate is explicit in the
+/// aggregated outcome for ANY consumer of the join (defense-in-depth
+/// alongside the tool-surface gate in `tools/agents.rs`, which shapes the
+/// `merge_blocked` result JSON). A reviewer that PASSED is left untouched; a
+/// reviewer with no report already carries a timeout/spawn error, which the
+/// tool-surface gate reads as blocking too.
+fn apply_review_gate(joins: &mut [WorkerJoin], workers: &[DelegateBatchWorker]) {
+    // `joins` is built 1:1 from `workers` in request order and only ever has
+    // its fields mutated (never reordered), so the zip stays aligned.
+    for (j, w) in joins.iter_mut().zip(workers) {
+        if !w.instructions.contains(REVIEWER_ROLE_SENTINEL) {
+            continue;
+        }
+        let Some(report) = j.report.as_deref() else {
+            continue; // no report → already carries a timeout/spawn error.
+        };
+        let verdict = parse_review_verdict(report);
+        if verdict.is_blocking() && j.error.is_none() {
+            let reason = match verdict {
+                ReviewVerdict::Block => "reviewer blocked the merge",
+                _ => "reviewer produced no verdict",
+            };
+            j.error = Some(format!(
+                "merge blocked by review ({reason}); see the report"
+            ));
+        }
     }
 }
 
@@ -482,6 +524,115 @@ mod tests {
         assert_eq!(
             pending[0].content.get("text").and_then(|t| t.as_str()),
             Some("from a stranger")
+        );
+    }
+
+    // ── reviewer role: merge gate at the join (M22 C5) ───────────────────
+
+    /// Drive a build worker + a review worker through the join. The reviewer
+    /// (recognized by the sentinel in its instructions) reports a `block`
+    /// verdict, so the join must annotate its `error` with the merge block
+    /// while leaving the build worker untouched.
+    #[tokio::test]
+    async fn reviewer_block_verdict_annotates_error_at_join() {
+        let (_tmp, inbound) = fresh_inbound();
+        let rev_instr = format!("{REVIEWER_ROLE_SENTINEL} review the api change");
+        let workers = vec![worker("impl", "build api"), worker("rev", &rev_instr)];
+        let sid_impl = SessionId::new().as_uuid().to_string();
+        let sid_rev = SessionId::new().as_uuid().to_string();
+
+        let writer = inbound.clone();
+        let (i, r, ri) = (sid_impl.clone(), sid_rev.clone(), rev_instr.clone());
+        let host = tokio::spawn(async move {
+            write_row(
+                &writer,
+                MessageKind::System,
+                delegate_result("created", Some(&i), "build api"),
+                None,
+            )
+            .await;
+            write_row(
+                &writer,
+                MessageKind::System,
+                delegate_result("created", Some(&r), &ri),
+                None,
+            )
+            .await;
+            write_row(
+                &writer,
+                MessageKind::Chat,
+                serde_json::json!({"text": "built it"}),
+                Some(i),
+            )
+            .await;
+            write_row(
+                &writer,
+                MessageKind::Chat,
+                serde_json::json!({"text": "api.py:4 no auth check\nREVIEW-VERDICT: block"}),
+                Some(r),
+            )
+            .await;
+        });
+
+        let outcome = join_workers(&inbound, &workers, 0, Duration::from_secs(5)).await;
+        host.await.unwrap();
+
+        // The build worker reported cleanly — no review annotation.
+        let impl_w = outcome.workers.iter().find(|w| w.name == "impl").unwrap();
+        assert_eq!(impl_w.report.as_deref(), Some("built it"));
+        assert!(impl_w.error.is_none());
+
+        // The reviewer reported (so it still ran), but its blocking verdict
+        // is recorded in `error` — the merge is gated at the join.
+        let rev = outcome.workers.iter().find(|w| w.name == "rev").unwrap();
+        assert!(rev.report.as_deref().unwrap().contains("no auth check"));
+        assert!(
+            rev.error
+                .as_deref()
+                .unwrap()
+                .contains("merge blocked by review"),
+            "a blocking reviewer must carry the merge block in its error; got: {:?}",
+            rev.error
+        );
+    }
+
+    /// A reviewer that PASSES leaves no error annotation — the merge is not
+    /// gated.
+    #[tokio::test]
+    async fn reviewer_pass_verdict_leaves_no_error_at_join() {
+        let (_tmp, inbound) = fresh_inbound();
+        let rev_instr = format!("{REVIEWER_ROLE_SENTINEL} review it");
+        let workers = vec![worker("rev", &rev_instr)];
+        let sid_rev = SessionId::new().as_uuid().to_string();
+
+        let writer = inbound.clone();
+        let (r, ri) = (sid_rev.clone(), rev_instr.clone());
+        let host = tokio::spawn(async move {
+            write_row(
+                &writer,
+                MessageKind::System,
+                delegate_result("created", Some(&r), &ri),
+                None,
+            )
+            .await;
+            write_row(
+                &writer,
+                MessageKind::Chat,
+                serde_json::json!({"text": "read the diff, clean\nREVIEW-VERDICT: pass"}),
+                Some(r),
+            )
+            .await;
+        });
+
+        let outcome = join_workers(&inbound, &workers, 0, Duration::from_secs(5)).await;
+        host.await.unwrap();
+
+        let rev = &outcome.workers[0];
+        assert_eq!(rev.status, WorkerStatus::Ok);
+        assert!(
+            rev.error.is_none(),
+            "a passing reviewer must not be annotated; got: {:?}",
+            rev.error
         );
     }
 }

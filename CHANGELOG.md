@@ -97,6 +97,29 @@ adheres to [Semantic Versioning](https://semver.org/).
   `baseline_reencoded.png` (identical pixels, different encoding → must diff to
   zero regions), `regressed.png` (a moved card → a localized flagged region),
   and `baseline_rgb.png` (color type 2, exercises the no-alpha decode path).
+### Added (M22 C5 — reviewer role in `delegate_batch`)
+
+- **Reviewer role for `delegate_batch`**: a batch worker may now be marked
+  `role: "review"` (optionally handed the `diff` to review) to make it a
+  first-class REVIEWER instead of a build worker, so diff review is no longer
+  ad hoc. A review worker is dispatched with the diff embedded in its
+  instructions and directed to drive the **existing `code-review` skill** (the
+  same skill `self_review.rs` points at) and end its report with a
+  machine-readable `REVIEW-VERDICT: pass|block` line. Its findings **gate the
+  merge**: if any reviewer blocks (or, fail-closed, produces no explicit
+  verdict / never reports), the aggregated result carries `merge_blocked: true`
+  plus a `review` section with each reviewer's verdict and findings, and the
+  build workers' reports are still delivered so the parent turn sees both. A
+  batch with no reviewer returns the pre-C5 aggregate shape unchanged (full
+  back-compat). Tool-surface half (role/diff params, reviewer-instruction
+  construction, verdict parsing, and the result-JSON gate) in
+  `crates/copperclaw-mcp/src/tools/agents.rs`; the runner-side join
+  (`crates/copperclaw-runner/src/run/delegate_batch.rs`) recognizes a reviewer
+  by a shared sentinel and annotates a blocking reviewer's `error` so the gate
+  is explicit in the joined outcome for any consumer (defense in depth). No
+  migration, no new approval machinery. Unit + integration coverage in both
+  files (reviewer dispatched with diff payload; blocking findings gate the
+  merge; passing clears it; back-compat preserved).
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
