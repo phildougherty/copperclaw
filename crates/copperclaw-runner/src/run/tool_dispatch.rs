@@ -316,10 +316,22 @@ pub(super) async fn invoke_tool(
             return (reason, Vec::new(), true);
         }
     }
+    // M22 S4 — active-skill tool narrowing, now covering INLINE (default) mode.
+    // The scope is whatever the most recent `load_skill` recorded on the
+    // context (`ToolContext::set_active_skill_allowed_tools`). This read is
+    // skills-mode-agnostic on purpose: `load_skill` populates the scope from the
+    // `/data/skills.json` catalogue in CALLABLE mode AND from the materialized
+    // `/data/skills/<name>/SKILL.md` in INLINE mode, so a skill's
+    // `tools:`/`allowed-tools:` allowlist narrows dispatch identically in both.
+    // `None` (no active skill, or a skill that declared no tool scope) leaves
+    // the base policy unscoped — unchanged for every shipped skill that declares
+    // nothing. `load_skill` is in `ALWAYS_TOOLS`, so a narrowed turn can still
+    // switch skills.
+    let active_skill_scope = deps.tool_ctx.active_skill_allowed_tools();
     let policy = deps
         .policy
         .clone()
-        .with_active_skill(deps.tool_ctx.active_skill_allowed_tools())
+        .with_active_skill(active_skill_scope)
         .with_trust(trust);
     if let PolicyDecision::Deny(reason) = policy.evaluate(&call.name) {
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
@@ -703,6 +715,31 @@ mod tests {
         assert!(
             !content.contains("active skill"),
             "no skill loaded must not narrow dispatch; got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_mode_tools_scope_narrows_dispatch() {
+        // M22 S4 acceptance: a skill activated under INLINE mode narrows
+        // dispatch. The runner reads the scope off the ToolContext (set by the
+        // inline `load_skill` path from the materialized SKILL.md's
+        // `tools:`/`allowed-tools:`, here `[read_file, grep]`); dispatch blocks
+        // a tool outside the scope and admits ones inside it — mode-agnostic, so
+        // no `/data/skills.json` catalogue is involved.
+        let base = ToolPolicy::new(ToolProfile::Coding, None);
+        let (_tmp, deps) = deps_with_policy_and_skill(
+            base,
+            Some(vec!["read_file".to_string(), "grep".to_string()]),
+        );
+        // Outside the skill's `tools:` scope → blocked at the active-skill layer.
+        let (blocked, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(blocked.contains("active skill"), "got: {blocked}");
+        // Inside the scope → survives the active-skill layer.
+        let (allowed, _imgs, _e) = invoke_tool(&deps, &call("read_file")).await;
+        assert!(
+            !allowed.contains("active skill"),
+            "read_file is in the scope and must pass; got: {allowed}"
         );
     }
 
