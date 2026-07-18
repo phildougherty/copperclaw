@@ -41,6 +41,42 @@ adheres to [Semantic Versioning](https://semver.org/).
   remaining wire for full in-container execution and is called out in the S1
   security review; host-side resolution + executability are tested here.
 
+### Added (M22 S1M — read-only skills-source bind mount: helpers resolve in-container)
+
+- **The S1 marquee is now truly live: a materialized skill's helper script is
+  executable *inside* a spawned container.** S1 stages selected skills as a
+  symlink farm at `<session_root>/skills/<id>` (the container's `/data/skills`)
+  whose links target the **canonical host** skill dirs (`copperclaw_skills::
+  materialize` links to `skill.dir.canonicalize()`). Those host paths don't
+  exist inside the sandbox, so the farm's links dangled in-container and a
+  skill's `scripts/` helper was not runnable there. `build_spec`
+  (`crates/copperclaw-host/src/container_manager/spawn.rs`,
+  `ContainerManager::apply_skills_source_mounts`) now binds the skills source
+  dir(s) **read-only at their own canonical host-absolute path** (source ==
+  target), so every farm link resolves in-container without rewriting.
+- **Both skill sources, resolved exactly as S1 resolves them.** The global
+  `skills_dir` and the per-group override `<groups_dir>/<ag>/skills` (only when
+  it exists on disk) are each mounted; both existing → two read-only mounts.
+  The mount lives at the *canonical* path because a configured `skills_dir` is
+  commonly a symlink (e.g. `<install>/data/skills` → the repo `skills/`), which
+  is what the farm links actually point at.
+- **Secure-by-default: read-only, escape-guarded, deduped, fail-safe.** Each
+  raw source is validated with `mount_guard::validate_source` before mounting
+  (global root = the configured dir itself; the per-group override's root is
+  `groups_dir`, mirroring how the memory mount validates
+  `<groups_dir>/<ag>/memory`); a source that fails validation, isn't a
+  directory, or can't canonicalize drops *that* mount and never fails the
+  spawn. No global `skills_dir` → no mount. Paths already bound (and the two
+  skills roots against each other) are deduped, so the mount is idempotent
+  across spawns. No egress or write widening — the content is the already-
+  trusted skill files S1 stages. Security note appended under the S1 verdict in
+  `docs/plans/m22-security-reviews.md`.
+- **Tests** (`spawn.rs`): `build_spec_mounts_skills_source_read_only_when_configured`
+  asserts the read-only source==target mount is present at the canonical
+  skills path; `build_spec_no_skills_mount_without_skills_dir` proves the
+  conditional no-op; `build_spec_mounts_per_group_skills_override_read_only`
+  covers the two-source case.
+
 ### Added (M22 AX — Wave-2 autonomy fixtures: grant wakes + goal progress)
 
 - **Grant-wake replay fixtures (`fixtures/cli/grant-wake-granted`,

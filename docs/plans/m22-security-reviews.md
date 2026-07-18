@@ -489,3 +489,49 @@ unselected skills, and every failure path fails safe without failing the spawn.
 No new external input, no privilege the agent's shell lacked, and the only
 outstanding item (the read-only skills-source mount) is additive and itself
 escape-guarded.
+
+### S1M — the read-only skills-source bind mount lands (marquee now truly live)
+
+**Scope.** S1M implements the one outstanding wire the S1 verdict flagged above:
+the read-only bind mount of the skills source path(s) so the farm's canonical
+host-path symlinks resolve *inside* the container, making a materialized skill's
+helper script executable in the sandbox (the S1 marquee). It lives entirely in
+`container_manager/spawn.rs` (`ContainerManager::apply_skills_source_mounts`,
+called from `build_spec`), outside S1's file scope — no change to
+`cold_start.rs`/`materialize.rs`. The farm's links target the *canonical* skill
+dir (`skill.dir.canonicalize()`), so the mount binds the canonical `skills_dir`
+(and, when present, the per-group override `<groups_dir>/<ag>/skills`) at its
+identical host-absolute path (source == target).
+
+**Confirming the anticipated properties.** This is exactly the additive,
+escape-guarded mount the S1 verdict said "does not weaken any security default":
+- **Read-only.** Both mounts are `read_only: true` — the container can never
+  write back into the host skills source (no path to poison the shared skill
+  tree from inside the sandbox).
+- **Already-trusted content.** The bytes exposed are the same operator/agent-
+  authored skill files S1 already stages and whose `SKILL.md` bodies already
+  shape the agent via the prompt; the mount introduces **no new external
+  input** and reaches no host content the farm didn't already reference.
+- **Escape-guarded.** Each raw source is validated with
+  `mount_guard::validate_source` before mounting — the per-group override
+  against `groups_dir` (identical to how the per-group memory mount is
+  validated), the global source against itself (absolute / no-`..` /
+  canonicalizable). A swapped-symlink component that escapes its root drops
+  *that* mount. This is defense-in-depth *on top of* `materialize.rs`'s own
+  per-skill escape guard, so what can reach `/data/skills` is bounded twice.
+- **Fails safe, never fails the spawn.** A missing / non-directory / non-
+  canonicalizable / validation-failing source skips its mount and logs at
+  `warn!`; no global `skills_dir` is a clean no-op. The spawn always proceeds.
+- **No widening.** No egress change, no write access, no new capability — a
+  read-only bind of a bounded, already-trusted tree. Deduped against paths
+  already mounted (and the two skills roots against each other), so it is
+  idempotent across spawns.
+
+**Residual risk.** Negligible and strictly smaller than S1's own: S1 already
+placed this content on-disk under `/data/skills`; S1M only makes the symlinks it
+created resolve, read-only, at their canonical host path. No new sink, no new
+input, no privilege the agent's `shell` lacked.
+
+**Verdict: PASS.** The mount completes the S1 marquee without weakening any
+default — read-only, of already-trusted escape-guarded skill content, deduped,
+and fail-safe.
