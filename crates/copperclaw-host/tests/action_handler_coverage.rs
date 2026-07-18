@@ -94,6 +94,15 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // service persists it immediately into the central `conditions` /
         // `condition_flags` tables.
         "condition",
+        // M22 A2H: granted-autonomous-fire budget writeback
+        // (`charge_grant_fire_once` in `run/tool_dispatch.rs`, NOT an `apply_*`
+        // in tools.rs — see the extra scanned file in
+        // `runner_emit_set_matches_source`). The runner emits this when a
+        // grant-authorized action actually fires; the host debits the central
+        // `task_grants` row so `max_fires` / token budgets deplete across fires.
+        // Intercepted inline (see `inline_handler_set`) — internal accounting,
+        // not approval-gated.
+        "grant_consume",
     ]
     .into_iter()
     .collect()
@@ -137,6 +146,11 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // `conditions` / `condition_flags` tables (with `self.central`) — a
         // condition is internal state, not approval-gated.
         "condition",
+        // M22 A2H: `grant_consume` is intercepted inline so the delivery service
+        // can debit the central `task_grants` row (with `self.central`) via
+        // `consume_fire` / `consume_tokens` — internal accounting, not
+        // approval-gated.
+        "grant_consume",
     ]
     .into_iter()
     .collect()
@@ -256,6 +270,14 @@ fn runner_emit_set_matches_source() {
     // contains its body.
     let run_src = std::fs::read_to_string(runner_path("run/mod.rs"))
         .expect("read crates/copperclaw-runner/src/run/mod.rs");
+    // M22 A2H: the `grant_consume` System row is emitted by
+    // `charge_grant_fire_once` in `run/tool_dispatch.rs` (a granted autonomous
+    // fire's budget writeback), NOT by an `apply_*` in tools.rs. Scan that file
+    // too, but ONLY for that one function's body so the many `json!(...)` calls
+    // in this file's own unit tests (and `fn apply_see_fix_hooks`) don't pollute
+    // the derived set.
+    let tool_dispatch_src = std::fs::read_to_string(runner_path("run/tool_dispatch.rs"))
+        .expect("read crates/copperclaw-runner/src/run/tool_dispatch.rs");
 
     // Match `serde_json::json!({ "<name>": ...` where <name> is the
     // first key inside the top-level object. This is the pattern every
@@ -289,6 +311,13 @@ fn runner_emit_set_matches_source() {
             for cap in re.captures_iter(&fn_body) {
                 derived.insert(cap[1].to_string());
             }
+        }
+    }
+    // M22 A2H: scan only `charge_grant_fire_once` in tool_dispatch.rs for the
+    // `grant_consume` emit.
+    for fn_body in extract_fn_bodies(&tool_dispatch_src, &["fn charge_grant_fire_once"]) {
+        for cap in re.captures_iter(&fn_body) {
+            derived.insert(cap[1].to_string());
         }
     }
     // Strip noise: nested keys inside payload values we don't care about.

@@ -1370,6 +1370,22 @@ impl DeliveryService {
             self.finish_self_mod("condition", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
+        // `grant_consume` (M22 A2H): the runner emits this when a GRANTED
+        // autonomous action actually fires (`charge_grant_fire_once` in the
+        // runner's `tool_dispatch`). It is pure internal accounting — it
+        // authorizes nothing, it only DEBITS an already-approved grant — so it
+        // applies IMMEDIATELY (like `goal` / `condition`, NOT approval-gated),
+        // decrementing the central `task_grants` row via `consume_fire` (+
+        // `consume_tokens` when the payload carries a token count). This is what
+        // makes `max_fires` / token budgets enforceable ACROSS fires: without
+        // it the runner's per-turn/in-snapshot bounds hold, but the central
+        // grant never depletes, so `effective_grant` (hence the next spawn's
+        // grant.json) would never read the grant exhausted.
+        if action.name == "grant_consume" {
+            let apply = apply_grant_consume(&self.central, &action.payload);
+            self.finish_self_mod("grant_consume", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
 
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. The payload carries the new
@@ -4375,6 +4391,54 @@ fn apply_condition(
     }
 }
 
+/// Apply a `{"grant_consume": {...}}` system row (M22 A2H): DEBIT an
+/// already-approved `task_grants` row as a granted autonomous fire happens.
+///
+/// Payload shape (emitted by the runner's `charge_grant_fire_once`):
+/// `{ "grant_id": "...", "task_id": "...", "fires": 1 }`, optionally carrying a
+/// `"tokens"` count. `task_id` is informational (the fire was already authorized
+/// against `grant_id` in-runner); we debit `grant_id` directly. `fires` defaults
+/// to 1 and is clamped non-negative; each unit is one [`consume_fire`] call
+/// (which bumps `fires_consumed` by one), so a grant with `max_fires` genuinely
+/// depletes across fires and `effective_grant` reads it inert once spent.
+///
+/// This is internal accounting, NOT approval-gated — it can only *reduce* an
+/// existing authorization, never widen one.
+fn apply_grant_consume(
+    central: &copperclaw_db::central::CentralDb,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::task_grants;
+
+    let grant_id = payload
+        .get("grant_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| copperclaw_db::DbError::invariant("grant_consume: missing grant_id"))?;
+    let now = chrono::Utc::now();
+
+    // A `grant_consume` row means at least one fire happened; default to 1 and
+    // clamp negatives away so a malformed payload can never *credit* a grant.
+    let fires = payload
+        .get("fires")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1)
+        .max(0);
+    for _ in 0..fires {
+        task_grants::consume_fire(central, grant_id, now)?;
+    }
+
+    // Optional token spend. `consume_tokens` rejects negatives itself; we only
+    // call it for a positive count.
+    if let Some(tokens) = payload.get("tokens").and_then(serde_json::Value::as_i64) {
+        if tokens > 0 {
+            task_grants::consume_tokens(central, grant_id, tokens, now)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6313,6 +6377,104 @@ mod tests {
             goals::get(&db, &goal.id).unwrap().unwrap().status,
             GoalStatus::Completed
         );
+    }
+
+    /// Seed a task for `sess` so a `task_grants` row (FK → tasks) can be
+    /// inserted against it.
+    fn seed_task_for(db: &copperclaw_db::central::CentralDb, sess: &Session, task_id: &str) {
+        copperclaw_db::tables::tasks::insert(
+            db,
+            copperclaw_db::tables::tasks::NewTask {
+                id: task_id.into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                name: Some("t".into()),
+                prompt: "p".into(),
+                when_spec: Utc::now().to_rfc3339(),
+                recurrence: None,
+                next_fire: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn grant_consume_decrements_fires_and_exhausts_grant() {
+        use copperclaw_db::tables::task_grants::{self, NewTaskGrant};
+        let (db, sess) = central_ag_session();
+        seed_task_for(&db, &sess, "task_g");
+        task_grants::insert_approved(
+            &db,
+            NewTaskGrant {
+                id: "grant_1".into(),
+                task_id: "task_g".into(),
+                capability_scope: "web_fetch".into(),
+                token_budget: Some(1000),
+                max_fires: Some(2),
+                expires_at: None,
+                granted_by: None,
+            },
+        )
+        .unwrap();
+
+        // First fire (with a token spend) → one fire + 250 tokens consumed;
+        // the grant is still live (1 fire, 750 tokens left).
+        apply_grant_consume(
+            &db,
+            &json!({ "grant_id": "grant_1", "task_id": "task_g", "fires": 1, "tokens": 250 }),
+        )
+        .unwrap();
+        let live = task_grants::effective_grant(&db, "task_g", Utc::now())
+            .unwrap()
+            .expect("grant still live after one fire");
+        assert_eq!(live.fires_remaining(), Some(1));
+        assert_eq!(live.tokens_remaining(), Some(750));
+
+        // Second fire → fires exhausted → effective_grant reads inert (None),
+        // which is exactly what makes the NEXT spawn's grant.json absent and the
+        // runner's autonomy gate closed.
+        apply_grant_consume(
+            &db,
+            &json!({ "grant_id": "grant_1", "task_id": "task_g", "fires": 1 }),
+        )
+        .unwrap();
+        assert!(
+            task_grants::effective_grant(&db, "task_g", Utc::now())
+                .unwrap()
+                .is_none(),
+            "grant reads inert once max_fires is reached"
+        );
+    }
+
+    #[test]
+    fn grant_consume_defaults_fires_to_one_and_rejects_missing_grant_id() {
+        use copperclaw_db::tables::task_grants::{self, NewTaskGrant};
+        let (db, sess) = central_ag_session();
+        seed_task_for(&db, &sess, "task_g");
+        task_grants::insert_approved(
+            &db,
+            NewTaskGrant {
+                id: "grant_1".into(),
+                task_id: "task_g".into(),
+                capability_scope: "web_fetch".into(),
+                token_budget: None,
+                max_fires: Some(3),
+                expires_at: None,
+                granted_by: None,
+            },
+        )
+        .unwrap();
+
+        // No explicit `fires` → defaults to 1.
+        apply_grant_consume(&db, &json!({ "grant_id": "grant_1" })).unwrap();
+        let live = task_grants::effective_grant(&db, "task_g", Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.fires_remaining(), Some(2));
+
+        // A payload with no grant_id is a hard error (surfaces as a self-mod
+        // failure, not a silent no-op).
+        assert!(apply_grant_consume(&db, &json!({ "task_id": "task_g" })).is_err());
     }
 
     #[test]

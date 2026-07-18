@@ -38,6 +38,42 @@ adheres to [Semantic Versioning](https://semver.org/).
   series fires through the central scheduler with `platform_id` / `channel_type`
   / `thread_id` unset, exactly as agent-scheduled tasks already do — recurring
   self-wakes never carried a user venue in practice.
+### Added (M22 A2H — flip the autonomy grant gate LIVE)
+
+- **grant.json snapshot writer (`crates/copperclaw-host/src/container_manager/tasks_snapshot.rs`)**:
+  the host-side companion A2 was waiting on. `write_grant_snapshot` resolves the
+  firing task from the session's pending `kind:task` inbound
+  (`firing_task_id_from_inbound`, mirroring the runner's `firing_task_id`), reads
+  its live `copperclaw_db::tables::task_grants::effective_grant`, and writes
+  `<session_data_root>/grant.json` in the exact
+  `copperclaw_runner::run::tool_dispatch::TurnGrant` serde shape (new
+  `GrantSnapshotRow`, `GRANT_SNAPSHOT_FILENAME`). It is folded into
+  `write_tasks_snapshot`, so it fires at BOTH the container spawn (via
+  `runner_config_for`) and the manager-tick refresh — the first scheduled fire
+  therefore sees its grant at spawn time. **Secure-by-default:** a `grant.json` is
+  written ONLY when `effective_grant` returns `Some`; no firing task, an inert
+  grant (none / revoked / expired / exhausted), or a DB read error all REMOVE any
+  stale snapshot and write nothing, so `load_turn_grant` returns `None` and the
+  runner's autonomy gate stays CLOSED. **This flips A2's gate from closed to
+  live**: before this writer existed, `grant.json` was always absent and every
+  autonomous credentialed-external action was blocked regardless of a stored,
+  human-approved grant.
+- **`grant_consume` delivery handler (`crates/copperclaw-host-delivery/src/service.rs`)**:
+  new inline System-row arm + `apply_grant_consume`, alongside the existing
+  `task_grant` / `goal` / `condition` handlers. The runner emits a
+  `{"grant_consume": {"grant_id","task_id","fires"}}` row (its
+  `charge_grant_fire_once`) when a granted autonomous action actually fires; the
+  handler debits the central `task_grants` row via
+  `task_grants::consume_fire` (once per `fires`, default 1, clamped non-negative)
+  and `consume_tokens` when the payload carries a `tokens` count. This is what
+  makes `max_fires` / token budgets enforceable ACROSS fires: without it the
+  runner's per-turn + in-snapshot bounds held, but the central grant never
+  depleted, so `effective_grant` (hence the next spawn's grant.json) would never
+  read the grant exhausted. Internal accounting — applied immediately, NOT
+  approval-gated (it can only reduce an existing authorization). Registered in
+  `crates/copperclaw-host/tests/action_handler_coverage.rs` (added to both
+  `runner_emit_set()` and `inline_handler_set()`; `runner_emit_set_matches_source`
+  now also scans `run/tool_dispatch.rs::charge_grant_fire_once`).
 
 ### Added (M22 A4 — revive condition/event check-ins)
 
