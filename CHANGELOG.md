@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 S1 — Wave-3 MARQUEE: skills materialize into the container)
+
+- **Skills are now runnable, not just prose.** `copperclaw_skills::materialize`
+  was complete + tested but **orphaned** (zero call sites), so a skill's
+  `scripts/`/`data/` never crossed the sandbox boundary — only its `SKILL.md`
+  body reached the agent (system prompt / `skills.json`). S1 gives it its first
+  call site: `ContainerManager::materialize_session_skills`
+  (`crates/copperclaw-host/src/container_manager/cold_start.rs`, in a clearly
+  separated "skills-materialize half" beside C2's repo-attach half) runs at cold
+  start from `begin_spawn_attempt` and symlinks each **selected** skill's source
+  dir into `<session_root>/skills/<skill_id>`. `<session_root>` is the
+  container's `/data` bind mount, so a skill's helper is reachable in-container
+  at `/data/skills/<skill_id>/scripts/…`.
+- **Selector + coding-cap parity with the prompt.** The materialized set is
+  resolved through the same `SkillsSelector` (default `All`, else the group's
+  stored selector) and the same `coding_enabled` / `CODING_SKILL_NAMES` cap that
+  `runner_config_for` applies, so materialize never stages a skill the group
+  didn't select. Best-effort + idempotent: a missing skills dir, scan failure,
+  or per-skill link error is logged and swallowed — it never fails the spawn.
+- **Escape guard activated at the call site.** `materialize_session_skills`
+  passes a non-empty `allowed_roots` (`[skills_dir, <groups_dir>/<ag>/skills]`)
+  so the `materialize.rs` guard rejects any skill dir that canonicalizes outside
+  the configured skill roots — defense-in-depth against a per-group override
+  pointing at an arbitrary host path. Security verdict recorded in
+  `docs/plans/m22-security-reviews.md` (S1 — PASS).
+- **Fixture skill (`fixtures/skills/runnable-helper/`)** shipping an executable
+  `scripts/greet.sh`, plus unit/integration tests in `cold_start.rs` proving
+  materialize is invoked with the resolved skill set, the symlink farm lands
+  under `/data/skills`, and the helper is executable through the farm (the
+  container's view). NOTE: a read-only bind mount of the skills source into the
+  container (so the farm's host-path symlinks resolve in-container) lives in
+  `container_manager/spawn.rs`, outside S1's file scope — it is the one
+  remaining wire for full in-container execution and is called out in the S1
+  security review; host-side resolution + executability are tested here.
+
 ### Added (M22 AX — Wave-2 autonomy fixtures: grant wakes + goal progress)
 
 - **Grant-wake replay fixtures (`fixtures/cli/grant-wake-granted`,

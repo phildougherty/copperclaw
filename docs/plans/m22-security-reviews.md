@@ -419,3 +419,73 @@ live, task-matched grant and fails closed on every other path; the consume
 handler can only debit. The autonomy brake now opens exactly per-task, bounded,
 pre-authorized, and revocable — and re-closes automatically on revoke, expiry,
 or budget exhaustion.
+
+## S1 — Wire `materialize` into container spawn (Wave 3, lanes K+H) — MARQUEE
+
+**Scope.** S1 gives `copperclaw_skills::materialize` its first runtime call
+site. At cold start (`container_manager/cold_start.rs`,
+`ContainerManager::materialize_session_skills`, invoked from
+`begin_spawn_attempt` alongside C2's repo-attach detection) the host resolves the
+group's `SkillsSelector` and symlinks each *selected* skill's source directory
+into `<session_root>/skills/<skill_id>`. `<session_root>` is the container's
+`/data` bind mount, so the farm appears in-container at `/data/skills/`. The
+new default-behavior change under review: **a selected skill's `scripts/` /
+`data/` files now reach the sandbox** — previously only its `SKILL.md` body did
+(spliced into the system prompt, or written to `skills.json`).
+
+**Threat model.** (1) A skill dir pointing outside the configured skill roots
+(a malicious/compromised per-group override symlinked at an arbitrary host path)
+being linked into `/data`, exposing host files to the agent. (2) The materialize
+step failing a spawn or letting an attacker widen what reaches the container.
+(3) New, untrusted content executing in the sandbox.
+
+**Mitigations.**
+- **Escape guard (defense-in-depth), activated here.** `materialize_session_skills`
+  passes a *non-empty* `allowed_roots` = `[global_skills_dir, <groups_dir>/<ag>/skills]`.
+  `materialize.rs` canonicalizes each skill's `dir` and rejects
+  (`SkillError::EscapedRoot`, per-skill, spawn continues) any that does not
+  fall under a root. An empty `allowed_roots` (which would *disable* the check)
+  is never passed. This is the exact guard the crate was built for; S1 does not
+  widen it.
+- **No new trust boundary.** The only files that can be linked are skills the
+  registry already discovered under the operator-configured `skills_dir` and the
+  approval-gated per-group override dir (`save_skill`, M19 A4). This is the *same
+  content set* already trusted to shape the agent's behaviour through the system
+  prompt / `skills.json` — S1 introduces **no new external input**. A skill's
+  markdown already directs the agent; its helper script is the same author's
+  code, now executable instead of merely quoted.
+- **Selection parity.** The materialized set is resolved through the same
+  `SkillsSelector` + coding-skills cap (`CODING_SKILL_NAMES`, `coding_enabled`)
+  as the prompt, so materialize never stages a skill the group has not selected
+  (verified by the `honours_explicit_selector` and
+  `excludes_coding_skills_when_coding_disabled` tests). A skill an operator
+  excluded from the prompt does not get its scripts staged either.
+- **Fail-safe, never fail-spawn.** Missing skills dir, scan failure, or a
+  per-skill link error is logged and swallowed; a skill that fails to
+  materialize is simply not runnable that spawn. Idempotent across spawns
+  (re-points stale links, leaves matching ones).
+- **Executable bit is the author's, not new privilege.** The farm is symlinks;
+  a script is executable in-container only if its source file already carried
+  the bit on the host — S1 grants no capability the agent's `shell` (which can
+  already `chmod`/write under `/data`) lacks.
+
+**Residual risk / honest limitation.** The farm is a symlink tree whose targets
+are canonical *host* paths (e.g. the repo/install `skills/` dir). For those
+symlinks to *resolve inside the container*, the skills source must also be
+reachable at that host path within the sandbox (a read-only bind mount of the
+skills root). Adding that mount lives in the container-spec assembly
+(`container_manager/spawn.rs`), which is outside S1's exclusive file scope, so
+it is called out as the one remaining wire for full in-container execution;
+until it lands the farm resolves host-side (proven by the tests) but the
+in-container symlinks dangle. This does **not** weaken any security default —
+a dangling symlink exposes nothing; when the read-only mount is added it exposes
+only the already-trusted, escape-guarded skills tree, read-only.
+
+**Verdict: PASS.** The default change (selected skills' support files reach the
+container) stays inside the existing trust boundary: the content is
+operator/agent-authored and already trusted, the escape guard bounds what can be
+linked and is passed a non-empty root set, selection parity prevents staging
+unselected skills, and every failure path fails safe without failing the spawn.
+No new external input, no privilege the agent's shell lacked, and the only
+outstanding item (the read-only skills-source mount) is additive and itself
+escape-guarded.
