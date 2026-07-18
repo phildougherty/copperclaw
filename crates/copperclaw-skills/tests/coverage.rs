@@ -649,3 +649,179 @@ fn skill_tools_frontmatter_when_present_references_real_tools() {
         );
     }
 }
+
+// =======================================================================
+// M22 SX (Wave 3): skills-crate integration coverage
+//
+// The Wave-3 X-rider. S1/S1M (materialize + read-only skills-source mount)
+// are host-crate seams (`ContainerManager::materialize_session_skills`,
+// `build_spec`) whose end-to-end proof lives host-side; that half is
+// registered in `copperclaw-host/tests/replay.rs`
+// (`sx_runnable_helper_skill_fixture_is_coherent`). The two Wave-3 behaviors
+// that copperclaw-skills OWNS as library seams are exercised here, at the
+// public-API integration layer, against a committed fixture set — distinct
+// from each function's own in-crate unit tests (`registry.rs`, `save.rs`):
+//
+//   - S2 relevance selection: `SkillsSelector::Relevant` narrows the inlined
+//     skill set for an off-topic query (selection size + inline byte cost
+//     drop vs `All`).
+//   - S3 versioning: an author -> list -> reload (scan) round-trip through
+//     `save_group_skill` / `list_group_skills` / `SkillRegistry::scan`, and a
+//     re-save durably bumps the persisted version.
+//
+// Neither is replay-harness-drivable: selector resolution + prompt assembly
+// happen host-side before any container spawn, and the harness never spawns
+// one — so the honest home for the seam is the crate that owns it (mirroring
+// how the CX rider noted the chromium boundary and asserted the layer below).
+// =======================================================================
+
+/// Locate `<repo>/fixtures/skill_selection/` — the four topically-disjoint
+/// fixture skills backing the S2 relevance test. Kept separate from the real
+/// `skills/` root (scanned by the inventory tests above) and from
+/// `fixtures/skills/` (the S1 materialize fixture).
+fn skill_selection_fixture_root() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let root = Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("CARGO_MANIFEST_DIR has two ancestors")
+        .join("fixtures")
+        .join("skill_selection");
+    assert!(
+        root.is_dir(),
+        "expected S2 relevance fixtures at {root:?}; is fixtures/skill_selection/ intact?"
+    );
+    root
+}
+
+/// S2 acceptance (integration): `SkillsSelector::Relevant` returns a strict,
+/// smaller subset of the registry for an off-topic query than
+/// `SkillsSelector::All` does — the prompt-shrink decision (e) promises. We
+/// scan the four-skill fixture set, then compare an on-topic query
+/// (bread-only vocabulary) against the full set: the relevant subset is
+/// non-empty, strictly smaller, a subset of `All`, led by the on-topic skill,
+/// and cheaper to inline (fewer description bytes).
+#[test]
+fn relevant_selector_narrows_inlined_skill_set() {
+    use copperclaw_skills::{SkillRegistry, SkillsSelector};
+    use copperclaw_types::AgentGroupId;
+
+    let reg = SkillRegistry::scan(&skill_selection_fixture_root(), None)
+        .expect("scan skill_selection fixtures");
+    let ag = AgentGroupId::new();
+
+    let all = reg.list_for_group(ag, &SkillsSelector::All);
+    assert_eq!(all.len(), 4, "fixture set should hold exactly four skills");
+
+    // Query uses vocabulary that appears ONLY in `bread-baking`'s description
+    // (the other three descriptions share none of these tokens), so FTS ranks
+    // bread-baking and returns nothing else. `limit` is set above the corpus
+    // size so the narrowing comes from relevance, not the cap.
+    let selector = SkillsSelector::Relevant {
+        query: "sourdough bread dough proofing".to_string(),
+        limit: 10,
+    };
+    let relevant = reg.list_for_group(ag, &selector);
+
+    assert!(
+        !relevant.is_empty(),
+        "an on-topic query must still surface the relevant skill(s), not strip everything",
+    );
+    assert!(
+        relevant.len() < all.len(),
+        "Relevant must inline FEWER skills than All (got {} vs {})",
+        relevant.len(),
+        all.len(),
+    );
+    // Every relevant skill is a member of the full set (a narrowing, not a
+    // rewrite).
+    let all_names: BTreeSet<&str> = all.iter().map(|s| s.name.as_str()).collect();
+    for s in &relevant {
+        assert!(
+            all_names.contains(s.name.as_str()),
+            "relevant skill {:?} is not in the full registry",
+            s.name,
+        );
+    }
+    // The on-topic skill is the top (only) relevant result.
+    assert_eq!(
+        relevant[0].name, "bread-baking",
+        "the bread query must rank the bread skill first",
+    );
+
+    // Prompt-cost proxy: inlining resolves each selected skill's description
+    // (and body) into the system prompt, so a smaller selection is a smaller
+    // prompt. The relevant subset costs strictly fewer description bytes.
+    let desc_bytes = |skills: &[copperclaw_skills::Skill]| -> usize {
+        skills.iter().map(|s| s.description.len()).sum()
+    };
+    assert!(
+        desc_bytes(&relevant) < desc_bytes(&all),
+        "narrowing to relevant skills must shrink the inlined description bytes",
+    );
+}
+
+/// S3 acceptance (integration): the author -> list -> reload round-trip
+/// through the public save/list/scan API, and a re-save durably bumps the
+/// version. Ties the three S3 seams together (distinct from each one's own
+/// unit test in `save.rs`): a saved skill is (a) listed with version 1, (b)
+/// re-discovered by the registry scan that a container spawn runs, and (c)
+/// version-bumped in the listing on a re-save.
+#[test]
+fn author_list_reload_roundtrip_bumps_version_on_resave() {
+    use copperclaw_skills::{SkillRegistry, list_group_skills, save_group_skill};
+    use copperclaw_types::AgentGroupId;
+    use tempfile::TempDir;
+
+    const GREET_V1: &str =
+        "---\nname: greet\ndescription: Greet a user warmly by name\n---\n# greet\nSay hello.\n";
+
+    let td = TempDir::new().expect("tempdir");
+    let group_skills = td.path().join("groups").join("ag").join("skills");
+
+    // (a) Author.
+    let dir = save_group_skill(&group_skills, &[], "greet", GREET_V1).expect("author greet");
+    assert!(dir.join("SKILL.md").is_file());
+
+    // (b) List — the freshly-authored skill reports version 1.
+    let listed = list_group_skills(&group_skills).expect("list after author");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "greet");
+    assert_eq!(listed[0].version, 1, "first save defaults to version 1");
+    assert_eq!(listed[0].description, "Greet a user warmly by name");
+
+    // (c) Reload — the registry scan a container spawn performs re-discovers
+    // the saved skill (the whole point of writing where discovery scans).
+    let ag = AgentGroupId::new();
+    let reg = SkillRegistry::scan(&group_skills, Some((ag, &group_skills)))
+        .expect("scan discovers saved skill");
+    let reloaded = reg.get("greet").expect("saved skill is discovered by scan");
+    assert_eq!(reloaded.description, "Greet a user warmly by name");
+
+    // (d) Re-save — the persisted version bumps, and the bump is visible both
+    // in the listing and in a fresh reload of the frontmatter.
+    save_group_skill(&group_skills, &[], "greet", GREET_V1).expect("re-save greet");
+    let relisted = list_group_skills(&group_skills).expect("list after re-save");
+    assert_eq!(relisted.len(), 1, "re-save updates in place, no duplicate");
+    assert_eq!(
+        relisted[0].version, 2,
+        "re-saving a skill durably bumps its version",
+    );
+    let persisted = fs::read_to_string(dir.join("SKILL.md")).expect("read persisted SKILL.md");
+    let fm = read_frontmatter_str(&persisted);
+    assert_eq!(fm.version(), 2, "the on-disk frontmatter carries the bump");
+}
+
+/// Parse frontmatter from an in-memory `SKILL.md` string (the round-trip test
+/// reads a just-written file). Mirrors `read_frontmatter`'s YAML slice but
+/// takes content rather than a directory.
+fn read_frontmatter_str(raw: &str) -> Frontmatter {
+    let yaml = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+        .expect("opening `---` delimiter");
+    let end = yaml
+        .find("\n---")
+        .expect("closing `---` delimiter on its own line");
+    serde_yaml::from_str::<Frontmatter>(&yaml[..end]).expect("valid frontmatter YAML")
+}

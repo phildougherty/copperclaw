@@ -4284,3 +4284,73 @@ fn visual_regression_fixtures_are_coherent() {
         "baseline_rgb.png must exercise the RGB (no-alpha) path"
     );
 }
+
+// ---- M22 SX (Wave 3): S1/S1M runnable-skill fixture coherence ----
+//
+// S1 (`materialize`) + S1M (read-only skills-source mount) are what make a
+// skill's helper script actually RUN inside the container, not just instruct:
+// `ContainerManager::materialize_session_skills` builds a symlink farm at
+// `<session>/skills/<id> -> <canonical skill dir>` (the container's
+// `/data/skills/<id>`), and `build_spec` binds the canonical skills root
+// read-only at its own host path so those farm links resolve in-container.
+// Both halves are unit-tested IN-CRATE against this exact committed fixture:
+//   - `container_manager::cold_start::tests::materialize_makes_fixture_helper_executable`
+//     (farm link resolves + `scripts/greet.sh` executable through it), and
+//   - `container_manager::spawn::tests::build_spec_mounts_skills_source_read_only_when_configured`
+//     (the read-only source mount at source == target).
+//
+// The full materialize -> mount -> exec path cannot be driven end-to-end
+// through the replay harness: those seams are `pub(super)` (host-crate
+// internal) and the harness never spawns a real container or execs a script
+// (docs/replay-fixtures.md, "What the suite does not cover" — container build
+// correctness). So the replay-layer contribution — exactly like the CX
+// visual-regression fixture guard above — is a COHERENCE GUARD over the
+// committed `fixtures/skills/runnable-helper/` those in-crate tests depend on:
+// it pins the fixture properties (frontmatter `name == dir`, a substantive
+// description for S2 relevance, and an EXECUTABLE `scripts/greet.sh`) so a
+// fixture that drifts, is renamed, loses its script, or gets its exec bit
+// stripped breaks a registered test here first.
+
+/// The S1 materialize fixture is coherent: a valid skill whose helper script
+/// is present and executable — the exact shape the in-crate materialize/mount
+/// tests rely on.
+#[test]
+fn sx_runnable_helper_skill_fixture_is_coherent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let skill_dir = workspace_root().join("fixtures/skills/runnable-helper");
+    assert!(
+        skill_dir.is_dir(),
+        "S1 fixture skill dir missing at {}",
+        skill_dir.display(),
+    );
+
+    // Frontmatter parses and satisfies the `name == dir` invariant discovery
+    // enforces (so `SkillRegistry::scan` accepts it when a container spawn
+    // scans this dir as a skills root).
+    let raw = std::fs::read_to_string(skill_dir.join("SKILL.md")).expect("read SKILL.md");
+    let fm = copperclaw_skills::frontmatter::parse(&raw).expect("valid frontmatter");
+    assert_eq!(
+        fm.name, "runnable-helper",
+        "frontmatter name must equal the directory slug",
+    );
+    // A substantive description keeps the fixture usable as an S2 relevance
+    // input and mirrors the coverage-crate `MIN_DESC_CHARS` floor.
+    assert!(
+        fm.description.trim().chars().count() >= 30,
+        "fixture description must be substantive (feeds S2 relevance scoring)",
+    );
+
+    // The helper script exists, is a regular file, and is EXECUTABLE — the
+    // single property `materialize_makes_fixture_helper_executable` asserts
+    // through the farm. If a checkout or an edit drops the exec bit, the S1
+    // integration test would fail; this guard names why.
+    let script = skill_dir.join("scripts/greet.sh");
+    let meta = std::fs::metadata(&script)
+        .unwrap_or_else(|e| panic!("fixture helper {} missing: {e}", script.display()));
+    assert!(meta.is_file(), "greet.sh must be a regular file");
+    assert!(
+        meta.permissions().mode() & 0o111 != 0,
+        "greet.sh must be committed executable, or the materialized farm helper won't run",
+    );
+}
