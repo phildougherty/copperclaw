@@ -829,6 +829,54 @@ pub mod update {
                     } else {
                         copperclaw_metrics::inc_review_gate_completion("passed");
                     }
+                    // M22 C6: see→fix (screenshot) gate — the final/delivery
+                    // todo of a UI task can't complete until a fresh
+                    // `ui_screenshot` has been taken since its last UI edit.
+                    // Runs only if the verify + review gates above left this
+                    // todo still heading for `Completed` (no point gating a
+                    // todo already diverted to `blocked`). Mirrors the review
+                    // gate's refuse-up-to-cap-then-block shape, and shares the
+                    // verify gate's `verify_gate_enabled()` off-switch — one
+                    // switch for the whole gate family, per decision (d).
+                    if matches!(effective_status, Some(TodoStatus::Completed)) {
+                        let needing_shot =
+                            crate::tools::self_review::scan_projects_needing_screenshot().await;
+                        if let Some(project_root) = needing_shot.first() {
+                            let cycles =
+                                crate::tools::self_review::screenshot_cycles(project_root).await;
+                            if cycles < crate::tools::self_review::SEE_FIX_CYCLE_CAP {
+                                let new_cycles =
+                                    crate::tools::self_review::record_screenshot_refusal(
+                                        project_root,
+                                    )
+                                    .await;
+                                let remaining = crate::tools::self_review::SEE_FIX_CYCLE_CAP
+                                    .saturating_sub(new_cycles);
+                                let display = project_root.display();
+                                return Err(ToolError::Validation(format!(
+                                    "cannot mark todo {} completed: it is the final/delivery todo, \
+                                     and `{display}` is a UI task with changes since its last \
+                                     `ui_screenshot`. Take a fresh `ui_screenshot` of the running \
+                                     app and eyeball it against the `frontend-design` critique \
+                                     checklist (`load_skill(\"frontend-design\")`) before signing \
+                                     off — that's the see→fix loop. ({remaining} screenshot \
+                                     cycle(s) remaining before this todo auto-blocks instead).",
+                                    input.id,
+                                )));
+                            }
+                            // See→fix cap already burned and still pending a
+                            // post-fix screenshot: auto-transition to
+                            // `blocked`, mirroring the verify + review gates'
+                            // own cap-exhaustion behaviour above.
+                            effective_status = Some(TodoStatus::Blocked);
+                            blocked_reason = Some(format!(
+                                "see→fix loop never completed for `{}` after {} cycle(s): no \
+                                 post-fix screenshot",
+                                project_root.display(),
+                                crate::tools::self_review::SEE_FIX_CYCLE_CAP
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2224,6 +2272,203 @@ mod tests {
                 .unwrap(),
         );
         let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    // ── M22 C6: see→fix (screenshot) gate ────────────────────────────────
+
+    /// Make `proj` a UI task under the gate's data root: seed one
+    /// `ui_screenshot`-style capture (the "this is a UI task" signal). A
+    /// plain (non-git) directory keeps the verify + review gates passing so
+    /// tests exercise the see→fix gate in isolation.
+    fn make_ui_task_project(proj: &std::path::Path) {
+        let shots = proj.join(".copperclaw").join("screenshots");
+        std::fs::create_dir_all(&shots).unwrap();
+        std::fs::write(shots.join("shot-1.png"), b"png-bytes").unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_todo_on_ui_task_with_pending_screenshot_refuses() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        make_ui_task_project(&proj);
+        // A UI edit re-opened the see→fix loop.
+        crate::tools::self_review::mark_needs_screenshot(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship the ui"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(msg.contains("ui_screenshot"), "got: {msg}");
+                assert!(msg.contains("final/delivery todo"), "got: {msg}");
+                assert!(msg.contains("1 screenshot cycle"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The todo itself must NOT have been mutated to completed.
+        let listed = body_json(&list::handle(obj(json!({})), &ctx).await.unwrap());
+        assert_eq!(listed[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn completion_succeeds_after_post_fix_screenshot_clears_marker() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        make_ui_task_project(&proj);
+        crate::tools::self_review::mark_needs_screenshot(&proj).await;
+        // A fresh ui_screenshot satisfied the loop (the dispatch hook does
+        // this in production; here we drive the clear directly).
+        crate::tools::self_review::clear_needs_screenshot(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn see_fix_cap_stops_the_third_cycle_with_blocked() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        make_ui_task_project(&proj);
+        crate::tools::self_review::mark_needs_screenshot(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        // Never take the post-fix screenshot: two refusals burn the budget
+        // (0 -> 1 -> 2); the third attempt auto-blocks instead of refusing
+        // forever.
+        for _ in 0..crate::tools::self_review::SEE_FIX_CYCLE_CAP {
+            let err = update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ToolError::Validation(_)));
+        }
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "blocked");
+        assert!(
+            updated["blocked_reason"]
+                .as_str()
+                .unwrap()
+                .contains("see→fix"),
+            "got: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_ui_task_is_never_see_fix_gated() {
+        // Fail-open guard: a project that never screenshotted is not a UI
+        // task, so even a stray `needs_screenshot` marker never gates it.
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("needs_screenshot"), b"").unwrap();
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn see_fix_gate_off_when_verify_gate_disabled() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        make_ui_task_project(&proj);
+        crate::tools::self_review::mark_needs_screenshot(&proj).await;
+
+        let ctx = MockToolContext::new();
+        ctx.set_verify_gate_enabled(false);
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        // Would normally refuse — the shared off-switch skips see→fix too
+        // (one switch for the whole gate family, per decision (d)).
         let updated = body_json(
             &update::handle(
                 obj(json!({
