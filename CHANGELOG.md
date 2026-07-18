@@ -68,6 +68,36 @@ adheres to [Semantic Versioning](https://semver.org/).
   modules guard), and maps only an allowlist of `package.json` script names to
   fixed stage commands so a hostile manifest can't inject a verify line.
 
+### Added (M22 C4 — screenshot-diff visual regression)
+
+- **Screenshot-diff visual regression** in
+  `crates/copperclaw-mcp/src/tools/ui_screenshot.rs`: every `ui_screenshot`
+  capture is now diffed against the previous screenshot of the same view (keyed
+  by `url` + viewport + `full_page`), so editing an existing UI that silently
+  shifts or breaks its layout is caught and fed back to the model in the same
+  turn — the visual counterpart to C1's post-edit diagnostics. The first
+  capture of a view establishes a PNG **baseline** under the project's
+  `.copperclaw/baselines/`; the next capture computes a perceptual **block
+  diff** and, when a region changed (or the viewport dimensions changed),
+  appends a concise regression note to the tool result (changed-region count,
+  % of the view, mean/peak pixel delta, and a bounding box of the change);
+  each capture then becomes the new baseline. Clean re-captures stay silent —
+  no token spam. Default ON; opt out per session with
+  `COPPERCLAW_UI_SCREENSHOT_DIFF=0`. Loopback-only, reuses the existing
+  screenshot path — no new capability, no security review.
+- Because chromium emits PNG and the workspace carries no image-decoding crate,
+  the diff ships a small, self-contained, `unsafe`-free **PNG decoder** (zlib
+  inflate + per-scanline unfilter, the non-interlaced 8-bit grayscale/GA/RGB/
+  RGBA subset chromium and the fixtures use) plus the threshold-based block
+  comparison — no new dependency. The whole path is best-effort: any
+  decode/IO hiccup skips the diff silently and never turns a good screenshot
+  into an error (a jpeg-downgraded capture re-baselines but is not diffed).
+- Fixtures under `fixtures/visual_regression/`: `decoder_probe.png` (a 4x4
+  known-pixel RGBA oracle for the decoder), `baseline.png` /
+  `baseline_reencoded.png` (identical pixels, different encoding → must diff to
+  zero regions), `regressed.png` (a moved card → a localized flagged region),
+  and `baseline_rgb.png` (color type 2, exercises the no-alpha decode path).
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the
