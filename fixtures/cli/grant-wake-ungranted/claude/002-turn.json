@@ -1,0 +1,10 @@
+{
+  "_note": "Ungranted-propose, round 2: off the block reason, the model proposes the action to a human instead of silently giving up. A plain end-of-turn chat reply (not a credentialed-external action) is always admitted on an autonomous turn — read-then-propose — so it delivers to the user.",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_grant_ung_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I can't send that on a scheduled run without approval. Approve it (or pre-authorize this task with a bounded grant) and I'll do it."}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

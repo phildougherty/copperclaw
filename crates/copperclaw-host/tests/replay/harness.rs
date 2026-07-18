@@ -43,6 +43,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use copperclaw_channels_core::{
     AdapterError, Card, ChannelAdapter, DmHandle, testing::MockAdapter,
 };
@@ -688,7 +689,7 @@ impl ReplayHarness {
     /// tempdir. `open_inbound` runs the schema migrations on first
     /// touch, so DDL referenced by the SQL (e.g. `messages_in`)
     /// always exists by the time the seed runs.
-    fn apply_inbound_sql(&mut self) -> Result<()> {
+    pub fn apply_inbound_sql(&mut self) -> Result<()> {
         use copperclaw_db::session::open_inbound;
         let sessions_active = sessions::list_active(&self.central)
             .context("list_active sessions for inbound.sql seed")?;
@@ -722,6 +723,57 @@ impl ReplayHarness {
             self.deliver_session(session.agent_group_id, sid).await?;
         }
         Ok(())
+    }
+
+    /// M22 AX (goal-progress fixture): run ONE goal / scheduling sweep pass at
+    /// a caller-controlled instant, then run + deliver a turn for every session
+    /// a goal check-in fired into this pass. Additive companion to
+    /// [`Self::trigger_sweep_pass`] (which runs on the wall clock and only
+    /// picks up pre-seeded due inbound): the M22-A3 goal check-in fan-out
+    /// re-arms `next_checkin` from a croner expression, so proving progress
+    /// across ≥2 wakes needs the sweep driven at successive controlled instants
+    /// that cross the re-armed boundary. Uses the sweep's own `MockClock` seam
+    /// (`SweepService::with_clock`) for that croner timing — `run_once` reads
+    /// `self.clock.now()`, which the A3 goal check reads through.
+    ///
+    /// A goal wake fires into a session `run_one_turn` may have left `running`,
+    /// so this drives turns off `report.goal_checkins_fired` (each resolved to
+    /// the goal's session) rather than `woken_sessions`, which the per-pass
+    /// wake check skips for an already-running session.
+    pub async fn run_goal_sweep_at(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<copperclaw_host_sweep::service::SweepReport> {
+        let sweep_root: Arc<dyn SweepSessionRoot> =
+            Arc::new(SweepRoot::new(self.tempdir.path().to_path_buf()));
+        let clock: Arc<dyn copperclaw_host_sweep::Clock> =
+            Arc::new(copperclaw_host_sweep::clock::MockClock::new(now));
+        let sweep = SweepService::with_clock(self.central.clone(), sweep_root, clock);
+        let report = sweep.run_once().context("goal sweep.run_once")?;
+        let mut driven: HashSet<SessionId> = HashSet::new();
+        for fan in &report.goal_checkins_fired {
+            let Some(goal) = copperclaw_db::tables::goals::get(&self.central, &fan.series_id)
+                .context("resolve goal for check-in fan-out")?
+            else {
+                continue;
+            };
+            if !driven.insert(goal.session_id) {
+                continue;
+            }
+            if !self
+                .touched_sessions
+                .iter()
+                .any(|(_, s)| *s == goal.session_id)
+            {
+                self.touched_sessions
+                    .push((goal.agent_group_id, goal.session_id));
+            }
+            self.run_one_turn(goal.agent_group_id, goal.session_id)
+                .await?;
+            self.deliver_session(goal.agent_group_id, goal.session_id)
+                .await?;
+        }
+        Ok(report)
     }
 
     async fn run_budget_gate(&self, ag: AgentGroupId) -> Result<()> {
@@ -786,6 +838,22 @@ impl ReplayHarness {
     async fn run_one_turn(&self, ag: AgentGroupId, sess: SessionId) -> Result<()> {
         let paths = SessionPaths::new(self.tempdir.path(), ag, sess);
         paths.ensure_dirs().context("ensure session dirs")?;
+        // M22 AX: mirror the container manager's spawn-time snapshot write
+        // (`container_manager::runner_config_for` → `write_tasks_snapshot`) so
+        // the runner's M22 A2 autonomy gate reads the SAME host-produced
+        // `<data_root>/grant.json` production writes at spawn. A2H folded the
+        // grant writer into `write_tasks_snapshot`: it renders `grant.json`
+        // ONLY when the firing `kind:task` inbound's task carries a live,
+        // approved `task_grants` row (otherwise it removes any stale file), so
+        // this is byte-neutral for every fixture without a seeded grant — the
+        // autonomy brake stays closed exactly as before. Runs BEFORE the rw
+        // inbound handle below opens so the snapshot's read-only inbound probe
+        // never contends with it.
+        copperclaw_host::container_manager::tasks_snapshot::write_tasks_snapshot(
+            &self.central,
+            sess,
+            &paths.root,
+        );
         let inbound = open_inbound_rw_no_mmap(&paths).context("open inbound (rw)")?;
         let outbound = open_outbound(&paths).context("open outbound (rw)")?;
         let inbound = Arc::new(Mutex::new(inbound));
@@ -1143,7 +1211,7 @@ impl ReplayHarness {
         Ok(report)
     }
 
-    fn snapshot_messages_in(&self) -> Result<Vec<serde_json::Value>> {
+    pub fn snapshot_messages_in(&self) -> Result<Vec<serde_json::Value>> {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut seen: HashSet<SessionId> = HashSet::new();
         for (ag, sess) in &self.touched_sessions {
@@ -1157,7 +1225,7 @@ impl ReplayHarness {
         Ok(rows)
     }
 
-    fn snapshot_messages_out(&self) -> Result<Vec<serde_json::Value>> {
+    pub fn snapshot_messages_out(&self) -> Result<Vec<serde_json::Value>> {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut seen: HashSet<SessionId> = HashSet::new();
         for (ag, sess) in &self.touched_sessions {

@@ -1,9 +1,10 @@
 {
   "name": "cli-grant-wake-granted",
   "channel": "cli",
-  "description": "M22 A2 scaffold. A scheduled task fires an autonomous turn whose firing task carries a live capability grant; the agent takes the pre-authorized credentialed-external action and one fire is charged (grant_consume). Registration + task-fire/grant plumbing finished by the AX X-rider — see README.md.",
+  "description": "M22 A2 (marquee). A scheduled task fires an autonomous turn whose firing task carries a live, human-approved capability grant; the runner's autonomy gate OPENS for the granted action (web_fetch), dispatches it, and charges exactly one fire (a grant_consume System row the delivery loop applies back to central). Driven end-to-end via the M21 sweep test-clock seam + the A2H grant.json writer folded into write_tasks_snapshot.",
   "schema": 1,
-  "scaffold": true,
+  "trigger_sweep": true,
+  "max_tool_turns": 5,
   "replay": {
     "mode": "direct",
     "step_timeout_ms": 5000

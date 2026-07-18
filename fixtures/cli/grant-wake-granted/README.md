@@ -1,54 +1,61 @@
-# fixtures/cli/grant-wake-granted (M22 A2 scaffold)
+# fixtures/cli/grant-wake-granted (M22 A2 — granted-act)
 
 **Granted-act** wake transcript: a scheduled task fires an *autonomous* turn,
-its firing task carries a live, human-approved capability grant, and the agent
+its firing task carries a live, human-approved capability grant, and the runner
 **takes the pre-authorized credentialed-external action** instead of only
 drafting it — the A2 marquee ("the agent does the thing it was told it could
-do").
+do"). Driven end-to-end by the AX X-rider.
 
 ## What it exercises
 
-- A `kind: task` wake inbound (no human Chat row) → the runner classifies the
-  turn autonomous (`run/mod.rs`).
-- The firing task's grant snapshot (`grant.json`, below) permits the action
-  the turn takes (`web_fetch`; the same shape applies to an external-messaging
-  MCP tool with a `mcp:<server>` grant — the "send the granted message"
-  framing).
-- `run/tool_dispatch.rs::invoke_tool` consults the grant, opens the autonomy
-  gate **for that action only**, dispatches it, and charges **one fire**
-  (`grant_consume` System row to `outbound.db`).
+- A `kind: task` wake row (`inbound.sql`, no human Chat row) → the runner
+  classifies the turn autonomous (`run/mod.rs`).
+- The firing task (`t-standup`) carries an **approved `task_grants` row**
+  (`central.sql`) whose scope permits the action the turn takes (`web_fetch`).
+- The **A2H `grant.json` writer**, folded into
+  `container_manager::tasks_snapshot::write_tasks_snapshot`, renders the live
+  effective grant to `<session>/grant.json` at spawn time. The AX harness calls
+  that same production writer before the turn (`run_one_turn`), so the runner
+  reads a **real** grant snapshot — not a hand-copied file.
+- `run/mod.rs::load_turn_grant` loads it, and `run/tool_dispatch.rs::invoke_tool`
+  consults it: the autonomy gate **opens for that action only**, admits the
+  call (not the `autonomous (heartbeat/scheduled) turn` deny), and charges
+  **one fire** (`grant_consume` System row → `outbound.db`), which the delivery
+  loop applies back to central via `task_grants::consume_fire`.
 
 ## Files
 
-- `grant.json` — the host-written effective-grant snapshot the runner reads at
-  turn start (`<data_root>/grant.json`). Shape = `run::TurnGrant`
-  (`grant_id`, `task_id`, `capability_scope`, `tokens_remaining`,
-  `fires_remaining`, `expires_at`). Matches the `task_grants` row the companion
-  host writer would produce (see below).
-- `inbound/001-wake.json` — the scheduled-fire wake row (`kind: task`,
-  `content.task_id = t-standup`).
-- `claude/001-turn.json` — the model script: take the granted action, then
-  report success.
-- `manifest.json` — scenario metadata.
+- `central.sql` — agent group + cli wiring, an idle session, the `t-standup`
+  `tasks` row, and the **approved** `task_grants` row (`grant-standup-001`,
+  scope `web_fetch`).
+- `inbound.sql` — the pending `kind:task` wake row (`content.task_id =
+  t-standup`, `series_id = t-standup`) + `session_routing` for the reply.
+- `claude/001-turn.json` — round 1: the granted `web_fetch` action.
+- `claude/002-turn.json` — round 2: the end-of-turn report.
+- `grant.json` — reference copy of the effective-grant snapshot the A2H writer
+  must reproduce from the `task_grants` row (shape = `run::TurnGrant`). It is
+  documentation only — the *live* `grant.json` the runner reads is produced by
+  the writer into the session data root at turn time.
+- `manifest.json` — `trigger_sweep: true`; scenario metadata.
 
-## What the AX X-rider must finish
+## The `web_fetch` / SSRF boundary (honest note)
 
-1. **Register** this fixture in `crates/copperclaw-host/tests/replay.rs` (a
-   `#[tokio::test]` calling `run_fixture("cli", "grant-wake-granted")`).
-2. **Task-fire injection**: a scheduled fire is synthesized by the sweep
-   directly into `messages_in` (it bypasses the router), so the harness must
-   seed the `tasks` row + fire it (reuse the M21 runner test-clock seam for
-   croner timing) rather than route `inbound/001-wake.json` as a channel event.
-3. **Grant plumbing**: copy `grant.json` into the session data root before the
-   turn runs (this stands in for the companion host writer described in
-   `docs/plans/m22-security-reviews.md` §A2 — the writer that snapshots
-   `task_grants::effective_grant` to `<session>/grant.json` at fire/spawn time
-   and applies the runner's `grant_consume` rows back to central).
-4. Capture `expected/` (messages-out etc.).
+The granted action is `web_fetch` to a **loopback** URL (`http://127.0.0.1/…`).
+The autonomy gate is the thing under test, and it fully opens: the call is
+admitted by every policy layer and **one fire is charged BEFORE dispatch**
+(`charge_grant_fire_once` runs after the policy allow, before the tool body).
+The `web_fetch` tool's own SSRF net-guard then rejects the loopback target —
+that guard is orthogonal to the autonomy gate and keeps the replay offline and
+instant. The deterministic proof of "the gate opened and the action fired" is
+therefore the emitted+applied `grant_consume`, not the fetch response body.
 
-## Expected outcome (assertion targets for AX)
+## Assertions (in `tests/replay.rs`)
 
-- The granted `web_fetch` (or `mcp__<server>__*`) action **runs** — no
-  `autonomous (heartbeat/scheduled) turn` deny.
-- Exactly **one** `grant_consume` System row is emitted to `outbound.db`
-  (`content.grant_consume.fires == 1`).
+- Exactly **one** `grant_consume` System row in `outbound.db`
+  (`content.grant_consume.grant_id == grant-standup-001`, `.fires == 1`).
+- The central `task_grants` row's `fires_consumed` is **1** after delivery
+  applied the consume (proves the runner→delivery→central writeback closed).
+- **No** outbound row carries the `autonomous (heartbeat/scheduled) turn` deny
+  (the gate opened rather than blocking).
+- The scheduled wake inbound is marked `completed` and the round-2 report is
+  delivered through the cli adapter (the turn is not a silent no-op).

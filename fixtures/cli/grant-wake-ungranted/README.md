@@ -1,41 +1,40 @@
-# fixtures/cli/grant-wake-ungranted (M22 A2 scaffold)
+# fixtures/cli/grant-wake-ungranted (M22 A2 — ungranted-propose)
 
 **Ungranted-propose** wake transcript: a scheduled task fires an *autonomous*
 turn with **no matching grant**, so a credentialed-external action stays
-**blocked** and the agent falls back to read-then-propose — the safe default
-half of the A2 gate.
+**blocked** and the agent falls back to read-then-propose — the safe-default
+half of the A2 gate. Driven end-to-end by the AX X-rider.
 
 ## What it exercises
 
-- A `kind: task` wake inbound (no human Chat row) → autonomous turn.
-- **No `grant.json`** present (the firing task has no live grant), so
-  `run/tool_dispatch.rs::invoke_tool` leaves the autonomy block in place: the
-  credentialed-external action is denied with the
-  `autonomous (heartbeat/scheduled) turn` reason, and the F2 blocker surfaces
-  the "Blocked: this needs a person / pre-authorize it" wall card.
+- A `kind: task` wake row (`inbound.sql`, no human Chat row) → autonomous turn.
+- **No `task_grants` row** for the firing task (`t-report`), so
+  `effective_grant` reads `None`, `write_tasks_snapshot` (the A2H writer)
+  produces **no `grant.json`**, and `load_turn_grant` returns `None`.
+- `run/tool_dispatch.rs::invoke_tool` leaves the autonomy block in place:
+  `autonomy_verdict` is `NotGated`, so `policy.rs` layer 4 denies the
+  credentialed-external action with the stable
+  `autonomous (heartbeat/scheduled) turn` reason — **before** dispatch, so no
+  fire is charged.
 - **No** `grant_consume` row is emitted (a blocked action is never charged).
-- The agent can still `send_message` to propose the action for a human to
-  approve.
+- The agent still emits a plain chat reply to **propose** the action for a human
+  to approve — the turn is not a silent no-op.
 
 ## Files
 
-- `inbound/001-wake.json` — the scheduled-fire wake row (`kind: task`).
-- `claude/001-turn.json` — the model script: attempt the action (blocked),
-  then propose it to the user.
-- `manifest.json` — scenario metadata.
+- `central.sql` — agent group + cli wiring + an idle session. Deliberately **no**
+  `task_grants` row (and no `tasks` row is needed — its whole point is the
+  absence of a grant).
+- `inbound.sql` — the pending `kind:task` wake row (`content.task_id =
+  t-report`) + `session_routing` for the proposal reply.
+- `claude/001-turn.json` — round 1: attempt the action (blocked).
+- `claude/002-turn.json` — round 2: propose it to the user.
 - (Deliberately **no** `grant.json`.)
 
-## What the AX X-rider must finish
+## Assertions (in `tests/replay.rs`)
 
-Same as `grant-wake-granted/README.md` steps 1, 2, 4 (register in
-`replay.rs`; seed + fire the task via the M21 test-clock seam; capture
-`expected/`). This scenario needs **no** grant plumbing — its whole point is
-the absence of a grant.
-
-## Expected outcome (assertion targets for AX)
-
-- The credentialed-external action is **blocked** (`is_error`, reason contains
-  `autonomous (heartbeat/scheduled) turn`).
-- **Zero** `grant_consume` rows in `outbound.db`.
-- A proposal `send_message` (and/or the Autonomous blocker wall card) reaches
-  the user — the turn is not a silent no-op.
+- **Zero** `grant_consume` rows in `outbound.db` (nothing was charged).
+- **Zero** `task_grants` rows in central (the fixture seeds none) — the gate had
+  nothing to open against.
+- The round-2 proposal reply is delivered through the cli adapter and the wake
+  inbound is marked `completed` (blocked ≠ silent no-op).
