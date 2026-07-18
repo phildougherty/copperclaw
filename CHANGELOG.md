@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 S3 — skill versioning + `list_skills`)
+
+- **Skill frontmatter `version`** — `crates/copperclaw-skills/src/frontmatter.rs`
+  gains an optional integer `version` field (`#[serde(default)]`) plus a
+  `Frontmatter::version()` accessor. The field is absent in all 41 shipped
+  skills, so they keep parsing unchanged and default to version 1. Why: skills
+  had no revision marker, so a re-saved agent-authored skill silently
+  overwrote its predecessor with no way to tell them apart. (Kept localized so
+  card S4's `tools:` frontmatter addition rebases cleanly on top.)
+- **Version-aware `save_skill`** — `crates/copperclaw-skills/src/save.rs`
+  `save_group_skill` now writes a monotonic version into the persisted
+  frontmatter: a first save keeps the declared version (or 1), and a re-save of
+  an existing skill reads the on-disk version and writes `on_disk + 1`, so
+  re-saving durably bumps rather than blindly overwriting. The on-disk skill is
+  the source of truth (a new `set_frontmatter_version` helper rewrites the
+  `version:` line, preserving BOM/CRLF and the body verbatim). The approval
+  round-trip is unchanged — `save_group_skill` still returns `PathBuf`, so the
+  host `apply_save_skill` caller is untouched. The `save_skill` MCP tool
+  (`crates/copperclaw-mcp/src/tools/save_skill.rs`) now documents the
+  auto-bump behaviour in its description and success message.
+- **`list_group_skills` (crate) + `SkillListing`** — a host-side list surface
+  in `save.rs` that scans a group's skills override directory and returns each
+  saved skill's name + effective version + description (sorted, malformed
+  entries skipped). Exported from `copperclaw-skills`.
+- **`list_skills` MCP tool** — new read-only, no-argument tool
+  (`crates/copperclaw-mcp/src/tools/list_skills.rs`, registered in
+  `tools/mod.rs`) enumerating the session's selected skills (name, version,
+  description) from the per-session skills catalogue `load_skill` reads; in
+  inline-skills mode it returns an empty list with an explanatory note instead
+  of an error. Classified read-only in `crates/copperclaw-runner/src/policy.rs`
+  (`READONLY_TOOLS`), so it is available under the messaging profile and to
+  guest senders. Why: agents could author and load skills but never enumerate
+  them, so re-saving meant guessing at existing names.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the

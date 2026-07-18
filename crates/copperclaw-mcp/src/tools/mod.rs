@@ -40,6 +40,7 @@ pub mod git_status;
 pub mod glob;
 pub mod grep;
 pub mod interactive;
+pub mod list_skills;
 pub mod load_skill;
 pub mod memory;
 pub mod multi_edit;
@@ -145,6 +146,10 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         web_search::entry(),
         explore::entry(),
         load_skill::entry(),
+        // M22 S3: read-only enumeration of the session's selected skills
+        // (name + version + description), the list companion to load_skill /
+        // save_skill. Rides the READONLY_TOOLS policy tier.
+        list_skills::entry(),
         memory::memory_search::entry(),
         memory::memory_get::entry(),
         memory::memory_save::entry(),
@@ -273,6 +278,7 @@ mod tests {
             "web_search",
             "explore",
             "load_skill",
+            "list_skills",
             "memory_search",
             "memory_get",
             "memory_save",
