@@ -26,6 +26,47 @@ adheres to [Semantic Versioning](https://semver.org/).
   `fixtures/diagnostics/post-edit-digest/`. Security review recorded in
   `docs/plans/m22-security-reviews.md` (C1): no trust-boundary expansion —
   runs already-available toolchain commands inside the existing sandbox.
+### Added (M22 C2 — open/attach an existing repository, Wave 1 marquee)
+
+- New `crates/copperclaw-runner/src/run/project.rs`: a first-class flow to
+  establish an *existing* repository as the working project, closing the
+  "coding is build-from-scratch only" ceiling. Given a repo path already in the
+  sandbox (the agent `git clone`s it with `shell` — decision (a), no
+  `git_clone`/`git_commit` tool), the flow **infers `.copperclaw/verify`
+  stages** from the repo's own toolchain manifests (`Cargo.toml` →
+  `cargo fmt --check`/`check`/`clippy`/`test`; `package.json` scripts →
+  `npm run lint`/`typecheck`/`test`/`build`; `Makefile` → `make check`/`test`;
+  `pyproject.toml` → `ruff`/`mypy`/`pytest`), writing them in the **exact**
+  format the M20 multi-stage verify gate parses (round-trip asserted against
+  `copperclaw_mcp::tools::verify_gate::recorded_stages`); **seeds
+  `.copperclaw/DECISIONS.md`** from the repo's README + top-level structure
+  (verbatim, byte-capped, no hallucination); triggers the C3 symbol-index seam;
+  and drops a `.copperclaw/attached` marker so the verify + self-review gates
+  apply to the existing code. The marker also makes attach idempotent, and it
+  never overwrites an agent-authored `.copperclaw/verify`.
+- `crates/copperclaw-runner/src/run/mod.rs`: the runner poll loop now
+  auto-attaches. It calls `project::auto_attach_pending()` at startup (handed /
+  persisted repos) and after each turn (a repo the just-finished turn cloned),
+  attaching any not-yet-attached directory under `/data` that carries an
+  `origin` remote — the discriminator that distinguishes a *cloned existing
+  repo* from a blank `git init` prototype, so prototypes are never touched and
+  no new MCP tool is needed.
+- `crates/copperclaw-host/src/container_manager/cold_start.rs`: host-side
+  repo-attach observability. At cold start `begin_spawn_attempt` logs when a
+  session's `/data` already holds an attachable existing repo the runner will
+  open (clearly separated as the "repo-attach half" from the skills-materialize
+  half card S1 adds later).
+- `skills/coding-task/SKILL.md`: documents the clone-and-auto-attach flow — how
+  to change an existing repo, that attach infers the verify stages the gate then
+  enforces, and that the agent owns `.copperclaw/verify` after attach.
+- Fixture `fixtures/repos/todo-tracker/`: a small multi-file Node repo standing
+  in for an existing project (real `package.json` scripts, `src/` tree, README),
+  used by the C2 unit + acceptance-integration tests.
+- Security review recorded in `docs/plans/m22-security-reviews.md` (C2, PASS):
+  the attach flow is read-only-plus-`.copperclaw/`-writes, executes no repo
+  code, adds no network capability (clone egress stays behind the existing
+  modules guard), and maps only an allowlist of `package.json` script names to
+  fixed stage commands so a hostile manifest can't inject a verify line.
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 

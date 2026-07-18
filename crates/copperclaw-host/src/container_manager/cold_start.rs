@@ -164,6 +164,13 @@ impl ContainerManager {
         let data_dir = self.cfg.data_dir.clone();
         let session_id = session.id;
         let agent_group_id = session.agent_group_id;
+        // M22 C2 (repo-attach half): surface, at cold start, whether this
+        // session is opening a pre-existing repository that the runner's
+        // attach flow (`copperclaw-runner::run::project`) will pick up —
+        // a clone persisted from a prior turn or an operator-seeded
+        // checkout under the session's `/data`. Host-side observability
+        // only; the runner performs the actual attach.
+        note_attachable_repos(&SessionPaths::new(&data_dir, agent_group_id, session_id).root);
         let watchdog = tokio::spawn(async move {
             tokio::time::sleep(SLOW_SPAWN_NOTICE_AFTER).await;
             // Still in flight past the threshold AND first time this
@@ -246,6 +253,120 @@ fn post_slow_spawn_notice(paths: &SessionPaths, session: SessionId) {
             );
         }
     }
+}
+
+// ── M22 C2: repo-attach half ────────────────────────────────────────────
+//
+// This section is the C2 (open/attach an existing repository) counterpart
+// to the slow-spawn feedback above. Card S1 (Wave 3) adds the *skills-
+// materialize* half to this same file; keep the two clearly separated so
+// they don't collide.
+//
+// The runner (`copperclaw-runner::run::project`) performs the actual
+// attach inside the container (it must — the write logic lives in the
+// runner crate, which the host does not depend on). The host cannot clone
+// (decision (a): cloning is the agent's `shell` git) and cannot run the
+// attach. What it *can* do at cold start is observe, on the host side,
+// that a session's `/data` already holds an existing (cloned) repository
+// the runner will attach — useful operator signal on a cold spawn, and
+// the seam a future host-side attach-hint could hang from.
+
+/// The `.copperclaw/` convention dir + the two markers the runner's attach
+/// flow drops. Mirrored here (rather than shared) because the host does
+/// not depend on the runner crate; the strings are a stable on-disk
+/// contract, not private implementation.
+const ATTACH_STATE_DIR: &str = ".copperclaw";
+const ATTACH_MARKER: &str = "attached";
+const ATTACH_VERIFY_FILE: &str = "verify";
+/// Bound on the `.git/config` read — a backstop against a pathological
+/// file during a purely structural host-side scan.
+const MAX_GIT_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// Log (at most one info line) the existing, not-yet-attached repositories
+/// sitting directly under `session_root`. Best-effort and side-effect-free
+/// beyond the log + metric: never touches the repos, never fails a spawn.
+///
+/// M22 C2 (M1 metric wish): a `copperclaw_repo_attach_detected_total`
+/// counter incremented per attachable repo detected here would let
+/// operators see cold starts that reopen an existing codebase.
+fn note_attachable_repos(session_root: &std::path::Path) {
+    let repos = scan_attachable_repos(session_root);
+    if repos.is_empty() {
+        return;
+    }
+    let names: Vec<String> = repos
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
+    info!(
+        count = repos.len(),
+        repos = %names.join(", "),
+        "cold start: existing repository present under session /data — the runner attach flow will open it",
+    );
+}
+
+/// Host-side detection of *attachable existing repos* directly under
+/// `session_root`: a git checkout with an `origin` remote (a clone, not a
+/// blank `git init` prototype) that carries a recognised toolchain
+/// manifest and has not been attached yet. Deliberately mirrors the
+/// runner's `is_attachable_existing_repo` discriminator so host and runner
+/// agree on what counts as attachable. Sorted for determinism.
+fn scan_attachable_repos(session_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(session_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.is_dir() && dir_is_attachable_repo(&dir) {
+            out.push(dir);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn dir_is_attachable_repo(dir: &std::path::Path) -> bool {
+    let state = dir.join(ATTACH_STATE_DIR);
+    // Already attached, or already carries a (non-empty) verify the agent
+    // manages — leave it alone.
+    if state.join(ATTACH_MARKER).is_file() {
+        return false;
+    }
+    if std::fs::metadata(state.join(ATTACH_VERIFY_FILE))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !repo_has_origin_remote(dir) {
+        return false;
+    }
+    ["Cargo.toml", "package.json", "pyproject.toml", "Makefile"]
+        .iter()
+        .any(|m| dir.join(m).is_file())
+}
+
+/// Whether `<dir>/.git/config` declares an `origin` remote. Reads only
+/// that one bounded file; no subprocess.
+fn repo_has_origin_remote(dir: &std::path::Path) -> bool {
+    use std::io::Read;
+    let git_dir = dir.join(".git");
+    if !git_dir.is_dir() {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(git_dir.join("config")) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if file
+        .take(MAX_GIT_CONFIG_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    String::from_utf8_lossy(&buf).contains("[remote \"origin\"]")
 }
 
 #[cfg(test)]
@@ -759,5 +880,66 @@ mod tests {
             2,
             "a new episode after a successful spawn may notice again",
         );
+    }
+
+    // ── M22 C2: host-side repo-attach detection ──────────────────────
+
+    /// Write a `.git/config` under `repo` declaring (or not) an origin
+    /// remote — the one file the host discriminator reads.
+    fn write_git_config(repo: &std::path::Path, with_origin: bool) {
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let body = if with_origin {
+            "[core]\n[remote \"origin\"]\n\turl = https://example.com/acme/x.git\n"
+        } else {
+            "[core]\n\tbare = false\n"
+        };
+        std::fs::write(git.join("config"), body).unwrap();
+    }
+
+    #[test]
+    fn scan_detects_only_cloned_existing_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A cloned existing repo with a manifest → detected.
+        let cloned = root.join("acme-lib");
+        std::fs::create_dir_all(&cloned).unwrap();
+        std::fs::write(cloned.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        write_git_config(&cloned, true);
+
+        // A blank prototype (no origin) → ignored even with a manifest.
+        let proto = root.join("fresh-proto");
+        std::fs::create_dir_all(&proto).unwrap();
+        std::fs::write(proto.join("package.json"), "{}").unwrap();
+        write_git_config(&proto, false);
+
+        // A non-project dir (e.g. the memory store) → ignored.
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        let found = scan_attachable_repos(root);
+        assert_eq!(found, vec![cloned]);
+    }
+
+    #[test]
+    fn scan_skips_already_attached_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("acme-lib");
+        std::fs::create_dir_all(repo.join(ATTACH_STATE_DIR)).unwrap();
+        std::fs::write(repo.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+        write_git_config(&repo, true);
+        // Marker present → the runner already attached it.
+        std::fs::write(
+            repo.join(ATTACH_STATE_DIR).join(ATTACH_MARKER),
+            "2026-07-17",
+        )
+        .unwrap();
+        assert!(scan_attachable_repos(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_of_missing_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(scan_attachable_repos(&tmp.path().join("nope")).is_empty());
     }
 }

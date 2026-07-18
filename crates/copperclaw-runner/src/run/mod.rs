@@ -18,6 +18,8 @@ pub(super) mod formatting;
 pub mod hud;
 pub mod preview;
 pub(super) mod progressive;
+// M22 C2: open/attach an existing repository as the working project.
+pub mod project;
 pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod reaction;
@@ -670,6 +672,13 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     // (`select_start` always returns 0, no transitions).
     let failover_health = FailoverHealth::from_deps(&deps);
 
+    // M22 C2 attach seam: at startup, attach any *existing* repository
+    // already sitting under the data root — a repo handed to / persisted
+    // for this session (a clone from a prior turn, an operator-seeded
+    // checkout). Best-effort and idempotent; a repo the agent clones
+    // mid-session is caught by the matching post-turn call below.
+    project::auto_attach_pending().await;
+
     loop {
         if let Some(limit) = deps.max_turns {
             if turns_run >= limit {
@@ -890,6 +899,12 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             save_state(&g, &state.history, state.continuation.as_deref())
                 .context("save runner state")?;
         }
+        // M22 C2 attach seam: a turn just completed and may have `git
+        // clone`d an existing repository via `shell` (decision (a) — no
+        // git MCP tool). Attach any newly-cloned, not-yet-attached repo
+        // now, before the next turn reasons about it. Idempotent + gated
+        // on an `origin` remote, so blank prototypes are never touched.
+        project::auto_attach_pending().await;
         turns_run += 1;
         // Active path: poll faster when traffic is flowing.
         sleep(Duration::from_millis(ACTIVE_POLL_INTERVAL_MS)).await;
