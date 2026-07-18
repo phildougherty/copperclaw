@@ -42,8 +42,7 @@ can safely edit in parallel.
   logging *and* config — "and" in a file's description means split it.
 - **Module boundaries follow what changes together**, not arbitrary
   size. Split on job collision (two features fighting over one file),
-  not line count — a 40-line script cut into three files is
-  decomposition theater, not craft.
+  not line count.
 - Put the module list in your first `todo_add` batch — the plan the
   build follows, not a mental note.
 - **Read before you write**, match the surrounding style; prefer
@@ -63,6 +62,12 @@ can safely edit in parallel.
 
 Probe before depending on an image tool (`command -v eslint`,
 `python3 -c "import <pkg>"`) — an absent tool just fails cold.
+
+- **SQLite on `/data`: no WAL.** Keep the default rollback journal
+  (`journal_mode = DELETE`) for any embedded/file DB (better-sqlite3,
+  Prisma, rusqlite, python sqlite3) — a hard container kill truncates a
+  bind-mounted WAL to unrecoverable `SQLITE_IOERR_SHORT_READ`. Need WAL?
+  Checkpoint on shutdown; know it's fragile on a bind mount.
 
 ## Robustness: handle what a user can actually hit
 
@@ -88,23 +93,21 @@ not vibes. Run it — `python3 x.py` (exit 0), `node x.js` + `curl` for a
 server, `pytest`/`npm test` for tests ("it compiles" is not the bar) —
 via the project's *canonical* build (`cargo build`, `go build ./...`,
 `npm run build`), never an ad-hoc per-file check. Couldn't run it? Say
-so — "wrote X, couldn't run it, because Y" beats a fabricated "done".
+so — that beats a fabricated "done".
 
 Verification is also *enforced*. Write
 `/data/<project>/.copperclaw/verify` **at scaffold time**, not as a
-wrap-up step, as one or more stages, one per line:
+wrap-up, one stage per line:
 
     lint: npx eslint .
     typecheck: tsc --noEmit
     test: npm test
 
 An optional `name:` prefix names a stage; an unprefixed line gets a
-derived name (`stage1`, ...) and is enforced the same way — a single
-unprefixed line is exactly today's one-command check. **Probe before
-writing a stage that needs a tool** (`command -v eslint`) — only write
-stages for tools confirmed on the image; an absent binary just fails
-the stage cold. `check_command` (per-group config) overrides the whole
-file with one command.
+derived name (`stage1`, ...), enforced the same way. **Probe before
+writing a stage that needs a tool** (`command -v eslint`) — an absent
+binary just fails the stage cold. `check_command` (per-group config)
+overrides the whole file with one command.
 
 Any edit marks the project **dirty**, resetting every stage. While
 dirty, `todo_update(status="completed")` refuses, naming the
@@ -113,8 +116,7 @@ Clear a stage by running **exactly** its command via `shell` with
 `cwd` set to the project — exit 0 records green, nonzero records a fix
 cycle and names the broken stage in `last_failure`. **2** failed
 cycles auto-blocks the todo. Every stage must be green since the last
-dirty mark, not just the one you last ran; no file → the error says
-so. A group that never touches a project never trips the gate.
+dirty mark, not just the one you last ran; no file → the error says so.
 Truncated log tail: [[testing]]/[[debug]] (`tail_bytes`, paged
 `read_file`).
 
@@ -131,8 +133,7 @@ there is genuinely no UI to look at:
 5. `ui_screenshot` again to confirm the fix landed.
 
 One full cycle minimum before the delivery todo. See
-[[web-app-scaffold]] for when a scaffolded app first has something on
-screen worth looking at.
+[[web-app-scaffold]] for when a scaffold first shows something.
 
 ## Delivering artifacts to the operator
 
