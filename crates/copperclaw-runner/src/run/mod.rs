@@ -16,6 +16,8 @@ pub mod external_mcp;
 pub(super) mod failover_health;
 pub(super) mod formatting;
 pub mod hud;
+// M22 C3: container-local symbol-index bridge (ctags/LSP) feeding find_symbol.
+pub(super) mod lsp;
 pub mod preview;
 pub(super) mod progressive;
 // M22 C2: open/attach an existing repository as the working project.

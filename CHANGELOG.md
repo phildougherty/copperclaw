@@ -160,6 +160,45 @@ adheres to [Semantic Versioning](https://semver.org/).
   migration, no new approval machinery. Unit + integration coverage in both
   files (reviewer dispatched with diff payload; blocking findings gate the
   merge; passing clears it; back-compat preserved).
+### Added (M22 C3 — `find_symbol` + LSP/ctags navigation, Wave 1)
+
+- New read-only `find_symbol` MCP tool
+  (`crates/copperclaw-mcp/src/tools/find_symbol.rs`): resolve a symbol to its
+  definition(s) (`file:line` + kind + a hover signature) and its references,
+  so the agent stops grepping the whole tree for a declaration. Mirrors the
+  `grep.rs`/`glob.rs` shape (same `ignore`-crate walker, `.gitignore` honoured,
+  `target/`/`node_modules/`/`.git/` skipped). Backends degrade cleanly:
+  (1) parse a bridge-built ctags index at `<root>/.copperclaw/tags`;
+  (2) run `universal-ctags` on demand to stdout (never writing into the repo)
+  when there's no index; (3) fall back to a scoped definition-line scan on a
+  minimal image with no ctags at all. References are always a whole-word scan
+  (ctags does not emit call sites reliably). Registered in
+  `crates/copperclaw-mcp/src/tools/mod.rs` (tool inventory) and added to
+  `READONLY_TOOLS` in `crates/copperclaw-runner/src/policy.rs` (read-only:
+  reachable under the messaging profile and by guest senders, gated by no
+  taint/autonomy layer).
+- New container-local symbol-index bridge
+  (`crates/copperclaw-runner/src/run/lsp.rs`, decision (f)): builds the ctags
+  index the tool consumes, entirely inside the sandbox — no host-side language
+  server, no writes outside `<repo>/.copperclaw/`, no egress. Picks the richest
+  available backend (probes for a fitting language server — rust-analyzer for a
+  `Cargo.toml` repo, typescript-language-server/`tsserver` for a
+  `package.json`/`tsconfig.json` repo — and records it for a future live
+  go-to-def path) and degrades to `universal-ctags` (baked into the baseline
+  image), then to no index (grep fallback at query time) on a minimal image. A
+  full live LSP JSON-RPC client is intentionally deferred per decision (f)'s
+  pragmatism note. Registered as `run/lsp.rs` in
+  `crates/copperclaw-runner/src/run/mod.rs`.
+- `crates/copperclaw-runner/src/run/project.rs`: filled in C2's
+  `trigger_symbol_index` seam (body only, signature unchanged) to call the new
+  bridge, so opening/attaching an existing repository now indexes its symbols
+  for the next turn instead of hitting a documented no-op.
+- Tests: ctags `tags`-file parsing (extended + numeric ex-command + `kind:`
+  forms), go-to-def via a bridge-built index returning `file:line`, and
+  definition + reference resolution on the `fixtures/repos/todo-tracker/` repo
+  without any index (the grep tier — the hermetic-CI path). The on-demand-ctags
+  and language-server-assisted paths self-skip when the binaries are absent so
+  the suite stays hermetic while still exercising the real path on a dev box.
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 

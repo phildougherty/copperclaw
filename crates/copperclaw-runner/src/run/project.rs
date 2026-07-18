@@ -412,25 +412,25 @@ fn origin_remote_url(repo: &Path) -> Option<String> {
 // ── C3 symbol-index seam ────────────────────────────────────────────────
 
 /// C3 symbol-index hook. C2 attaches a repo and calls this so the C3
-/// symbol index (LSP/ctags, landing in `run/lsp.rs` + the `find_symbol`
-/// tool) can build or refresh its index for `repo`.
+/// symbol-index bridge ([`crate::run::lsp`], feeding the `find_symbol` MCP
+/// tool) builds or refreshes the index for `repo`.
 ///
-/// **This is an intentional no-op seam, not a stub of C2 behaviour.** C2
-/// does not own the index; card C3 replaces this body with the real index
-/// build. The signature is stable and standalone precisely so C3 wires in
-/// here without touching the attach flow. Kept `async` so C3's
-/// implementation (spawning a language server, reading ctags output) needs
-/// no signature change.
-// Intentional seam: the body is a no-op until C3 fills it in, so there is
-// nothing to `.await` yet — keep the `async` signature C3 will need.
-#[allow(clippy::unused_async)]
+/// Delegates to [`crate::run::lsp::build_symbol_index`], which picks the
+/// richest available backend (a fitting language server when present,
+/// otherwise `universal-ctags`) and degrades cleanly to no index — leaving
+/// `find_symbol` to its scoped scan — on a minimal image. Best-effort and
+/// read-only with respect to the repo's own files (the sole write is
+/// `<repo>/.copperclaw/tags`), so it can never take an attach down. The
+/// signature is unchanged from the C2 seam so this wires in without
+/// touching the attach flow.
 pub async fn trigger_symbol_index(repo: &Path) {
-    // C3 (find_symbol.rs / run/lsp.rs) implements this. Until then the
-    // attach flow records that it *reached* the seam and moves on.
-    tracing::debug!(
+    let outcome = crate::run::lsp::build_symbol_index(repo).await;
+    tracing::info!(
         target: "copperclaw_runner",
         repo = %repo.display(),
-        "C2 attach: reached C3 symbol-index seam (no-op until C3 lands)"
+        backend = outcome.backend.label(),
+        symbols = outcome.symbols_indexed,
+        "C3 symbol index: built for attached repository"
     );
 }
 

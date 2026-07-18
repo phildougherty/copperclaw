@@ -83,6 +83,8 @@ const READONLY_TOOLS: &[&str] = &[
     "view_image",
     "glob",
     "grep",
+    // M22 C3: read-only symbol navigation (go-to-def / find-refs / hover).
+    "find_symbol",
     "git_blame",
     "git_diff",
     "git_log",
