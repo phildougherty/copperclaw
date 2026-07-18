@@ -114,11 +114,19 @@ pub(super) async fn invoke_tool(
     let call_fut = entry.handler.call(arguments, deps.tool_ctx.as_ref());
     let timeout = std::time::Duration::from_secs(deps.tool_deadline_secs);
     match tokio::time::timeout(timeout, call_fut).await {
-        Ok(Ok(result)) => (
-            render_tool_result(&result),
-            extract_tool_images(&result),
-            false,
-        ),
+        Ok(Ok(result)) => {
+            // M22 C6: the see→fix (screenshot) gate's dispatch-level side
+            // effects — a successful `ui_screenshot` satisfies the loop and
+            // clears pending markers; a successful edit-family tool re-opens
+            // it. This is the one layer that observes every tool call, so the
+            // clear (whose tool is out of C6's scope) lives here.
+            apply_see_fix_hooks(deps, &call.name).await;
+            (
+                render_tool_result(&result),
+                extract_tool_images(&result),
+                false,
+            )
+        }
         Ok(Err(err)) => (
             format!("Tool `{}` failed: {err}", call.name),
             Vec::new(),
@@ -132,6 +140,54 @@ pub(super) async fn invoke_tool(
             Vec::new(),
             true,
         ),
+    }
+}
+
+/// C6: which see→fix side effect a just-succeeded tool call triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeeFixAction {
+    /// A fresh `ui_screenshot` satisfied the loop — clear pending markers.
+    Clear,
+    /// An edit-family tool re-opened the loop — mark UI tasks as needing a
+    /// post-fix screenshot.
+    Mark,
+    /// The tool is irrelevant to the see→fix gate.
+    None,
+}
+
+/// Decide the see→fix side effect for a successful `tool_name`. Keyed off
+/// the tool NAME (not per-tool arg parsing) so it stays tool-agnostic
+/// across the edit tools C6 does not own. `write_file` is deliberately
+/// absent: its own handler marks the specific project it touched
+/// (`computer_use::write_file`), so re-marking here would be redundant.
+/// `ui_screenshot` is here — it is out of C6's file scope, and this
+/// dispatch layer is the one place that observes every tool call, so its
+/// clear must live here.
+fn see_fix_action(tool_name: &str) -> SeeFixAction {
+    match tool_name {
+        "ui_screenshot" => SeeFixAction::Clear,
+        "edit_file" | "multi_edit" | "apply_patch" | "copy_file" => SeeFixAction::Mark,
+        _ => SeeFixAction::None,
+    }
+}
+
+/// C6: apply a successful tool call's see→fix side effect. Gated by the
+/// shared verify-gate off-switch (decision (d): one switch for the whole
+/// gate family). Best-effort filesystem work — a no-op when the session
+/// has no UI task, or when the tool is irrelevant to the gate.
+async fn apply_see_fix_hooks(deps: &RunnerDeps, tool_name: &str) {
+    let action = see_fix_action(tool_name);
+    if action == SeeFixAction::None || !deps.tool_ctx.verify_gate_enabled() {
+        return;
+    }
+    match action {
+        SeeFixAction::Clear => {
+            copperclaw_mcp::tools::self_review::clear_all_needs_screenshot().await;
+        }
+        SeeFixAction::Mark => {
+            copperclaw_mcp::tools::self_review::mark_all_ui_tasks_need_screenshot().await;
+        }
+        SeeFixAction::None => {}
     }
 }
 
@@ -283,6 +339,22 @@ mod tests {
             input: serde_json::json!({}),
             parse_error: None,
         }
+    }
+
+    #[test]
+    fn see_fix_action_maps_tool_names() {
+        // C6: the dispatch-hook decision is a pure name → action mapping.
+        // ui_screenshot clears the loop; the edit-family tools re-open it;
+        // write_file is handled by its own tool handler (so it's None here);
+        // everything else is irrelevant.
+        assert_eq!(see_fix_action("ui_screenshot"), SeeFixAction::Clear);
+        assert_eq!(see_fix_action("edit_file"), SeeFixAction::Mark);
+        assert_eq!(see_fix_action("multi_edit"), SeeFixAction::Mark);
+        assert_eq!(see_fix_action("apply_patch"), SeeFixAction::Mark);
+        assert_eq!(see_fix_action("copy_file"), SeeFixAction::Mark);
+        assert_eq!(see_fix_action("write_file"), SeeFixAction::None);
+        assert_eq!(see_fix_action("read_file"), SeeFixAction::None);
+        assert_eq!(see_fix_action("shell"), SeeFixAction::None);
     }
 
     #[tokio::test]

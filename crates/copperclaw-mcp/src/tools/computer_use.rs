@@ -1078,6 +1078,18 @@ pub mod write_file {
         }
         let display = path.display().to_string();
         crate::tools::verify_gate::mark_dirty_for_write(ctx, &display).await;
+        // M22 C6: a UI edit re-opens the see→fix loop — mark the project as
+        // needing a post-fix screenshot before its final todo can complete.
+        // No-op unless the project is a UI task (has already screenshotted)
+        // and the gate family is enabled (decision (d): one off-switch for
+        // verify + review + see→fix). State-dir writes (`.copperclaw/…`) are
+        // the gate's own bookkeeping, never a UI change, so they're skipped —
+        // mirroring `mark_dirty_for_write`.
+        if ctx.verify_gate_enabled() && !display.contains("/.copperclaw/") {
+            if let Some(root) = crate::tools::verify_gate::project_root_of(&display) {
+                crate::tools::self_review::mark_needs_screenshot(&root).await;
+            }
+        }
         // M22 C1: append the post-edit verify digest (see `edit_file`) so a
         // freshly written file's type/lint breakage feeds back to the model.
         let mut out = json!({
@@ -2920,6 +2932,48 @@ mod tests {
         let args = obj(&json!({"path": path.to_string_lossy(), "content": "fn main() {}"}));
         write_file::handle(Some(args), &mock).await.unwrap();
         assert!(crate::tools::verify_gate::is_dirty(&g.path().join("proj")).await);
+    }
+
+    #[tokio::test]
+    async fn write_file_opens_see_fix_loop_only_for_ui_tasks() {
+        // C6: a write to a UI task (one that has already screenshotted) marks
+        // it as needing a post-fix screenshot; a write to a project with no
+        // looked-at UI leaves the loop inert.
+        use crate::tools::self_review::{SeeFixState, see_fix_state};
+        let g = DataRootGuard::new();
+
+        // Non-UI project: a write must NOT open the see→fix loop.
+        let plain = g.path().join("plain");
+        let plain_file = plain.join("server.js");
+        let mock = crate::context::MockToolContext::new();
+        write_file::handle(
+            Some(obj(
+                &json!({"path": plain_file.to_string_lossy(), "content": "x"}),
+            )),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(see_fix_state(&plain).await, SeeFixState::NotUiTask);
+
+        // UI task: seed a prior capture, then a write opens the loop.
+        let ui = g.path().join("ui");
+        std::fs::create_dir_all(ui.join(".copperclaw").join("screenshots")).unwrap();
+        std::fs::write(
+            ui.join(".copperclaw").join("screenshots").join("shot.png"),
+            b"png",
+        )
+        .unwrap();
+        let ui_file = ui.join("index.html");
+        write_file::handle(
+            Some(obj(
+                &json!({"path": ui_file.to_string_lossy(), "content": "<h1>hi</h1>"}),
+            )),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(see_fix_state(&ui).await, SeeFixState::NeedsScreenshot);
     }
 
     #[tokio::test]

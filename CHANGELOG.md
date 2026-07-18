@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 C6 — promote the see→fix loop to a runtime gate)
+
+- **See→fix (screenshot) gate**: the screenshot → critique → fix →
+  re-screenshot loop (M20 D4) was a prompt-level habit with "no runtime
+  marker", so completion gates and the HUD could neither require nor observe
+  it. C6 gives it a runtime gate state modelled on the existing verify +
+  `self_review` gates, so a UI task's final/delivery todo can't complete
+  without a fresh post-fix screenshot. New machinery in
+  `crates/copperclaw-mcp/src/tools/self_review.rs`: `SeeFixState`
+  (`NotUiTask` / `NeedsScreenshot` / `Satisfied`), a `.copperclaw/needs_screenshot`
+  presence marker + `.copperclaw/screenshot_cycles` counter, `SEE_FIX_CYCLE_CAP`
+  (mirrors `REVIEW_CYCLE_CAP`), and `is_ui_task` / `mark_needs_screenshot` /
+  `clear_needs_screenshot` / `see_fix_state` / `screenshot_cycles` /
+  `record_screenshot_refusal` / `scan_projects_needing_screenshot`.
+- **"Is this a UI task" reuses an existing signal, not a new heuristic**: a
+  project is a UI task iff it has ≥1 `ui_screenshot` capture under
+  `.copperclaw/screenshots/` (the directory M20 D1's `ui_screenshot` already
+  creates). A project that never screenshotted is never gated (fails open,
+  exactly like `ReviewState::NotApplicable`).
+- **Marker SET on a UI edit**: after a successful `write_file` in
+  `crates/copperclaw-mcp/src/tools/computer_use.rs` (the card's "no runtime
+  marker" anchor), a UI-task project is marked as needing a post-fix
+  screenshot. The other edit-family tools (`edit_file` / `multi_edit` /
+  `apply_patch` / `copy_file`) set it via the runner's dispatch hook (below),
+  so the whole edit surface re-opens the loop without touching those tools.
+- **Marker CLEARED on a fresh screenshot**: the runner's
+  `crates/copperclaw-runner/src/run/tool_dispatch.rs` gains a see→fix dispatch
+  hook (`see_fix_action` / `apply_see_fix_hooks`) that, after a successful
+  `ui_screenshot`, clears every pending marker in the session; after a
+  successful edit-family tool it re-opens the loop. The dispatch layer is the
+  one place that observes every tool call, so the clear (whose tool is out of
+  C6's file scope) lives there.
+- **Completion gate**: `crates/copperclaw-mcp/src/tools/todo.rs`'s
+  `todo_update` completion gate now refuses to complete the final/delivery
+  todo while any UI project needs a post-fix screenshot — up to
+  `SEE_FIX_CYCLE_CAP` refusals, then auto-transitions the todo to `blocked`
+  with a reason attached, the same refuse-then-block shape as the verify and
+  review gates. Shares the verify gate's `verify_gate_enabled()` off-switch
+  (one switch for the whole gate family, per decision (d)).
+
 ### Added (M22 C1 — post-edit verify hook)
 
 - **Post-edit verify hook**: after a successful `edit_file` / `multi_edit` /
