@@ -20,6 +20,12 @@ URL.
    - `npx serve -l tcp://0.0.0.0:3000`
    - Express: `app.listen(3000, "0.0.0.0")`
    - Flask: `app.run(host="0.0.0.0", port=5000)`
+   - **Vite** (the common one): `npm run dev` alone binds `localhost` and the
+     preview 500s with "the app did not respond". Set `server.host: true` **and**
+     `server.allowedHosts: true` in `vite.config.ts` (Vite 6 blocks the proxied
+     Host header) — or run `vite --host 0.0.0.0`. The `/api` proxy still targets
+     `localhost:<api-port>` inside the container; only the dev server's own bind
+     needs `0.0.0.0`.
 
 2. **Confirm it is actually listening** before exposing it, e.g.
    `curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
