@@ -27,6 +27,26 @@ pub struct Frontmatter {
     pub description: String,
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<Vec<String>>,
+    // M22 S3: optional monotonic skill version. Absent in every one of the 41
+    // shipped skills, so it is `#[serde(default)]` (parses to `None`) and the
+    // effective value defaults to 1 via [`Frontmatter::version`] — existing
+    // skills keep parsing unchanged. `save_skill` bumps this on every re-save
+    // so an agent-authored skill carries a monotonic revision. Kept localized
+    // (this field + the `version()` accessor below) so card S4's `tools:`
+    // addition rebases cleanly on top.
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
+impl Frontmatter {
+    /// M22 S3: the effective skill version. The `version` frontmatter field is
+    /// optional; a skill without it (every one of the 41 shipped skills, and
+    /// any first-time agent-authored skill that omits it) defaults to version
+    /// 1. `save_skill` writes an explicit bumped version on re-save.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version.unwrap_or(1)
+    }
 }
 
 /// Parse the YAML frontmatter from a `SKILL.md` body.
@@ -232,8 +252,37 @@ mod tests {
             name: "n".into(),
             description: "d".into(),
             allowed_tools: None,
+            version: None,
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // ── M22 S3: version field ────────────────────────────────────────────
+
+    #[test]
+    fn version_defaults_to_one_when_absent() {
+        // Every one of the 41 shipped skills omits `version`; they must keep
+        // parsing and default to version 1.
+        let input = "---\nname: x\ndescription: y\n---\n# body\n";
+        let fm = parse(input).unwrap();
+        assert!(fm.version.is_none());
+        assert_eq!(fm.version(), 1);
+    }
+
+    #[test]
+    fn version_is_parsed_when_present() {
+        let input = "---\nname: x\ndescription: y\nversion: 7\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.version, Some(7));
+        assert_eq!(fm.version(), 7);
+    }
+
+    #[test]
+    fn version_coexists_with_allowed_tools() {
+        let input = "---\nname: x\ndescription: y\nallowed-tools: [Read]\nversion: 3\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.allowed_tools, Some(vec!["Read".to_string()]));
+        assert_eq!(fm.version(), 3);
     }
 }

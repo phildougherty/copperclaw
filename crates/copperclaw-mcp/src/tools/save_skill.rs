@@ -45,7 +45,11 @@ pub fn schema() -> Tool {
          `name` and `description`), and `reason`. The skill is validated now \
          and, on operator approval, written into this group's skills so the \
          next session can use it. Per-group only — not shared across groups. \
-         Use this to durably teach yourself a repeatable procedure.",
+         Saving is VERSION-AWARE: a first save is version 1 (or the `version` \
+         you set in the frontmatter), and re-saving an existing skill of the \
+         same name bumps its version automatically — you do not need to manage \
+         `version` yourself. Use `list_skills` to see saved skills and their \
+         versions. Use this to durably teach yourself a repeatable procedure.",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -59,7 +63,7 @@ pub fn schema() -> Tool {
                 "content": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "The full SKILL.md text, including the `---` YAML frontmatter (`name`, `description`, optional `allowed-tools`)."
+                    "description": "The full SKILL.md text, including the `---` YAML frontmatter (`name`, `description`, optional `allowed-tools`, optional `version` — managed automatically on re-save)."
                 },
                 "reason": {
                     "type": "string",
@@ -107,7 +111,9 @@ pub async fn handle(
     Ok(CallToolResult::success(vec![Content::text(format!(
         "Skill `{name}` validated and submitted for approval. Once an operator \
          approves, it lands in this group's skills and becomes available in your \
-         NEXT session (not the current one). Nothing changes this session."
+         NEXT session (not the current one). If a skill of this name already \
+         exists its version is bumped automatically on write; a new skill starts \
+         at version 1. Nothing changes this session."
     ))]))
 }
 

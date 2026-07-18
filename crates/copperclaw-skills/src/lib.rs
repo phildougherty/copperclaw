@@ -47,5 +47,5 @@ pub use frontmatter::{Frontmatter, skip_frontmatter};
 pub use materialize::{MaterializeOutcome, MaterializeReport, materialize};
 pub use registry::{Skill, SkillId, SkillRegistry, SkillSource, SkillsSelector, read_skill_body};
 pub use relevance::{ScoredSkill, rank_descriptions};
-pub use save::{save_group_skill, validate_skill_content};
+pub use save::{SkillListing, list_group_skills, save_group_skill, validate_skill_content};
 pub use tool_names::normalize as normalize_allowed_tools;

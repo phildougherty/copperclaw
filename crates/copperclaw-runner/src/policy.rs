@@ -96,6 +96,11 @@ const READONLY_TOOLS: &[&str] = &[
     // mutating goal verbs (`create_goal` / `update_goal`) live in
     // [`SCHEDULING_MUTATION_TOOLS`] so the guest role floor denies them.
     "list_goals",
+    // M22 S3: read-only enumeration of the session's selected skills (name +
+    // version + description). Reads the per-session skills catalogue only — no
+    // mutation, no egress — so it is safe for a guest sender and rides the
+    // messaging profile alongside the other read tools.
+    "list_skills",
 ];
 
 /// Scheduler-mutation verbs layered on top of [`READONLY_TOOLS`] by the
