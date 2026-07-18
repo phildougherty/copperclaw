@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 A4 — revive condition/event check-ins)
+
+- **Conditions schema (`conditions` + `condition_flags` tables, migration
+  032)**: durable, event-driven wakes that revive the previously-dormant
+  `checks::condition_checkin` sweep. Before this the sweep's `ConditionStore`
+  was in-memory/default-empty with no registration surface, so
+  `IdleForAtLeastSecs` / `FlagSet` conditions could never be created and never
+  fired. `crates/copperclaw-db/migrations/032_conditions.sql` (032 was the next
+  free number after A3's 031), registered in
+  `crates/copperclaw-db/src/migrate.rs`. Conditions persist (a dormant in-memory
+  store that empties on restart is a weak revival); the rising-edge latch stays
+  in-memory (re-arming from "never seen" after a restart is correct).
+- **Conditions model (`crates/copperclaw-db/src/tables/conditions.rs`)**:
+  `upsert` (register/replace by agent-chosen id), `list_active`, `get`,
+  `soft_remove` (deregister via `removed_at`, retaining an audit trail), plus
+  the settable per-session flag latches (`set_flag` / `clear_flag` /
+  `list_flags_for_session`) the `flag` condition kind reads. Registered in
+  `crates/copperclaw-db/src/tables/mod.rs`.
+- **Revived condition sweep (`crates/copperclaw-host-sweep`)**: `service.rs`
+  `run_once` now reloads the `conditions` table into the shared in-memory
+  `ConditionStore` each pass (new `ConditionStore::reconcile`, which preserves an
+  unchanged condition's rising-edge latch so a still-true condition doesn't
+  re-fire every pass) and the condition sampler
+  (`sample_condition_context`) now populates ALL THREE observable signals — the
+  pending-inbound count (as before) plus `idle_secs` (from the session's
+  `last_active`) and `flags_set` (from `condition_flags`) — so idle/flag
+  conditions actually fire. `checks/condition_checkin.rs` gains
+  `Condition::from_stored` (DB row → in-memory condition) and the kind wire
+  tags. A fired condition reuses the SAME `kind:task` fan-out scheduled tasks /
+  goals use; the wake therefore flows through the autonomous path and stays
+  subject to A2's grant gate at fire time.
+- **Condition MCP tools (`crates/copperclaw-mcp/src/tools/conditions.rs`)**:
+  `register_condition` (declare/deregister a durable idle / pending-inbound /
+  flag condition) and `set_condition_flag` (raise/lower the latch a `flag`
+  condition watches), registered in `tools/mod.rs` alongside the scheduling /
+  goal tools. New `RegisterConditionSpec` / `SetConditionFlagSpec` +
+  `OutboundToolEffect::RegisterCondition`/`SetConditionFlag` in
+  `crates/copperclaw-mcp/src/context.rs` (additive, alongside A1's grant effect
+  + A3's goal effects). Both verbs classified as autonomy-affecting mutations in
+  `crates/copperclaw-runner/src/policy.rs` (denied to a guest sender). The runner
+  writes them as `{"condition": {...}}` system rows
+  (`crates/copperclaw-runner/src/tools.rs` `apply_register_condition` /
+  `apply_set_condition_flag`); the host's delivery `condition` inline handler
+  (`crates/copperclaw-host-delivery/src/service.rs` `apply_condition`) persists
+  them immediately into the central `conditions` / `condition_flags` tables — a
+  condition is internal state and authorizes nothing on its own (registered in
+  `crates/copperclaw-host/tests/action_handler_coverage.rs`).
+
 ### Added (M22 A3 — first-class long-running goal object)
 
 - **Goals schema (`goals` + `goal_progress` tables, migration 031)**: a durable

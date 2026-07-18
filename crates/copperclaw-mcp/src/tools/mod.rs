@@ -26,6 +26,7 @@ pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
 pub mod computer_use;
+pub mod conditions;
 pub mod copy_file;
 pub mod core;
 pub mod diagnostics;
@@ -108,6 +109,13 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         goals::create_goal::entry(),
         goals::list_goals::entry(),
         goals::update_goal::entry(),
+        // M22 A4: durable event-driven condition wakes (revives the dormant
+        // sweep condition check-in) + the settable flag latch a `flag`
+        // condition watches. Registered alongside the scheduling/goal tools
+        // they sit beside — a condition is an event-triggered sibling of a
+        // scheduled task.
+        conditions::register_condition::entry(),
+        conditions::set_condition_flag::entry(),
         computer_use::shell::entry(),
         edit_file::entry(),
         multi_edit::entry(),
@@ -265,6 +273,8 @@ mod tests {
             "create_goal",
             "list_goals",
             "update_goal",
+            "register_condition",
+            "set_condition_flag",
             "shell",
             "edit_file",
             "multi_edit",

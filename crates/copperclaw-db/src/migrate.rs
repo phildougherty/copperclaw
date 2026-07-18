@@ -127,6 +127,14 @@ const CENTRAL: &[Migration] = &[
         name: "031_goals",
         sql: include_str!("../migrations/031_goals.sql"),
     },
+    // M22 A4: durable HEARTBEAT-style condition/event check-ins + settable
+    // per-session flags. Revives the dormant `checks::condition_checkin` sweep
+    // by giving `IdleForAtLeastSecs` / `FlagSet` / `PendingInboundAtLeast`
+    // conditions a persistent home the sweep reloads each pass.
+    Migration {
+        name: "032_conditions",
+        sql: include_str!("../migrations/032_conditions.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[

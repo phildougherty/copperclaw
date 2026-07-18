@@ -86,6 +86,14 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // `inline_handler_set`): a goal is internal state, so the delivery
         // service persists it immediately into the central `goals` table.
         "goal",
+        // M22 A4: condition/event-trigger registration + flag latch
+        // (apply_register_condition / apply_set_condition_flag). Both
+        // `register_condition` / `set_condition_flag` emit the same top-level
+        // "condition" key with an inner `op`. Intercepted inline (see
+        // `inline_handler_set`): a condition is internal state, so the delivery
+        // service persists it immediately into the central `conditions` /
+        // `condition_flags` tables.
+        "condition",
     ]
     .into_iter()
     .collect()
@@ -124,6 +132,11 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // persist the goal immediately into the central `goals` table (with
         // `self.central`) — a goal is internal state, not approval-gated.
         "goal",
+        // M22 A4: `condition` is intercepted inline so the delivery service can
+        // persist the condition / flag immediately into the central
+        // `conditions` / `condition_flags` tables (with `self.central`) — a
+        // condition is internal state, not approval-gated.
+        "condition",
     ]
     .into_iter()
     .collect()

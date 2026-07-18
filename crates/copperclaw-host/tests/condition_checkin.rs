@@ -14,7 +14,7 @@ use copperclaw_db::tables::sessions::{
 };
 use copperclaw_host::sessions::FsSessionRoot;
 use copperclaw_host_sweep::{
-    CHECKIN_AUDIT_COMMAND, Condition, ConditionContext, ConditionKind, ConditionStore, SweepService,
+    CHECKIN_AUDIT_COMMAND, ConditionContext, ConditionStore, SweepService,
 };
 use std::sync::Arc;
 
@@ -64,20 +64,29 @@ async fn host_condition_checkin_fires_only_when_condition_holds_and_audits() {
     let sweep =
         SweepService::new(central.clone(), root.clone()).with_condition_store(store.clone());
 
-    // Register a flag-driven condition on the session via the SHARED store
-    // the host would call (sweep.condition_store()).
-    sweep.condition_store().register(Condition {
-        id: "ci-1".into(),
-        agent_group_id: sess.agent_group_id,
-        session_id: sess.id,
-        kind: ConditionKind::FlagSet {
-            flag: "wake".into(),
+    // M22 A4: register a flag-driven condition through the DURABLE registration
+    // surface (the central `conditions` table). `run_once` reloads this into the
+    // shared store each pass — the revived, restart-surviving path — replacing
+    // the old in-memory-only `store.register` the dormant check relied on.
+    copperclaw_db::tables::conditions::upsert(
+        &central,
+        copperclaw_db::tables::conditions::NewCondition {
+            id: "ci-1".into(),
+            agent_group_id: sess.agent_group_id,
+            session_id: sess.id,
+            kind: copperclaw_host_sweep::checks::condition_checkin::KIND_FLAG.into(),
+            threshold: None,
+            flag: Some("wake".into()),
+            prompt: "heartbeat: please check in".into(),
+            grant_id: None,
         },
-        prompt: "heartbeat: please check in".into(),
-    });
+    )
+    .unwrap();
 
-    // The default production sampler builds context from pending inbound only,
-    // so the flag condition is FALSE under it -> no fire on a normal pass.
+    // The default production sampler reads the session's set flags from
+    // `condition_flags`; the "wake" flag is NOT set, so the flag condition is
+    // FALSE and no fire happens on a normal pass (which also reconciles the
+    // condition into the shared store).
     let report = sweep.run_once().unwrap();
     assert!(
         report.condition_checkins_fired.is_empty(),

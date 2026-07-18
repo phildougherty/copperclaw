@@ -104,7 +104,39 @@ impl ConditionContext {
     }
 }
 
+/// The three wire kind tags stored in the `conditions.kind` column (M22 A4).
+/// Kept next to [`ConditionKind`] so the DB<->enum mapping has one home.
+pub const KIND_PENDING_INBOUND: &str = "pending_inbound";
+pub const KIND_IDLE: &str = "idle";
+pub const KIND_FLAG: &str = "flag";
+
 impl Condition {
+    /// Rebuild an in-memory [`Condition`] from a persisted
+    /// [`copperclaw_db::tables::conditions::StoredCondition`] (M22 A4). Returns
+    /// `None` for a malformed row (unknown kind, or a kind missing its required
+    /// `threshold` / `flag`) — the sweep skips those rather than aborting the
+    /// reload, so one bad row never wedges the whole condition check.
+    #[must_use]
+    pub fn from_stored(stored: copperclaw_db::tables::conditions::StoredCondition) -> Option<Self> {
+        let kind = match stored.kind.as_str() {
+            KIND_PENDING_INBOUND => ConditionKind::PendingInboundAtLeast {
+                min: u32::try_from(stored.threshold?).ok()?,
+            },
+            KIND_IDLE => ConditionKind::IdleForAtLeastSecs {
+                idle_secs: u64::try_from(stored.threshold?).ok()?,
+            },
+            KIND_FLAG => ConditionKind::FlagSet { flag: stored.flag? },
+            _ => return None,
+        };
+        Some(Self {
+            id: stored.id,
+            agent_group_id: stored.agent_group_id,
+            session_id: stored.session_id,
+            kind,
+            prompt: stored.prompt,
+        })
+    }
+
     /// Pure predicate: does this condition currently hold in `ctx`?
     #[must_use]
     pub fn holds(&self, ctx: &ConditionContext) -> bool {
@@ -163,6 +195,50 @@ impl ConditionStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id)
             .is_some()
+    }
+
+    /// Sync the store's membership to exactly `desired` (M22 A4): the sweep
+    /// calls this each pass with the active rows loaded from the central
+    /// `conditions` table so a registered condition survives a restart and a
+    /// deregistered one stops firing.
+    ///
+    /// Edge-latch preservation is the whole subtlety: a condition present with
+    /// an UNCHANGED definition keeps its rising-edge latch (so a still-true
+    /// condition does not re-fire every pass), while a NEW or CHANGED condition
+    /// is (re-)registered — which resets its latch — so it fires on its next
+    /// rising edge. Conditions absent from `desired` are dropped along with
+    /// their latch.
+    pub fn reconcile(&self, desired: Vec<Condition>) {
+        let desired_ids: std::collections::HashSet<String> =
+            desired.iter().map(|c| c.id.clone()).collect();
+        // Drop conditions (and their latches) no longer desired.
+        let stale: Vec<String> = {
+            let conditions = self
+                .conditions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            conditions
+                .keys()
+                .filter(|id| !desired_ids.contains(*id))
+                .cloned()
+                .collect()
+        };
+        for id in stale {
+            self.remove(&id);
+        }
+        // Register new or changed conditions (register resets the latch);
+        // leave an unchanged condition — and its latch — untouched.
+        for cond in desired {
+            let unchanged = self
+                .conditions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&cond.id)
+                .is_some_and(|existing| existing == &cond);
+            if !unchanged {
+                self.register(cond);
+            }
+        }
     }
 
     /// Snapshot of all registered conditions for one session.
@@ -624,6 +700,139 @@ mod tests {
         );
         assert_eq!(count_inbound(&root, &sess), 2);
         assert_eq!(audit_log::count(&central).unwrap(), 2);
+    }
+
+    // ---- M22 A4: DB<->enum mapping + reconcile ---------------------------
+
+    fn stored(
+        id: &str,
+        kind: &str,
+        threshold: Option<i64>,
+        flag: Option<&str>,
+    ) -> copperclaw_db::tables::conditions::StoredCondition {
+        copperclaw_db::tables::conditions::StoredCondition {
+            id: id.into(),
+            agent_group_id: AgentGroupId::new(),
+            session_id: SessionId::new(),
+            kind: kind.into(),
+            threshold,
+            flag: flag.map(str::to_owned),
+            prompt: "check in".into(),
+            grant_id: None,
+            created_at: now(),
+            removed_at: None,
+        }
+    }
+
+    #[test]
+    fn from_stored_maps_all_three_kinds() {
+        let p = Condition::from_stored(stored("p", KIND_PENDING_INBOUND, Some(4), None)).unwrap();
+        assert_eq!(p.kind, ConditionKind::PendingInboundAtLeast { min: 4 });
+        let i = Condition::from_stored(stored("i", KIND_IDLE, Some(300), None)).unwrap();
+        assert_eq!(i.kind, ConditionKind::IdleForAtLeastSecs { idle_secs: 300 });
+        let f = Condition::from_stored(stored("f", KIND_FLAG, None, Some("go"))).unwrap();
+        assert_eq!(f.kind, ConditionKind::FlagSet { flag: "go".into() });
+    }
+
+    #[test]
+    fn from_stored_rejects_malformed_rows() {
+        // Unknown kind.
+        assert!(Condition::from_stored(stored("x", "bogus", Some(1), None)).is_none());
+        // pending_inbound / idle missing their threshold.
+        assert!(Condition::from_stored(stored("p", KIND_PENDING_INBOUND, None, None)).is_none());
+        assert!(Condition::from_stored(stored("i", KIND_IDLE, None, None)).is_none());
+        // flag missing its flag name.
+        assert!(Condition::from_stored(stored("f", KIND_FLAG, None, None)).is_none());
+        // Negative threshold cannot map to an unsigned count.
+        assert!(
+            Condition::from_stored(stored("p", KIND_PENDING_INBOUND, Some(-1), None)).is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_adds_removes_and_preserves_latch() {
+        let store = ConditionStore::new();
+        let sess = SessionId::new();
+        let ag = AgentGroupId::new();
+        let mk = |id: &str, kind: ConditionKind| Condition {
+            id: id.into(),
+            agent_group_id: ag,
+            session_id: sess,
+            kind,
+            prompt: "x".into(),
+        };
+        let flag = |name: &str| ConditionKind::FlagSet { flag: name.into() };
+
+        // Initial reconcile registers both.
+        store.reconcile(vec![mk("a", flag("go")), mk("b", flag("stop"))]);
+        assert_eq!(store.all().len(), 2);
+
+        // Fire "a" on its rising edge, arming its latch to true.
+        assert!(store.observe_edge("a", true));
+        assert_eq!(store.latch_of("a"), Some(true));
+
+        // Reconcile with the SAME definitions: unchanged conditions keep their
+        // latch (so a still-true "a" will NOT re-fire), and "b" is untouched.
+        store.reconcile(vec![mk("a", flag("go")), mk("b", flag("stop"))]);
+        assert_eq!(
+            store.latch_of("a"),
+            Some(true),
+            "unchanged: latch preserved"
+        );
+
+        // Dropping "b" and CHANGING "a" (new flag) removes "b" and re-arms "a".
+        store.reconcile(vec![mk("a", flag("changed"))]);
+        assert_eq!(store.all().len(), 1);
+        assert!(store.for_session(&sess).iter().all(|c| c.id == "a"));
+        assert_eq!(store.latch_of("a"), None, "changed def resets the latch");
+    }
+
+    #[test]
+    fn reconcile_to_empty_clears_everything() {
+        let store = ConditionStore::new();
+        store.register(Condition {
+            id: "a".into(),
+            agent_group_id: AgentGroupId::new(),
+            session_id: SessionId::new(),
+            kind: ConditionKind::FlagSet { flag: "go".into() },
+            prompt: "x".into(),
+        });
+        store.reconcile(Vec::new());
+        assert!(store.all().is_empty());
+    }
+
+    /// M22 A4 acceptance (unit): a registered idle condition fires when the
+    /// sampled context reports the session has been idle past the floor.
+    #[test]
+    fn registered_idle_condition_fires_when_idle() {
+        let central = CentralDb::open_in_memory().unwrap();
+        let root = MemSessionRoot::new();
+        let sess = seed_running_session(&central);
+        let store = ConditionStore::new();
+        store.reconcile(vec![
+            Condition::from_stored(copperclaw_db::tables::conditions::StoredCondition {
+                id: "idle-1".into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                kind: KIND_IDLE.into(),
+                threshold: Some(300),
+                flag: None,
+                prompt: "you've gone quiet — check in".into(),
+                grant_id: None,
+                created_at: now(),
+                removed_at: None,
+            })
+            .unwrap(),
+        ]);
+        // Sampler reports the session idle for 10 minutes (> 300s floor).
+        let sampler = |_: &SessionId| ConditionContext {
+            idle_secs: Some(600),
+            ..ConditionContext::quiet()
+        };
+        let fired = check(&store, &central, &root, &sampler, now()).unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].series_id, "idle-1");
+        assert_eq!(count_inbound(&root, &sess), 1);
     }
 
     #[test]
