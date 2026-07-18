@@ -114,6 +114,11 @@ pub fn check(
                     next_fire: Some(next_fire),
                 },
             )?;
+            // M22 A5 metric: a new central task was created for this series.
+            copperclaw_metrics::inc_recurrence_consolidated("created");
+        } else {
+            // M22 A5 metric: a central task already existed — idempotent no-op.
+            copperclaw_metrics::inc_recurrence_consolidated("already_present");
         }
 
         // Neutralise the legacy self-replication path for this series so the

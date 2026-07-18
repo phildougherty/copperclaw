@@ -1047,7 +1047,19 @@ mod visual {
 
         let note = match tokio::fs::read(&path).await {
             Ok(prior) => match (decode_png(&prior), decode_png(current_png)) {
-                (Ok(base), Ok(cur)) => diff_note(&compute_diff(&base, &cur)),
+                (Ok(base), Ok(cur)) => {
+                    let diff = compute_diff(&base, &cur);
+                    // M22 C4 metric: count a flagged visual regression, labelled
+                    // by viewport + whether the viewport dimensions themselves
+                    // changed (a strong layout-regression signal).
+                    if diff.flagged {
+                        copperclaw_metrics::inc_visual_regression_flag(
+                            viewport_label,
+                            diff.dimensions_changed,
+                        );
+                    }
+                    diff_note(&diff)
+                }
                 // Undecodable baseline or capture (e.g. a jpeg-downgraded prior
                 // shot): skip silently and just re-baseline below.
                 _ => String::new(),
@@ -1057,8 +1069,11 @@ mod visual {
 
         // Re-baseline (create dir best-effort). A write failure must not affect
         // the returned note or the screenshot itself.
-        if tokio::fs::create_dir_all(&dir).await.is_ok() {
-            let _ = tokio::fs::write(&path, current_png).await;
+        if tokio::fs::create_dir_all(&dir).await.is_ok()
+            && tokio::fs::write(&path, current_png).await.is_ok()
+        {
+            // M22 C4 metric: a view baseline was (re)written for the next diff.
+            copperclaw_metrics::inc_visual_regression_baseline();
         }
         note
     }

@@ -357,6 +357,9 @@ fn run_find_symbol(
     include_refs: bool,
 ) -> Output {
     let (mut definitions, definition_source) = resolve_definitions(root, symbol, definition_cap);
+    // M22 C3 metric: one `find_symbol` invocation, labelled by the backend tier
+    // that resolved the definition (ctags-index / ctags-ondemand / grep / none).
+    copperclaw_metrics::inc_find_symbol(definition_source);
     let definitions_truncated = definitions.len() > definition_cap;
     definitions.truncate(definition_cap);
 

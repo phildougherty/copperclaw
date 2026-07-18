@@ -952,21 +952,42 @@ fn build_post_edit_digest(tool: DiagTool, file: &str, diagnostics: &[Diagnostic]
 /// parsed, or the file is clean. Best-effort by design: a hiccup here must
 /// never turn a successful edit into a failure.
 pub async fn post_edit_verify(path: &str) -> Option<Value> {
+    // M22 C1 metric: emit one `copperclaw_post_edit_verify_total{tool, outcome}`
+    // per attempt, labelling each early-exit and terminal outcome. `?` is
+    // expanded into explicit branches so every exit is attributed.
     if !post_edit_verify_enabled() {
+        copperclaw_metrics::inc_post_edit_verify("none", "disabled");
         return None;
     }
     let file = Path::new(path);
-    let tool = tool_for_extension(file)?;
+    let Some(tool) = tool_for_extension(file) else {
+        copperclaw_metrics::inc_post_edit_verify("none", "unsupported");
+        return None;
+    };
     if !probe_binary(tool.binary()).await {
+        copperclaw_metrics::inc_post_edit_verify(tool.name(), "not_available");
         return None;
     }
     let dir = file
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let file_name = file.file_name()?.to_string_lossy().into_owned();
-    let diagnostics = run_tool_on_file(tool, &dir, &file_name).await.ok()?;
-    build_post_edit_digest(tool, &file_name, &diagnostics)
+    let Some(file_name) = file.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        copperclaw_metrics::inc_post_edit_verify(tool.name(), "error");
+        return None;
+    };
+    let Ok(diagnostics) = run_tool_on_file(tool, &dir, &file_name).await else {
+        copperclaw_metrics::inc_post_edit_verify(tool.name(), "error");
+        return None;
+    };
+    let digest = build_post_edit_digest(tool, &file_name, &diagnostics);
+    if digest.is_some() {
+        copperclaw_metrics::inc_post_edit_verify(tool.name(), "flagged");
+        copperclaw_metrics::observe_post_edit_verify_findings(diagnostics.len() as u64);
+    } else {
+        copperclaw_metrics::inc_post_edit_verify(tool.name(), "clean");
+    }
+    digest
 }
 
 /// Convenience wiring shared by all four mutation tools

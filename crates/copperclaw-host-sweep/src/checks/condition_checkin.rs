@@ -325,6 +325,15 @@ pub fn check(
             continue;
         }
         let fanout = fire(central, root, &condition, now)?;
+        // M22 A4 metric: a condition fired a check-in wake, labelled by kind.
+        // Emitted here (not from the SweepReport) because the fanout the report
+        // carries drops the kind.
+        let kind = match &condition.kind {
+            ConditionKind::PendingInboundAtLeast { .. } => KIND_PENDING_INBOUND,
+            ConditionKind::IdleForAtLeastSecs { .. } => KIND_IDLE,
+            ConditionKind::FlagSet { .. } => KIND_FLAG,
+        };
+        copperclaw_metrics::inc_condition_checkin_fired(kind);
         out.push(fanout);
     }
     Ok(out)

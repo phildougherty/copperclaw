@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 M1 — metrics)
+
+One sweep of the metric "wishes" every M22 card recorded, defined + wired in
+`crates/copperclaw-metrics/src/lib.rs` (the serialized hotspot only this card
+touches) and documented in `docs/observability.md`. Each helper is emitted at a
+real call site in the crate that owns the signal — no dangling metrics.
+
+- **Wave 1 (coding).** `copperclaw_post_edit_verify_total{tool,outcome}` +
+  `copperclaw_post_edit_verify_findings` (histogram) in
+  `copperclaw-mcp/src/tools/diagnostics.rs` (`post_edit_verify`, C1);
+  `copperclaw_repo_attach_total` +
+  `copperclaw_repo_attach_verify_stages_inferred` (histogram) in
+  `copperclaw-runner/src/run/project.rs` (`attach_project`) and
+  `copperclaw_repo_attach_detected_total` in
+  `copperclaw-host/.../cold_start.rs` (`note_attachable_repos`, C2);
+  `copperclaw_find_symbol_total{definition_source}` in
+  `copperclaw-mcp/src/tools/find_symbol.rs` plus
+  `copperclaw_symbol_index_builds_total{backend}` +
+  `copperclaw_symbol_index_symbols` (histogram) in `project.rs`
+  (`trigger_symbol_index`, C3);
+  `copperclaw_visual_regression_flags_total{viewport,dimensions_changed}` +
+  `copperclaw_visual_regression_baselines_total` in
+  `copperclaw-mcp/src/tools/ui_screenshot.rs` (`visual::regression_note`, C4);
+  `copperclaw_review_batch_reviewers_total` +
+  `copperclaw_review_merge_gate_total{outcome}` in
+  `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch::handle`, C5);
+  `copperclaw_see_fix_gate_completion_total{outcome}` in
+  `copperclaw-mcp/src/tools/todo.rs` (the C6 see→fix gate, mirroring
+  `inc_review_gate_completion`).
+- **Wave 2 (autonomy).** `copperclaw_task_grants_total{outcome}` in
+  `copperclaw-host/src/handlers/approvals.rs` (`apply_task_grant`, A1);
+  `copperclaw_autonomous_actions_total{outcome}` in
+  `copperclaw-runner/src/run/tool_dispatch.rs` (A2);
+  `copperclaw_grants_snapshotted_total{outcome}` in
+  `copperclaw-host/.../tasks_snapshot.rs` (`write_grant_snapshot`) plus
+  `copperclaw_grant_fires_consumed_total` /
+  `copperclaw_grant_tokens_consumed_total` in
+  `copperclaw-host-delivery/src/service.rs` (`apply_grant_consume`, A2 host
+  half); `copperclaw_goal_checkins_fired_total` /
+  `copperclaw_goals_budget_paused_total` (sweep run loop),
+  `copperclaw_goal_status_total{status}` /
+  `copperclaw_goal_progress_recorded_total` (`apply_goal`), and the
+  `copperclaw_active_goals` gauge (`checks/goals.rs`) (A3);
+  `copperclaw_condition_checkins_fired_total{kind}` in
+  `copperclaw-host-sweep/src/checks/condition_checkin.rs` (A4);
+  `copperclaw_recurrence_consolidated_total{outcome}` in
+  `checks/recurrence.rs` (A5).
+- **Wave 3 (skills).** `copperclaw_skills_materialized_total{agent_group}` in
+  `copperclaw-host/.../cold_start.rs` (`materialize_session_skills`, S1);
+  `copperclaw_skills_relevance_filtered_total` in
+  `copperclaw-host/.../prompt.rs` (inline builder, S2);
+  `copperclaw_skills_listed_total{mode}` in
+  `copperclaw-mcp/src/tools/list_skills.rs` +
+  `copperclaw_skill_version_saved` (histogram) in `approvals.rs` (after
+  `save_group_skill`, S3);
+  `copperclaw_load_skill_inline_scoped_total{skill,scope}` in
+  `copperclaw-mcp/src/tools/load_skill.rs` (S4).
+
 ### Added (M22 S4 — activate `tools:` frontmatter + inline-mode active-skill narrowing)
 
 - **`tools:` frontmatter is now a working tool allowlist.**

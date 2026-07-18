@@ -89,8 +89,7 @@ fn catalogue_path() -> PathBuf {
 fn materialized_skills_dir() -> PathBuf {
     catalogue_path()
         .parent()
-        .map(|p| p.join("skills"))
-        .unwrap_or_else(|| PathBuf::from("/data/skills"))
+        .map_or_else(|| PathBuf::from("/data/skills"), |p| p.join("skills"))
 }
 
 /// M22 S4: activate a skill's tool scope under **inline** skills mode.
@@ -144,6 +143,15 @@ async fn activate_inline_skill_scope(
     let allowed_tools = fm
         .declared_tools()
         .map(|raw| copperclaw_skills::normalize_allowed_tools(&raw));
+    // M22 S4 metric: a sibling of the existing inline/callable `inc_load_skill`
+    // count — this one records whether the loaded skill actually NARROWED the
+    // tool surface (declared a scope) or CLEARED any prior narrowing.
+    let scope = if allowed_tools.is_some() {
+        "narrowed"
+    } else {
+        "cleared"
+    };
+    copperclaw_metrics::inc_load_skill_inline_scoped(name, scope);
     ctx.set_active_skill_allowed_tools(allowed_tools);
 
     // The body is already inlined into the system prompt; echo it back (matching
@@ -320,7 +328,7 @@ mod tests {
     /// RAII guard that points `catalogue_path()` at a tempfile for the
     /// guard's lifetime and clears the override on drop.
     struct CatalogueGuard {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -333,10 +341,7 @@ mod tests {
             let path = dir.path().join("skills.json");
             std::fs::write(&path, json_body).unwrap();
             skills_catalogue_test_override_set(path);
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
+            Self { dir, _lock: lock }
         }
 
         /// Point the override at a deliberately-missing path. Used for
@@ -350,16 +355,13 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("missing.json");
             skills_catalogue_test_override_set(path);
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
+            Self { dir, _lock: lock }
         }
 
         /// The tempdir root. `materialized_skills_dir()` resolves to
         /// `<root>/skills` because the catalogue override lives at `<root>/…`.
         fn root(&self) -> &std::path::Path {
-            self._dir.path()
+            self.dir.path()
         }
 
         /// Stage a materialized skill at `<root>/skills/<name>/SKILL.md` (the

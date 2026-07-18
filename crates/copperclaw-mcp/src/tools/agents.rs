@@ -718,9 +718,9 @@ pub mod delegate_batch {
         // successful build reports the parent still needs to see) — with a
         // top-level `merge_blocked` flag the parent turn keys off.
         let gate = evaluate_review_gate(&reviewer_names, &outcome);
-        // M22 C5 metric wishes (recorded for the M1 rider): reviewers
-        // dispatched (`reviewer_names.len()`) and whether the batch was
-        // merge-blocked (`gate.blocked`).
+        // M22 C5 metrics: reviewers dispatched this batch + the merge-gate verdict.
+        copperclaw_metrics::add_review_batch_reviewers(reviewer_names.len() as u64);
+        copperclaw_metrics::inc_review_merge_gate(if gate.blocked { "blocked" } else { "passed" });
         let mut body = serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}));
         if let serde_json::Value::Object(map) = &mut body {
             map.insert("merge_blocked".into(), serde_json::json!(gate.blocked));

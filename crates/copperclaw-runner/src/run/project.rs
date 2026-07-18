@@ -425,6 +425,10 @@ fn origin_remote_url(repo: &Path) -> Option<String> {
 /// touching the attach flow.
 pub async fn trigger_symbol_index(repo: &Path) {
     let outcome = crate::run::lsp::build_symbol_index(repo).await;
+    // M22 C3 metric: one build per attach, labelled by backend, with the
+    // symbol count observed.
+    copperclaw_metrics::inc_symbol_index_build(outcome.backend.label());
+    copperclaw_metrics::observe_symbol_index_symbols(outcome.symbols_indexed as u64);
     tracing::info!(
         target: "copperclaw_runner",
         repo = %repo.display(),
@@ -511,6 +515,11 @@ pub async fn attach_project(repo: &Path) -> AttachSummary {
         chrono::Utc::now().to_rfc3339().as_bytes(),
     )
     .await;
+
+    // M22 C2 metric: count one genuine attach + observe how many verify stages
+    // were inferred from the repo's manifests.
+    copperclaw_metrics::inc_repo_attach();
+    copperclaw_metrics::observe_repo_attach_verify_stages_inferred(stages.len() as u64);
 
     tracing::info!(
         target: "copperclaw_runner",

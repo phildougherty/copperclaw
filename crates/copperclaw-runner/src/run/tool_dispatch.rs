@@ -313,6 +313,9 @@ pub(super) async fn invoke_tool(
         }
         AutonomyVerdict::Blocked(reason) => {
             tracing::info!(tool = %call.name, %reason, "autonomous action outside task grant scope");
+            // M22 A2 metric: an ungranted / out-of-scope autonomous action was
+            // blocked and falls to read-then-propose.
+            copperclaw_metrics::inc_autonomous_action("blocked_proposed");
             return (reason, Vec::new(), true);
         }
     }
@@ -343,6 +346,8 @@ pub(super) async fn invoke_tool(
     // charged (block-not-charge).
     if let Some(grant) = &granted_fire {
         charge_grant_fire_once(deps, grant).await;
+        // M22 A2 metric: a granted, in-scope autonomous action was taken.
+        copperclaw_metrics::inc_autonomous_action("taken");
     }
     // M17 session-preview tools (`expose_preview` / `close_preview`) are
     // host-owned but ride the SAME host-broker relay as external MCP: the
