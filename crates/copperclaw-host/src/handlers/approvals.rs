@@ -743,6 +743,15 @@ fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, E
         Ok(written) => {
             // M19 A4: dedicated saved/rejected counter at the true write site.
             copperclaw_metrics::inc_skills_saved("saved");
+            // M22 S3 metric: observe the effective version persisted (1 on a
+            // first save, N+1 on a re-save). `save_group_skill` writes the
+            // version but returns only the path, so read it back from the
+            // group's listing; a read hiccup simply skips the observation.
+            if let Ok(listing) = copperclaw_skills::list_group_skills(&dest) {
+                if let Some(entry) = listing.iter().find(|s| s.name == name) {
+                    copperclaw_metrics::observe_skill_version_saved(entry.version);
+                }
+            }
             written
         }
         // A well-formed but invalid skill (bad frontmatter, name mismatch,
@@ -821,6 +830,9 @@ fn apply_task_grant(
         },
     )
     .map_err(db_err)?;
+
+    // M22 A1 metric: an operator-approved grant persisted.
+    copperclaw_metrics::inc_task_grant("approved");
 
     Ok(json!({
         "kind": "task_grant",

@@ -4293,6 +4293,10 @@ fn apply_goal(
                     .parse()
                     .map_err(|e: String| copperclaw_db::DbError::invariant(e))?;
                 goals::set_status(central, &id, status)?;
+                // M22 A3 metric: count goal completions / abandonments.
+                if status.is_terminal() {
+                    copperclaw_metrics::inc_goal_status(status.as_str());
+                }
             }
             if let Some(note) = str_field("progress") {
                 goals::record_progress(
@@ -4302,6 +4306,8 @@ fn apply_goal(
                     &note,
                     i64_field("progress_tokens"),
                 )?;
+                // M22 A3 metric: a goal progress entry was recorded.
+                copperclaw_metrics::inc_goal_progress_recorded();
             }
             Ok(())
         }
@@ -4428,12 +4434,22 @@ fn apply_grant_consume(
     for _ in 0..fires {
         task_grants::consume_fire(central, grant_id, now)?;
     }
+    // M22 A2 (host half) metric: grant fires debited after an autonomous action.
+    if let Ok(n) = u64::try_from(fires) {
+        if n > 0 {
+            copperclaw_metrics::add_grant_fires_consumed(n);
+        }
+    }
 
     // Optional token spend. `consume_tokens` rejects negatives itself; we only
     // call it for a positive count.
     if let Some(tokens) = payload.get("tokens").and_then(serde_json::Value::as_i64) {
         if tokens > 0 {
             task_grants::consume_tokens(central, grant_id, tokens, now)?;
+            // M22 A2 (host half) metric: grant token budget debited.
+            if let Ok(t) = u64::try_from(tokens) {
+                copperclaw_metrics::add_grant_tokens_consumed(t);
+            }
         }
     }
     Ok(())

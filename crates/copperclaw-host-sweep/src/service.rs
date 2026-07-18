@@ -533,6 +533,15 @@ impl SweepService {
                 () = tokio::time::sleep(interval) => {
                     match self.run_once_actuated().await {
                         Ok(report) => {
+                            // M22 A3 metrics: consume the sweep report's goal
+                            // fan-out counts once here (one site covers both
+                            // counters). No-ops when the pass fired nothing.
+                            copperclaw_metrics::add_goal_checkins_fired(
+                                report.goal_checkins_fired.len() as u64,
+                            );
+                            copperclaw_metrics::add_goals_budget_paused(
+                                report.goals_budget_paused.len() as u64,
+                            );
                             if !report.is_empty() {
                                 tracing::info!(
                                     target: "copperclaw_host_sweep",

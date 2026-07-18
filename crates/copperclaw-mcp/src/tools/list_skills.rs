@@ -123,12 +123,18 @@ pub async fn handle(
 ) -> Result<CallToolResult, ToolError> {
     let path = catalogue_path();
     let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
+        Ok(b) => {
+            // M22 S3 metric: a catalogue-backed (callable-mode) list.
+            copperclaw_metrics::inc_skills_listed("catalogue");
+            b
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // Inline-skills mode: no catalogue on disk. Return an empty list
             // with a note rather than an error — a "list" verb answering
             // "nothing enumerable here, and here's why" is friendlier and more
             // actionable than a failure.
+            // M22 S3 metric: an inline-mode (no catalogue) list.
+            copperclaw_metrics::inc_skills_listed("inline_empty");
             return Ok(success_json(&ListSkillsResult {
                 skills: Vec::new(),
                 note: Some(format!(

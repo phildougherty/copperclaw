@@ -2046,6 +2046,402 @@ pub fn set_sweep_last_run_timestamp(unix_secs: i64) {
     gauge!(SWEEP_LAST_RUN_TIMESTAMP).set(unix_secs as f64);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// M22 metrics rider (card M1) — one sweep of the metric "wishes" the merged M22
+// cards (Wave 1 C1-C6, Wave 2 A1-A5, Wave 3 S1-S4) recorded in their PR
+// descriptions, in-code markers (`// M1 metric wish`, `// M22 <card> metric`),
+// and the plan's `## M1. Metrics rider` section. No other M22 card touches this
+// crate; names/labels mirror each card's wish where one exists. The emit call
+// sites live in the crate each wish named (noted per helper). Grouped by card.
+//
+// Where a wish enumerated label values that have no clean production emit site
+// yet (e.g. A1 `revoked`/`expired` — no production revoke caller / no expiry
+// sweep), the helper still takes the label as `&str` so the family is defined
+// once and the missing arms light up for free when a real site lands. No helper
+// below is left unwired.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── C1 — post-edit verify hook (runs the format/typecheck path over a just-
+// edited file and feeds the digest back). Emitted from
+// `copperclaw-mcp/src/tools/diagnostics.rs` (`post_edit_verify`). ────────────
+pub const POST_EDIT_VERIFY_TOTAL: &str = "copperclaw_post_edit_verify_total";
+pub const POST_EDIT_VERIFY_FINDINGS: &str = "copperclaw_post_edit_verify_findings";
+
+/// Increment `copperclaw_post_edit_verify_total{tool, outcome}` — one post-edit
+/// verify attempt over a just-mutated file. `tool` is the resolved checker
+/// (`eslint`/`tsc`/`ruff`, or `none` when no checker fits). `outcome` is one of
+/// `flagged` (the checker found error(s)/warning(s) — a digest was fed back),
+/// `clean` (checker ran, nothing to report), `not_available` (the checker
+/// binary is not installed in this image), `unsupported` (no checker fits the
+/// file type), `disabled` (the opt-out flag is set), or `error` (the checker run
+/// could not be launched/parsed). Emitted from
+/// `copperclaw-mcp/src/tools/diagnostics.rs` (`post_edit_verify`).
+pub fn inc_post_edit_verify(tool: &str, outcome: &str) {
+    counter!(
+        POST_EDIT_VERIFY_TOTAL,
+        "tool" => tool.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record `copperclaw_post_edit_verify_findings` — the per-run error+warning
+/// count for a post-edit verify that flagged (observed only on the `flagged`
+/// outcome). Emitted from `copperclaw-mcp/src/tools/diagnostics.rs`.
+pub fn observe_post_edit_verify_findings(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(POST_EDIT_VERIFY_FINDINGS).record(count as f64);
+}
+
+// ── C2 — open/attach an existing repository. Attach flow emits from
+// `copperclaw-runner/src/run/project.rs` (`attach_project`); the host-side
+// detection notice from `copperclaw-host/.../cold_start.rs`. ─────────────────
+pub const REPO_ATTACH_TOTAL: &str = "copperclaw_repo_attach_total";
+pub const REPO_ATTACH_VERIFY_STAGES_INFERRED: &str =
+    "copperclaw_repo_attach_verify_stages_inferred";
+pub const REPO_ATTACH_DETECTED_TOTAL: &str = "copperclaw_repo_attach_detected_total";
+
+/// Increment `copperclaw_repo_attach_total` — the runner attached an existing
+/// repository as the working project (inferred its verify stages, seeded the
+/// decision log, triggered the C3 symbol index, dropped the attached marker).
+/// Counted once per genuine attach (a re-attach of an already-attached repo is
+/// a no-op and is NOT counted). Emitted from
+/// `copperclaw-runner/src/run/project.rs` (`attach_project`).
+pub fn inc_repo_attach() {
+    counter!(REPO_ATTACH_TOTAL).increment(1);
+}
+
+/// Record `copperclaw_repo_attach_verify_stages_inferred` — how many verify
+/// stages the attach flow inferred from a repo's manifests
+/// (`package.json`/`Makefile`/`Cargo.toml`/`pyproject`). Zero means nothing was
+/// inferred (the repo carries no recognized build/test entrypoint). Emitted
+/// from `copperclaw-runner/src/run/project.rs` (`attach_project`).
+pub fn observe_repo_attach_verify_stages_inferred(stages: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(REPO_ATTACH_VERIFY_STAGES_INFERRED).record(stages as f64);
+}
+
+/// Increment `copperclaw_repo_attach_detected_total` — the host's cold-start
+/// path noticed an attachable repository handed into a session's `/data`. A
+/// host-side companion to the runner's [`inc_repo_attach`] (which counts the
+/// actual attach). Emitted from
+/// `copperclaw-host/src/container_manager/cold_start.rs`
+/// (`note_attachable_repos`).
+pub fn inc_repo_attach_detected() {
+    counter!(REPO_ATTACH_DETECTED_TOTAL).increment(1);
+}
+
+// ── C3 — `find_symbol` + symbol-index build. Emitted from
+// `copperclaw-mcp/src/tools/find_symbol.rs` (lookup) and
+// `copperclaw-runner/src/run/project.rs` (`trigger_symbol_index`). ───────────
+pub const FIND_SYMBOL_TOTAL: &str = "copperclaw_find_symbol_total";
+pub const SYMBOL_INDEX_BUILDS_TOTAL: &str = "copperclaw_symbol_index_builds_total";
+pub const SYMBOL_INDEX_SYMBOLS: &str = "copperclaw_symbol_index_symbols";
+
+/// Increment `copperclaw_find_symbol_total{definition_source}` — one
+/// `find_symbol` invocation, labelled by which backend tier resolved the
+/// definition: `ctags-index`, `ctags-ondemand`, `grep`, or `none` (no
+/// definition found). Emitted from
+/// `copperclaw-mcp/src/tools/find_symbol.rs` (`run_find_symbol`).
+pub fn inc_find_symbol(definition_source: &str) {
+    counter!(FIND_SYMBOL_TOTAL, "definition_source" => definition_source.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_symbol_index_builds_total{backend}` — one symbol-index
+/// build over an attached repo; `backend` is `language-server-assisted`,
+/// `ctags`, or `none` (no index builder available). Emitted from
+/// `copperclaw-runner/src/run/project.rs` (`trigger_symbol_index`).
+pub fn inc_symbol_index_build(backend: &str) {
+    counter!(SYMBOL_INDEX_BUILDS_TOTAL, "backend" => backend.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_symbol_index_symbols` — the number of symbols an index
+/// build wrote (0 when no index was built). Emitted alongside
+/// [`inc_symbol_index_build`] from `copperclaw-runner/src/run/project.rs`.
+pub fn observe_symbol_index_symbols(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(SYMBOL_INDEX_SYMBOLS).record(count as f64);
+}
+
+// ── C4 — screenshot-diff visual regression. Emitted from
+// `copperclaw-mcp/src/tools/ui_screenshot.rs` (`visual::regression_note`). ───
+pub const VISUAL_REGRESSION_FLAGS_TOTAL: &str = "copperclaw_visual_regression_flags_total";
+pub const VISUAL_REGRESSION_BASELINES_TOTAL: &str = "copperclaw_visual_regression_baselines_total";
+
+/// Increment `copperclaw_visual_regression_flags_total{viewport,
+/// dimensions_changed}` — a post-edit screenshot diff flagged a visual
+/// regression against this view's stored baseline. `viewport` is the capture
+/// preset (`desktop`/`mobile`); `dimensions_changed` is `true` when the viewport
+/// dimensions themselves changed (a strong layout-regression signal) vs a
+/// within-frame pixel shift. Emitted from
+/// `copperclaw-mcp/src/tools/ui_screenshot.rs` (`visual::regression_note`).
+pub fn inc_visual_regression_flag(viewport: &str, dimensions_changed: bool) {
+    counter!(
+        VISUAL_REGRESSION_FLAGS_TOTAL,
+        "viewport" => viewport.to_owned(),
+        "dimensions_changed" => if dimensions_changed { "true" } else { "false" },
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_visual_regression_baselines_total` — a view's baseline
+/// PNG was (re)written after a successful capture (the next diff will compare
+/// against it). Emitted from
+/// `copperclaw-mcp/src/tools/ui_screenshot.rs` (`visual::regression_note`).
+pub fn inc_visual_regression_baseline() {
+    counter!(VISUAL_REGRESSION_BASELINES_TOTAL).increment(1);
+}
+
+// ── C5 — reviewer role in `delegate_batch`. Emitted from
+// `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch::handle`). ───────────
+pub const REVIEW_BATCH_REVIEWERS_TOTAL: &str = "copperclaw_review_batch_reviewers_total";
+pub const REVIEW_MERGE_GATE_TOTAL: &str = "copperclaw_review_merge_gate_total";
+
+/// Add `n` to `copperclaw_review_batch_reviewers_total` — the count of reviewer
+/// workers dispatched in one `delegate_batch` call (0 when the batch carried no
+/// reviewer, in which case this is not called). Emitted from
+/// `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch::handle`).
+pub fn add_review_batch_reviewers(n: u64) {
+    counter!(REVIEW_BATCH_REVIEWERS_TOTAL).increment(n);
+}
+
+/// Increment `copperclaw_review_merge_gate_total{outcome}` — the merge-gate
+/// verdict a reviewer-bearing batch computed; `outcome` is `blocked` (at least
+/// one reviewer blocked, or returned an unrecognized verdict) or `passed` (all
+/// reviewers cleared the diff). Emitted from
+/// `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch::handle`).
+pub fn inc_review_merge_gate(outcome: &str) {
+    counter!(REVIEW_MERGE_GATE_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── C6 — see→fix (screenshot) completion gate. Mirrors
+// [`inc_review_gate_completion`]. Emitted from
+// `copperclaw-mcp/src/tools/todo.rs` (the C6 gate in `update::handle`). ──────
+pub const SEE_FIX_GATE_COMPLETION_TOTAL: &str = "copperclaw_see_fix_gate_completion_total";
+
+/// Increment `copperclaw_see_fix_gate_completion_total{outcome}` — a
+/// final/delivery todo of a UI task crossed the see→fix (post-fix screenshot)
+/// gate; `outcome` is `refused_needs_screenshot` (blocked this attempt, cycles
+/// remain), `blocked_cycle_cap` (the see→fix cap was burned — the todo
+/// auto-transitioned to `blocked`), or `passed` (no pending post-fix screenshot,
+/// completion allowed). The see→fix analogue of the verify + review gates'
+/// [`inc_review_gate_completion`]. Emitted from
+/// `copperclaw-mcp/src/tools/todo.rs` (`update::handle`).
+pub fn inc_see_fix_gate_completion(outcome: &str) {
+    counter!(SEE_FIX_GATE_COMPLETION_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── A1 — task capability grants (approval-gated authoring). Emitted from
+// `copperclaw-host/src/handlers/approvals.rs` (`apply_task_grant`). ──────────
+pub const TASK_GRANTS_TOTAL: &str = "copperclaw_task_grants_total";
+
+/// Increment `copperclaw_task_grants_total{outcome}` — a task capability grant
+/// lifecycle event. `outcome` is `approved` (an operator approved a pending
+/// grant card and the bounded `task_grants` row persisted). Reserved for future
+/// sites: `issued` (grant proposal raised), `revoked` (a revoke path — no
+/// production caller yet), and `expired` (an expiry sweep — none exists; grants
+/// lapse lazily via `effective_grant`). Emitted from
+/// `copperclaw-host/src/handlers/approvals.rs` (`apply_task_grant`).
+pub fn inc_task_grant(outcome: &str) {
+    counter!(TASK_GRANTS_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── A2 — enforce grants at the autonomy gate. Emitted from
+// `copperclaw-runner/src/run/tool_dispatch.rs` (`invoke_tool`). ──────────────
+pub const AUTONOMOUS_ACTIONS_TOTAL: &str = "copperclaw_autonomous_actions_total";
+
+/// Increment `copperclaw_autonomous_actions_total{outcome}` — an autonomous
+/// (scheduled/heartbeat) turn's attempt at a credentialed external action met
+/// the grant gate. `outcome` is `taken` (a live grant authorized THIS action
+/// and a fire was charged — the agent acted) or `blocked_proposed` (no grant, or
+/// the action was out of the grant's scope — the action stays blocked and falls
+/// to read-then-propose). Emitted from
+/// `copperclaw-runner/src/run/tool_dispatch.rs` (`invoke_tool`).
+pub fn inc_autonomous_action(outcome: &str) {
+    counter!(AUTONOMOUS_ACTIONS_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── A2 (host half) — grant snapshotting + fire/token consumption. Emitted from
+// `copperclaw-host/.../tasks_snapshot.rs` (`write_grant_snapshot`) and
+// `copperclaw-host-delivery/src/service.rs` (`apply_grant_consume`). ─────────
+pub const GRANTS_SNAPSHOTTED_TOTAL: &str = "copperclaw_grants_snapshotted_total";
+pub const GRANT_FIRES_CONSUMED_TOTAL: &str = "copperclaw_grant_fires_consumed_total";
+pub const GRANT_TOKENS_CONSUMED_TOTAL: &str = "copperclaw_grant_tokens_consumed_total";
+
+/// Increment `copperclaw_grants_snapshotted_total{outcome}` — the host wrote (or
+/// removed) the per-session `grant.json` the runner's autonomy gate reads.
+/// `outcome` is `written` (a live grant was snapshotted — the gate MAY open),
+/// `removed_no_grant` (the firing task has no live grant — snapshot removed,
+/// gate stays closed), `removed_no_firing_task` (no pending autonomous fire), or
+/// `removed_read_error` (a DB read failed — fail closed). Emitted from
+/// `copperclaw-host/src/container_manager/tasks_snapshot.rs`
+/// (`write_grant_snapshot`).
+pub fn inc_grants_snapshotted(outcome: &str) {
+    counter!(GRANTS_SNAPSHOTTED_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Add `n` to `copperclaw_grant_fires_consumed_total` — the number of grant
+/// fires the host debited from a `task_grants` row after an autonomous action
+/// (one per `consume_fire`). Emitted from
+/// `copperclaw-host-delivery/src/service.rs` (`apply_grant_consume`).
+pub fn add_grant_fires_consumed(n: u64) {
+    counter!(GRANT_FIRES_CONSUMED_TOTAL).increment(n);
+}
+
+/// Add `tokens` to `copperclaw_grant_tokens_consumed_total` — grant token budget
+/// the host debited after an autonomous action carried a token spend. Emitted
+/// from `copperclaw-host-delivery/src/service.rs` (`apply_grant_consume`).
+pub fn add_grant_tokens_consumed(tokens: u64) {
+    counter!(GRANT_TOKENS_CONSUMED_TOTAL).increment(tokens);
+}
+
+// ── A3 — first-class long-running goals. Counts flow from the sweep report
+// (`copperclaw-host-sweep/src/service.rs` run loop) + the goal check-in scan
+// (`checks/goals.rs`); status/progress from the `update_goal` apply
+// (`copperclaw-host-delivery/src/service.rs`, `apply_goal`). ─────────────────
+pub const GOAL_CHECKINS_FIRED_TOTAL: &str = "copperclaw_goal_checkins_fired_total";
+pub const GOALS_BUDGET_PAUSED_TOTAL: &str = "copperclaw_goals_budget_paused_total";
+pub const GOAL_STATUS_TOTAL: &str = "copperclaw_goal_status_total";
+pub const GOAL_PROGRESS_RECORDED_TOTAL: &str = "copperclaw_goal_progress_recorded_total";
+pub const ACTIVE_GOALS: &str = "copperclaw_active_goals";
+
+/// Add `n` to `copperclaw_goal_checkins_fired_total` — goal check-in wakes the
+/// sweep synthesised this pass (one per due `active` goal). Emitted from the
+/// sweep run loop consuming `SweepReport.goal_checkins_fired`
+/// (`copperclaw-host-sweep/src/service.rs`).
+pub fn add_goal_checkins_fired(n: u64) {
+    counter!(GOAL_CHECKINS_FIRED_TOTAL).increment(n);
+}
+
+/// Add `n` to `copperclaw_goals_budget_paused_total` — goals the sweep paused
+/// this pass because their grant-backed budget was exhausted. Emitted from the
+/// sweep run loop consuming `SweepReport.goals_budget_paused`.
+pub fn add_goals_budget_paused(n: u64) {
+    counter!(GOALS_BUDGET_PAUSED_TOTAL).increment(n);
+}
+
+/// Increment `copperclaw_goal_status_total{status}` — a goal reached a terminal
+/// status via `update_goal`; `status` is `completed` or `abandoned`. Emitted
+/// from `copperclaw-host-delivery/src/service.rs` (`apply_goal`, the status
+/// transition arm).
+pub fn inc_goal_status(status: &str) {
+    counter!(GOAL_STATUS_TOTAL, "status" => status.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_goal_progress_recorded_total` — an `update_goal` call
+/// recorded a progress note against a goal. Emitted from
+/// `copperclaw-host-delivery/src/service.rs` (`apply_goal`, the progress arm).
+pub fn inc_goal_progress_recorded() {
+    counter!(GOAL_PROGRESS_RECORDED_TOTAL).increment(1);
+}
+
+/// Set `copperclaw_active_goals` — the count of `active` goals observed this
+/// sweep pass. A gauge over the live active-goal population. Emitted from
+/// `copperclaw-host-sweep/src/checks/goals.rs` (`check`, once per pass).
+pub fn set_active_goals(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!(ACTIVE_GOALS).set(count as f64);
+}
+
+// ── A4 — condition/event check-ins. Emitted from
+// `copperclaw-host-sweep/src/checks/condition_checkin.rs` (`check`). ─────────
+pub const CONDITION_CHECKINS_FIRED_TOTAL: &str = "copperclaw_condition_checkins_fired_total";
+
+/// Increment `copperclaw_condition_checkins_fired_total{kind}` — a stored
+/// HEARTBEAT-style condition fired a check-in wake on its rising edge; `kind` is
+/// `pending_inbound`, `idle`, or `flag`. Emitted from
+/// `copperclaw-host-sweep/src/checks/condition_checkin.rs` (`check`) — the site
+/// where the fired condition's kind is known (the `SweepReport` fanout carries
+/// only the series id, not the kind).
+pub fn inc_condition_checkin_fired(kind: &str) {
+    counter!(CONDITION_CHECKINS_FIRED_TOTAL, "kind" => kind.to_owned()).increment(1);
+}
+
+// ── A5 — recurrence consolidation into the central `tasks` scheduler. Emitted
+// from `copperclaw-host-sweep/src/checks/recurrence.rs` (`check`). ───────────
+pub const RECURRENCE_CONSOLIDATED_TOTAL: &str = "copperclaw_recurrence_consolidated_total";
+
+/// Increment `copperclaw_recurrence_consolidated_total{outcome}` — a per-session
+/// self-replicating recurrence series was consolidated into the central `tasks`
+/// scheduler; `outcome` is `created` (a new central task was inserted for the
+/// series) or `already_present` (a task already existed for this series — the
+/// migration is idempotent). Emitted from
+/// `copperclaw-host-sweep/src/checks/recurrence.rs` (`check`).
+pub fn inc_recurrence_consolidated(outcome: &str) {
+    counter!(RECURRENCE_CONSOLIDATED_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── S1 — materialize skills into the container. Emitted from
+// `copperclaw-host/src/container_manager/cold_start.rs`
+// (`materialize_session_skills`). ────────────────────────────────────────────
+pub const SKILLS_MATERIALIZED_TOTAL: &str = "copperclaw_skills_materialized_total";
+
+/// Add `n` to `copperclaw_skills_materialized_total{agent_group}` — skill dirs
+/// symlinked into a session container's `/data/skills` at cold start (so a
+/// skill's `scripts/`/`data/` reach the sandbox). Labelled by agent group so an
+/// operator can see how many runnable skills each group's spawns receive.
+/// Emitted from `copperclaw-host/src/container_manager/cold_start.rs`
+/// (`materialize_session_skills`).
+pub fn add_skills_materialized(agent_group: &str, n: u64) {
+    counter!(SKILLS_MATERIALIZED_TOTAL, "agent_group" => agent_group.to_owned()).increment(n);
+}
+
+// ── S2 — relevance-narrowed skill selection. Emitted from
+// `copperclaw-host/src/container_manager/prompt.rs` (inline-skills builder). ─
+pub const SKILLS_RELEVANCE_FILTERED_TOTAL: &str = "copperclaw_skills_relevance_filtered_total";
+
+/// Add `n` to `copperclaw_skills_relevance_filtered_total` — skills dropped from
+/// the inline system prompt by a `SkillsSelector::Relevant` narrowing (the
+/// registry total minus the selected count), versus `All` which inlines every
+/// skill. Emitted from `copperclaw-host/src/container_manager/prompt.rs` when the
+/// host resolves a `Relevant` selector for the inline prompt.
+pub fn add_skills_relevance_filtered(n: u64) {
+    counter!(SKILLS_RELEVANCE_FILTERED_TOTAL).increment(n);
+}
+
+// ── S3 — skill versioning + `list_skills`. Emitted from
+// `copperclaw-mcp/src/tools/list_skills.rs` (`handle`) and
+// `copperclaw-host/src/handlers/approvals.rs` (the `save_skill` write). ──────
+pub const SKILLS_LISTED_TOTAL: &str = "copperclaw_skills_listed_total";
+pub const SKILL_VERSION_SAVED: &str = "copperclaw_skill_version_saved";
+
+/// Increment `copperclaw_skills_listed_total{mode}` — a `list_skills` call
+/// answered; `mode` is `catalogue` (callable mode — a catalogue file existed and
+/// was read) or `inline_empty` (inline mode — no catalogue on disk, an empty
+/// list with an explanatory note was returned). Emitted from
+/// `copperclaw-mcp/src/tools/list_skills.rs` (`handle`).
+pub fn inc_skills_listed(mode: &str) {
+    counter!(SKILLS_LISTED_TOTAL, "mode" => mode.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_skill_version_saved` — the effective version persisted by
+/// an approval-gated `save_skill` (1 on a first save; N+1 on a re-save that
+/// bumped an on-disk version N). Emitted from
+/// `copperclaw-host/src/handlers/approvals.rs` (after `save_group_skill`).
+pub fn observe_skill_version_saved(version: u32) {
+    histogram!(SKILL_VERSION_SAVED).record(f64::from(version));
+}
+
+// ── S4 — `tools:` frontmatter narrowing under inline skills mode. Emitted from
+// `copperclaw-mcp/src/tools/load_skill.rs` (`activate_inline_skill_scope`). ──
+pub const LOAD_SKILL_INLINE_SCOPED_TOTAL: &str = "copperclaw_load_skill_inline_scoped_total";
+
+/// Increment `copperclaw_load_skill_inline_scoped_total{skill, scope}` — an
+/// inline-mode `load_skill` resolved a materialized skill's tool scope; `scope`
+/// is `narrowed` (the skill declared a `tools:`/`allowed-tools:` allowlist that
+/// now narrows dispatch) or `cleared` (the skill declared no scope — any prior
+/// narrowing was cleared). Complements the pre-existing [`inc_load_skill`]
+/// (which counts every inline/callable invocation). Emitted from
+/// `copperclaw-mcp/src/tools/load_skill.rs` (`activate_inline_skill_scope`).
+pub fn inc_load_skill_inline_scoped(skill: &str, scope: &str) {
+    counter!(
+        LOAD_SKILL_INLINE_SCOPED_TOTAL,
+        "skill" => skill.to_owned(),
+        "scope" => scope.to_owned(),
+    )
+    .increment(1);
+}
+
 // ── Address parsing ────────────────────────────────────────────────────────
 
 /// Parse `COPPERCLAW_METRICS_ADDR`.  Accepts:

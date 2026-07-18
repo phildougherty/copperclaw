@@ -853,6 +853,10 @@ pub mod update {
                                 let remaining = crate::tools::self_review::SEE_FIX_CYCLE_CAP
                                     .saturating_sub(new_cycles);
                                 let display = project_root.display();
+                                // M22 C6 metric: mirrors `inc_review_gate_completion`.
+                                copperclaw_metrics::inc_see_fix_gate_completion(
+                                    "refused_needs_screenshot",
+                                );
                                 return Err(ToolError::Validation(format!(
                                     "cannot mark todo {} completed: it is the final/delivery todo, \
                                      and `{display}` is a UI task with changes since its last \
@@ -875,6 +879,11 @@ pub mod update {
                                 project_root.display(),
                                 crate::tools::self_review::SEE_FIX_CYCLE_CAP
                             ));
+                            copperclaw_metrics::inc_see_fix_gate_completion("blocked_cycle_cap");
+                        } else {
+                            // No pending post-fix screenshot: the see→fix gate is
+                            // satisfied and the completion may proceed.
+                            copperclaw_metrics::inc_see_fix_gate_completion("passed");
                         }
                     }
                 }

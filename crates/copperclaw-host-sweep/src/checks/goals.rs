@@ -122,6 +122,11 @@ pub fn check(
             next_fire: now,
         });
     }
+    // M22 A3 metric: refresh the active-goals gauge once per pass. Best-effort —
+    // a read error leaves the prior gauge value in place.
+    if let Ok(active) = goals::count_active(central) {
+        copperclaw_metrics::set_active_goals(active);
+    }
     Ok(report)
 }
 

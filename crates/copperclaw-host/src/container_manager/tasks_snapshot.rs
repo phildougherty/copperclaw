@@ -138,6 +138,7 @@ pub fn write_grant_snapshot(central: &CentralDb, session_root: &Path, now: DateT
     let Some(task_id) = firing_task_id_from_inbound(session_root) else {
         // No scheduled/autonomous fire pending → no grant to authorize.
         remove_stale_grant(&path);
+        copperclaw_metrics::inc_grants_snapshotted("removed_no_firing_task");
         return;
     };
 
@@ -148,12 +149,14 @@ pub fn write_grant_snapshot(central: &CentralDb, session_root: &Path, now: DateT
             // remove any stale snapshot and leave the gate closed.
             warn!(?err, task_id = %task_id, "grant_snapshot: effective_grant read failed; failing closed");
             remove_stale_grant(&path);
+            copperclaw_metrics::inc_grants_snapshotted("removed_read_error");
             return;
         }
     };
     let Some(e) = effective else {
         // No live grant (none / revoked / expired / exhausted).
         remove_stale_grant(&path);
+        copperclaw_metrics::inc_grants_snapshotted("removed_no_grant");
         return;
     };
 
@@ -177,6 +180,10 @@ pub fn write_grant_snapshot(central: &CentralDb, session_root: &Path, now: DateT
     };
     if let Err(err) = std::fs::write(&path, bytes) {
         warn!(?err, path = %path.display(), "grant_snapshot: write failed");
+    } else {
+        // M22 A2 (host half) metric: a live grant was snapshotted — the runner's
+        // autonomy gate MAY open for this fire.
+        copperclaw_metrics::inc_grants_snapshotted("written");
     }
 }
 

@@ -644,6 +644,12 @@ pub(crate) fn build_skill_system_prompt(
     };
 
     let selected = registry.list_for_group(agent_group_id, selector);
+    // M22 S2 metric: when a `Relevant` selector narrows the inline prompt, count
+    // how many skills it dropped versus `All` (registry total − selected).
+    if matches!(selector, copperclaw_skills::SkillsSelector::Relevant { .. }) {
+        let dropped = registry.len().saturating_sub(selected.len());
+        copperclaw_metrics::add_skills_relevance_filtered(dropped as u64);
+    }
     if selected.is_empty() {
         return String::new();
     }

@@ -143,6 +143,15 @@ async fn activate_inline_skill_scope(
     let allowed_tools = fm
         .declared_tools()
         .map(|raw| copperclaw_skills::normalize_allowed_tools(&raw));
+    // M22 S4 metric: a sibling of the existing inline/callable `inc_load_skill`
+    // count — this one records whether the loaded skill actually NARROWED the
+    // tool surface (declared a scope) or CLEARED any prior narrowing.
+    let scope = if allowed_tools.is_some() {
+        "narrowed"
+    } else {
+        "cleared"
+    };
+    copperclaw_metrics::inc_load_skill_inline_scoped(name, scope);
     ctx.set_active_skill_allowed_tools(allowed_tools);
 
     // The body is already inlined into the system prompt; echo it back (matching

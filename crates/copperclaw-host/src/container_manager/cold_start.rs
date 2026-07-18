@@ -297,13 +297,16 @@ const MAX_GIT_CONFIG_BYTES: u64 = 256 * 1024;
 /// sitting directly under `session_root`. Best-effort and side-effect-free
 /// beyond the log + metric: never touches the repos, never fails a spawn.
 ///
-/// M22 C2 (M1 metric wish): a `copperclaw_repo_attach_detected_total`
-/// counter incremented per attachable repo detected here would let
-/// operators see cold starts that reopen an existing codebase.
+/// M22 C2: increments `copperclaw_repo_attach_detected_total` per attachable
+/// repo detected here, so operators can see cold starts that reopen an existing
+/// codebase (the host-side companion to the runner's `copperclaw_repo_attach_total`).
 fn note_attachable_repos(session_root: &std::path::Path) {
     let repos = scan_attachable_repos(session_root);
     if repos.is_empty() {
         return;
+    }
+    for _ in &repos {
+        copperclaw_metrics::inc_repo_attach_detected();
     }
     let names: Vec<String> = repos
         .iter()
@@ -505,12 +508,14 @@ impl ContainerManager {
                     dest = %dest.display(),
                     "materialized selected skills into session /data/skills",
                 );
-                // M22 S1 (M1 metric wish): a
-                // `copperclaw_skills_materialized_total` counter incremented
-                // by `materialized` here (labelled by agent group) would let
-                // operators see how many skill dirs reach each container per
-                // spawn — the runnable-skills companion to S2's
+                // M22 S1 metric: `copperclaw_skills_materialized_total`, labelled
+                // by agent group, incremented by the count of skill dirs that
+                // reached this container — the runnable-skills companion to S2's
                 // relevance-filtered counter.
+                copperclaw_metrics::add_skills_materialized(
+                    &session.agent_group_id.as_uuid().to_string(),
+                    materialized as u64,
+                );
             }
             Err(err) => {
                 warn!(
