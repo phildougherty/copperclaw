@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 S4 — activate `tools:` frontmatter + inline-mode active-skill narrowing)
+
+- **`tools:` frontmatter is now a working tool allowlist.**
+  `crates/copperclaw-skills/src/frontmatter.rs` gains a `tools: Option<Vec<String>>`
+  field (sibling to S3's `version`) plus a `Frontmatter::declared_tools()`
+  accessor. `tools:` is a companion to `allowed-tools:` — both declare the tool
+  surface a skill needs. `parse` folds any `tools:` entries into `allowed_tools`
+  (union, order-preserving, de-duplicated), so the whole existing enforcement
+  pipeline (`Skill::allowed_tool_names` → skills catalogue → `load_skill` → the
+  runner's `ToolPolicy::with_active_skill` dispatch gate) scopes on `tools:` with
+  no change to `registry.rs`/`prompt.rs`. Was reserved-but-unused before this
+  card. A skill declaring neither key keeps `allowed_tools == None` and narrows
+  nothing — unchanged for all 41 shipped skills.
+- **Active-skill tool narrowing now works under inline (default) skills mode.**
+  Previously `load_skill` was inert in inline mode: with no `/data/skills.json`
+  catalogue it errored, so a skill could never scope the tool surface unless the
+  operator opted into callable mode. `crates/copperclaw-mcp/src/tools/load_skill.rs`
+  now, on catalogue-miss, reads the skill's materialized `SKILL.md`
+  (`/data/skills/<name>/`, staged by S1) and narrows dispatch to the skill's
+  declared tools (`allowed-tools:` ∪ `tools:`, normalized to copperclaw MCP
+  names) via the same `set_active_skill_allowed_tools` hook the callable path
+  uses. A skill with no declared scope clears any prior narrowing. Why: skills
+  should be able to scope the tool surface without forcing every operator off the
+  lowest-risk default mode (decision **e**).
+
+### Changed (M22 S4)
+
+- `crates/copperclaw-runner/src/run/tool_dispatch.rs`: the active-skill scope
+  read at the dispatch gate is now named and documented as skills-mode-agnostic
+  — the same `ToolContext::active_skill_allowed_tools()` narrowing applies in
+  inline mode (scope set from the materialized `SKILL.md`) exactly as in callable
+  mode (scope set from `skills.json`). No behavioural change to callable mode; a
+  regression test pins that an inline-activated `tools:` scope blocks
+  out-of-scope tools and admits in-scope ones at dispatch.
+
 ### Added (M22 S1 — Wave-3 MARQUEE: skills materialize into the container)
 
 - **Skills are now runnable, not just prose.** `copperclaw_skills::materialize`
