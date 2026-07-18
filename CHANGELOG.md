@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Preview links can advertise a stable off-LAN host (e.g. Tailscale).** When
+  `preview_bind` is `0.0.0.0`, the shareable `__preview` URL previously always
+  used the auto-detected `192.168.x` LAN IP, which is unreachable when the
+  operator is off their home network. `display_host`
+  (`crates/copperclaw-host/src/preview.rs`) now honors a new
+  `COPPERCLAW_PREVIEW_HOST` env var — set it to a stable name/IP by which the
+  machine is reachable from wherever the link is opened (e.g. a Tailscale
+  `MagicDNS` name `desk-1.tailXXXXXX.ts.net`) and preview URLs render that host
+  instead. The proxy still binds per `preview_bind` (0.0.0.0 already includes
+  the tailscale interface); only the advertised host changes. Bare host only
+  (no scheme/port); empty/unset falls back to LAN detection.
 - **Text-only models no longer wedge on a screenshot in the transcript.** When
   the active model is text-only and the conversation history carries an image
   block (a `ui_screenshot` / `view_image` result), an OpenRouter-style gateway
