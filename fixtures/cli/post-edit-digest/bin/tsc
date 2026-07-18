@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake `tsc` shim for the CX (M22 Wave-1) post-edit-digest replay fixture.
+#
+# The C1 post-edit verify hook (`diagnostics::post_edit_verify`) runs
+#   tsc --noEmit --pretty false <file>
+# in the touched file's directory and parses stdout with `parse_tsc_output`.
+# A real TypeScript compiler is not present in the replay/CI environment, so
+# this deterministic stand-in emits exactly one canonical TS2322 diagnostic
+# line for index.ts. `parse_tsc_output` turns it into a single Diagnostic and
+# `build_post_edit_digest` folds it into the digest that is fed back to the
+# model — byte-identical to the committed golden at
+# fixtures/diagnostics/post-edit-digest/recorded-digest.json.
+#
+# The fixture's test puts this dir on PATH via a subprocess re-exec (the same
+# seam the verify-gate fixtures use for COPPERCLAW_DATA_ROOT, since
+# forbid(unsafe_code) blocks std::env::set_var). Args are ignored on purpose:
+# the point is that the hook fires and the parsed digest reaches the model,
+# not that we reimplement tsc.
+echo "index.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'."

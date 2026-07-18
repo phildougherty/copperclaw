@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 CX — Wave-1 coding replay fixtures)
+- `fixtures/cli/post-edit-digest/` + `tests/replay.rs::cli_post_edit_digest_feeds_diagnostics_back`:
+  deterministic replay coverage for the C1 post-edit verify hook. A `write_file`
+  mutation of a `.ts` file fires the automatic post-edit typecheck; the fixture
+  ships a fake `tsc` shim (`bin/tsc`) placed on `PATH` via the same subprocess
+  re-exec seam the verify-gate fixtures use (forbid(unsafe_code) blocks
+  `std::env::set_var`), so the hook fires with no real toolchain present. The
+  test byte-diffs the four expected streams and asserts the fed-back
+  `post_edit_diagnostics` digest — including the `note` string byte-identical to
+  `fixtures/diagnostics/post-edit-digest/recorded-digest.json` — reached the
+  model in the captured provider request bodies.
+- `tests/replay.rs::visual_regression_fixtures_are_coherent`: a coherence guard
+  over the C4 `fixtures/visual_regression/` PNGs the in-crate screenshot-diff
+  tests depend on — pins their 8-bit depth, supported color types (0/2/6),
+  baseline/regressed same-dimensions-different-bytes invariant, and the RGB
+  no-alpha path. C4's `ui_screenshot` cannot be driven end-to-end through the
+  replay harness (it hard-requires a real in-container CDP chromium with no
+  byte-injection seam), so this guards the fixtures that back its deterministic
+  in-crate diff coverage instead.
+
 ### Added (M22 C6 — promote the see→fix loop to a runtime gate)
 
 - **See→fix (screenshot) gate**: the screenshot → critique → fix →

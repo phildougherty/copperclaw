@@ -1,0 +1,19 @@
+{
+  "name": "cli-post-edit-digest",
+  "channel": "cli",
+  "description": "M22 CX (Wave-1 coding X-rider) acceptance fixture for the C1 post-edit verify hook: a write_file mutation of a .ts file triggers the automatic post-edit typecheck, and the resulting diagnostics digest is fed back to the model in the write_file tool_result next turn. The typechecker is stubbed by a deterministic fake `tsc` shim placed on PATH via a subprocess re-exec (forbid(unsafe_code) blocks std::env::set_var), so the hook fires with no real toolchain in CI; the emitted digest is byte-identical to fixtures/diagnostics/post-edit-digest/recorded-digest.json. Scripted mock provider: write a BROKEN index.ts (turn 1), then a closing acknowledgement (turn 2) whose provider request body carries the fed-back digest. Registered in tests/replay.rs via the same re-exec seam the verify-gate fixtures use. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "max_tool_turns": 6,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

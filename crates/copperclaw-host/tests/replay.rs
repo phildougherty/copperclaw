@@ -3828,3 +3828,288 @@ async fn cli_operator_alert_delivered_and_silent_when_unconfigured() {
         "the chat reply and the alert stayed on separate targets"
     );
 }
+
+// ---- M22 CX (Wave 1): the C1 post-edit verify hook feeds a diagnostics
+// digest back to the model ----
+//
+// After a successful write_file/edit_file/multi_edit/apply_patch mutation the
+// runner auto-runs the applicable checker (tsc/eslint/ruff) scoped to the
+// touched file and folds a digest under `post_edit_diagnostics` into the tool
+// result, so type/lint breakage surfaces to the MODEL next turn rather than
+// leaking to the user (`diagnostics::append_post_edit_digest`, wired at the
+// four mutation sites incl. `computer_use::write_file`).
+//
+// The hook runs a REAL checker subprocess, probed at call time via
+// `command -v`. The replay/CI environment ships none of tsc/eslint/ruff, so
+// the fixture puts a deterministic fake `tsc` (fixtures/cli/post-edit-digest/
+// bin/tsc) on PATH. That needs a process-env mutation, which
+// `forbid(unsafe_code)` blocks via `std::env::set_var` — so this reuses the
+// exact re-exec seam the verify-gate fixtures use: the parent re-execs THIS
+// test binary as a child with PATH prepended (safe `Command::env`), and the
+// child drives the real `ReplayHarness`. The fed-back digest is byte-identical
+// to the committed golden `fixtures/diagnostics/post-edit-digest/
+// recorded-digest.json`, whose `note` string the child asserts appears in the
+// captured provider request bodies.
+
+/// Set on the re-exec'd child so it runs the scenario instead of re-spawning.
+const CX_POST_EDIT_CHILD_ENV: &str = "COPPERCLAW_CX_POST_EDIT_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams as JSONL so `expected/*.jsonl` can be regenerated from a real run
+/// (`COPPERCLAW_CX_GENERATE=1 cargo test ... cli_post_edit_digest_feeds_diagnostics_back`).
+const CX_POST_EDIT_MODE_ENV: &str = "COPPERCLAW_CX_POST_EDIT_MODE";
+/// Fixed on-disk path the fixture's `write_file` turn targets. A stable, known
+/// path keeps the expected streams byte-stable across runs (same `/tmp`
+/// convention the verify-gate fixtures use for their project dirs).
+const CX_POST_EDIT_FILE: &str = "/tmp/copperclaw-cx-post-edit-digest/index.ts";
+
+#[tokio::test]
+async fn cli_post_edit_digest_feeds_diagnostics_back() {
+    // Child leg: PATH already carries the fake `tsc`. Run the real scenario.
+    if std::env::var_os(CX_POST_EDIT_CHILD_ENV).is_some() {
+        let dump = std::env::var(CX_POST_EDIT_MODE_ENV).ok().as_deref() == Some("dump");
+        run_post_edit_digest_child(dump).await;
+        return;
+    }
+
+    // Parent leg: re-exec ourselves with the fixture's `bin/` prepended to
+    // PATH (via the safe Command::env — set_var is unavailable under
+    // forbid(unsafe_code)).
+    let file = std::path::Path::new(CX_POST_EDIT_FILE);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    let mode = if std::env::var_os("COPPERCLAW_CX_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let shim_bin = fixture_path("cli", "post-edit-digest").join("bin");
+    assert!(
+        shim_bin.join("tsc").exists(),
+        "fake tsc shim missing at {} — the fixture must ship it executable",
+        shim_bin.join("tsc").display()
+    );
+    let path_var = match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut prefix = shim_bin.clone().into_os_string();
+            prefix.push(":");
+            prefix.push(&p);
+            prefix
+        }
+        None => shim_bin.clone().into_os_string(),
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cli_post_edit_digest_feeds_diagnostics_back",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CX_POST_EDIT_CHILD_ENV, "1")
+        .env(CX_POST_EDIT_MODE_ENV, mode)
+        .env("PATH", path_var)
+        .output()
+        .expect("spawn post-edit-digest re-exec child");
+
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        // Generation run: surface the child's dumped JSONL to the operator.
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "post-edit-digest child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `post-edit-digest` fixture through the real
+/// harness with the fake `tsc` on PATH. In `dump` mode, print the captured
+/// actuals (fixture authoring). Otherwise diff against the committed
+/// `expected/*.jsonl` and assert the digest genuinely reached the model.
+async fn run_post_edit_digest_child(dump: bool) {
+    let path = fixture_path("cli", "post-edit-digest");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load post-edit-digest fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The write_file mutation actually landed the broken file on disk (the
+    // hook only fires on a successful mutation).
+    let written = std::fs::read_to_string(CX_POST_EDIT_FILE)
+        .unwrap_or_else(|e| panic!("write_file must have created {CX_POST_EDIT_FILE}: {e}"));
+    assert!(
+        written.contains("const answer: number"),
+        "the fixture's broken index.ts must be on disk: {written}"
+    );
+
+    // The digest rides back to the model inside the write_file `tool_result`,
+    // so it appears in the provider request bodies captured by the wiremock
+    // server (same channel the verify-gate refusals use).
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    let bodies: String = reqs
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The hook fired and named itself (post_edit_verify) and the tool (tsc).
+    assert!(
+        bodies.contains("post_edit_diagnostics"),
+        "the write_file tool_result must carry the post_edit_diagnostics key",
+    );
+    assert!(
+        bodies.contains("post_edit_verify"),
+        "the digest must name the hook",
+    );
+    // The parsed diagnostic reached the model verbatim.
+    assert!(
+        bodies.contains("TS2322"),
+        "the tsc diagnostic rule must reach the model",
+    );
+    assert!(
+        bodies.contains("Type 'string' is not assignable to type 'number'."),
+        "the tsc diagnostic message must reach the model",
+    );
+
+    // Coherence with the C1 unit-test golden: the digest's `note` — the exact
+    // wording the model is told to act on — matches
+    // fixtures/diagnostics/post-edit-digest/recorded-digest.json byte-for-byte,
+    // and that same wording appears in the fed-back tool_result body. This
+    // ties the replay fixture to the committed digest golden the C1 crate
+    // tests assert against.
+    let golden_path =
+        workspace_root().join("fixtures/diagnostics/post-edit-digest/recorded-digest.json");
+    let golden: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&golden_path).expect("read digest golden"))
+            .expect("digest golden is JSON");
+    let golden_note = golden["note"].as_str().expect("golden note string");
+    assert!(
+        bodies.contains(golden_note),
+        "the golden digest note must reach the model verbatim.\nnote: {golden_note}",
+    );
+}
+
+// ---- M22 CX (Wave 1): C4 screenshot-diff visual-regression fixture
+// coherence ----
+//
+// C4's visual-regression digest (`ui_screenshot.rs`, `mod visual`) is a
+// self-contained PNG decode + perceptual block diff that runs on the bytes a
+// captured screenshot yields. The diff itself is deterministic and is unit-
+// tested in-crate against these exact fixture PNGs
+// (`regression_note_baselines_then_flags_a_regression` /
+// `..._stays_silent_on_an_unchanged_recapture`).
+//
+// It cannot be driven end-to-end through the replay harness: `ui_screenshot`
+// hard-requires a real CDP-speaking in-container chromium
+// (`find_chromium_binary` + `chromium_singleton().get_transport`) with no
+// byte-injection seam, and the harness never spawns a container or a browser
+// (see docs/replay-fixtures.md "What the suite does not cover" — container
+// build correctness / real network). So the replay-layer contribution here is
+// a coherence GUARD over the committed fixture PNGs the in-crate C4 tests
+// depend on: it pins the exact properties those tests (and the C4 decoder's
+// supported subset — 8-bit, color type 0/2/6) rely on, so a fixture that
+// drifts, is truncated, or loses its regression breaks a registered test.
+
+/// Parse a minimal PNG IHDR from `bytes`, returning
+/// `(width, height, bit_depth, color_type)`. Enough to guard the fixture
+/// PNGs' shape without pulling in an image-decoder dependency.
+fn png_ihdr(bytes: &[u8]) -> (u32, u32, u8, u8) {
+    const SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    assert!(bytes.len() >= 26, "PNG too short to hold an IHDR");
+    assert_eq!(bytes[..8], SIG, "PNG signature mismatch");
+    assert_eq!(&bytes[12..16], b"IHDR", "first chunk must be IHDR");
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    (w, h, bytes[24], bytes[25])
+}
+
+#[test]
+fn visual_regression_fixtures_are_coherent() {
+    let dir = workspace_root().join("fixtures/visual_regression");
+    let read = |name: &str| -> Vec<u8> {
+        std::fs::read(dir.join(name))
+            .unwrap_or_else(|e| panic!("C4 fixture {name} missing at {}: {e}", dir.display()))
+    };
+
+    let baseline = read("baseline.png");
+    let regressed = read("regressed.png");
+    let reencoded = read("baseline_reencoded.png");
+    let rgb = read("baseline_rgb.png");
+    let probe = read("decoder_probe.png");
+
+    // All five are valid 8-bit PNGs in the color-type subset the C4 decoder
+    // supports (0 grayscale / 2 RGB / 6 RGBA — never palette).
+    for (name, bytes) in [
+        ("baseline.png", &baseline),
+        ("regressed.png", &regressed),
+        ("baseline_reencoded.png", &reencoded),
+        ("baseline_rgb.png", &rgb),
+        ("decoder_probe.png", &probe),
+    ] {
+        let (_w, _h, depth, ctype) = png_ihdr(bytes);
+        assert_eq!(depth, 8, "{name}: C4 decoder only handles 8-bit depth");
+        assert!(
+            matches!(ctype, 0 | 2 | 6),
+            "{name}: color type {ctype} is outside the C4 decoder's supported subset",
+        );
+    }
+
+    // baseline vs regressed: SAME dimensions (so the diff is a genuine
+    // perceptual comparison, not a short-circuit on a dimension change) but
+    // DIFFERENT bytes (a regression actually exists for the diff to flag).
+    let (bw, bh, _, bct) = png_ihdr(&baseline);
+    let (rw, rh, _, _) = png_ihdr(&regressed);
+    assert_eq!(
+        (bw, bh),
+        (rw, rh),
+        "baseline and regressed must share dimensions for a real perceptual diff",
+    );
+    assert_ne!(
+        baseline, regressed,
+        "regressed.png must differ from baseline.png or there is no regression to detect",
+    );
+    assert_eq!(bct, 6, "baseline.png is the RGBA capture the model emits");
+
+    // baseline_reencoded: the same view re-encoded — same dimensions, distinct
+    // bytes — so the C4 cross-encoding test can prove the diff is perceptual,
+    // not a byte-compare.
+    let (ew, eh, _, _) = png_ihdr(&reencoded);
+    assert_eq!((bw, bh), (ew, eh), "re-encoded baseline keeps dimensions");
+    assert_ne!(
+        baseline, reencoded,
+        "re-encoded baseline must be a distinct encoding of the same view",
+    );
+
+    // baseline_rgb: color type 2 (no alpha) — the decoder's non-alpha path.
+    let (_, _, _, rgb_ct) = png_ihdr(&rgb);
+    assert_eq!(
+        rgb_ct, 2,
+        "baseline_rgb.png must exercise the RGB (no-alpha) path"
+    );
+}
