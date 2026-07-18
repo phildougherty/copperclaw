@@ -364,3 +364,58 @@ out-of-scope and ungranted actions stay blocked and fall to read-then-propose;
 and there is no autonomous path to an external sink that skips the check. The
 one caveat is the fail-closed staging of the two host companion seams, which
 cannot weaken the default (absent snapshot ⇒ closed brake).
+
+### A2H — the two host companion seams land (gate now LIVE)
+
+**Scope.** A2H implements the exact two seams the A2 review flagged as
+"companion plumbing, out of A2's runner scope," turning A2's fail-closed staging
+into the live path. No change to A2's runner enforcement — A2H only *feeds* it.
+Files: `crates/copperclaw-host/src/container_manager/tasks_snapshot.rs` (the
+grant.json writer), `crates/copperclaw-host-delivery/src/service.rs` (the
+`grant_consume` handler), plus the coverage meta-test. It consumes A1's
+`effective_grant` / `consume_fire` / `consume_tokens` unchanged.
+
+**Seam 1 — grant.json writer (secure-by-default).** `write_grant_snapshot`
+resolves the firing task from the session's pending `kind:task` inbound (the same
+`content.task_id` → `series_id` resolution the runner's `firing_task_id` uses),
+reads `task_grants::effective_grant`, and writes `<session>/grant.json` in the
+`TurnGrant` shape ONLY when a live grant exists. Every other outcome — no firing
+task, an inert grant (none / revoked / expired / exhausted), or a DB read error —
+REMOVES any stale snapshot and writes nothing. So the writer can only ever hand
+the runner a grant a human approved and that is still live; it can never
+manufacture authorization, and a transient failure fails closed (absent
+grant.json ⇒ `load_turn_grant` = `None` ⇒ closed brake). It is folded into
+`write_tasks_snapshot`, which runs at container spawn and on the manager-tick
+refresh, so the firing turn sees its grant and a mid-session refresh re-reads the
+(possibly now-depleted) grant. The runner independently re-verifies the
+snapshot's `task_id` and re-checks `is_live` (defence-in-depth), so a stale or
+cross-task snapshot still cannot authorize a fire.
+
+**Seam 2 — `grant_consume` budget writeback.** The delivery handler
+(`apply_grant_consume`) applies the runner's `grant_consume` System row to the
+central grant via `consume_fire` (per `fires`, default 1, clamped non-negative)
+and `consume_tokens` (only for a positive `tokens` count). This is a pure DEBIT
+of an already-approved grant — it can only *reduce* headroom, never widen scope
+or credit budget — so it is applied immediately, not approval-gated. It closes
+the cross-fire enforcement gap A2 noted: `max_fires` and token budgets now
+genuinely deplete centrally, so once spent `effective_grant` reads inert and the
+NEXT spawn's grant.json is absent — the gate re-closes on exhaustion. A malformed
+payload (missing `grant_id`, or an unknown grant id) errors rather than silently
+crediting, surfacing as a self-mod failure.
+
+**Residual risk.** Budget depletion is eventually-consistent within a single
+long turn: the runner charges one fire per turn locally and the host applies the
+debit when the `grant_consume` row is delivered, so the hard in-turn bounds are
+the snapshot's `fires_remaining` / `expires_at` (re-checked by `is_live`) plus
+the host's `effective_grant` at each spawn/refresh; a burst of fires inside one
+uninterrupted turn is bounded by the runner's per-turn single-charge latch, not
+by a live central read. This matches A2's documented "within a turn, fires +
+expiry + the host's `effective_grant` are the hard bounds." No new external
+surface, no new approval path, no widening.
+
+**Verdict: PASS.** The two seams flip the gate from closed to live without
+weakening any default: the writer emits authorization only for a human-approved,
+live, task-matched grant and fails closed on every other path; the consume
+handler can only debit. The autonomy brake now opens exactly per-task, bounded,
+pre-authorized, and revocable — and re-closes automatically on revoke, expiry,
+or budget exhaustion.
