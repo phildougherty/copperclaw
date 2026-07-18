@@ -51,8 +51,7 @@ can safely edit in parallel.
   logging *and* config — "and" in a file's description means split it.
 - **Module boundaries follow what changes together**, not arbitrary
   size. Split on job collision (two features fighting over one file),
-  not line count — a 40-line script cut into three files is
-  decomposition theater, not craft.
+  not line count.
 - Put the module list in your first `todo_add` batch — the plan, not a
   mental note.
 - **Read before you write**, match the surrounding style; prefer
@@ -64,7 +63,7 @@ can safely edit in parallel.
 1. **Baked first.** `create-vite` scaffolds a real project — see
    [[web-app-scaffold]] for the full golden path (skip hand-rolled
    `index.html` + script tags); `typescript` once scaffolded;
-   `sqlite3` for real storage, not a hand-rolled JSON-file "database".
+   `sqlite3` for real storage, not a hand-rolled JSON "database".
 2. **Fetched second.** `npm install <pkg>` / `pip install <pkg>` for
    edge cases already solved upstream (dates, markdown, password
    hashing) — don't hand-roll bcrypt.
@@ -73,11 +72,10 @@ can safely edit in parallel.
 Probe before depending on an image tool (`command -v eslint`) — an
 absent tool just fails cold.
 
-- **SQLite on `/data`: no WAL.** Keep the default rollback journal
-  (`journal_mode = DELETE`) for any embedded/file DB (better-sqlite3,
-  Prisma, rusqlite, python sqlite3) — a hard container kill truncates a
-  bind-mounted WAL to unrecoverable `SQLITE_IOERR_SHORT_READ`. Need WAL?
-  Checkpoint on shutdown; know it's fragile on a bind mount.
+- **Databases & APIs:** load [[web-backend]] when an app needs a server,
+  API, or persistence — datastore choice (not always SQLite), endpoint
+  design, layout. Inline rule: a `/data` SQLite DB uses
+  `journal_mode = DELETE`, never WAL (a killed WAL corrupts).
 
 ## Robustness: handle what a user can actually hit
 
@@ -93,8 +91,7 @@ prototype:
 - **Network/IO failure** — timed-out fetch, missing file, denied
   write. Catch it, show something; don't crash over one bad request.
 
-Out of scope: a null only your own call sites pass, a format only
-you control.
+Out of scope: a null only your call sites pass, a format you control.
 
 ## Verify before you claim done — `.copperclaw/verify` and the gate (NOT OPTIONAL)
 
@@ -139,18 +136,16 @@ there is genuinely no UI to look at:
 4. Fix the worst two things the checklist surfaces.
 5. `ui_screenshot` again to confirm the fix landed.
 
-One full cycle minimum before the delivery todo; see
-[[web-app-scaffold]] for when a scaffolded app first has something worth
-looking at.
+One full cycle before the delivery todo. See [[web-app-scaffold]].
 
 ## Delivering artifacts to the operator
 
 Files under `/data/` are invisible to the operator unless you do one
-of these — pick one per artifact: **`send_file`** (small deliverables),
-**`artifact_path`** (host-side path for `/data`, paste it verbatim;
-many-file projects), or a live preview link (`expose_preview`, send
-the URL verbatim — see [[preview]]). Without one you've built nothing
-the operator can use — `/data` is the *container*'s path, not theirs.
+of these — pick one per artifact: **`send_file`** (small files),
+**`artifact_path`** (host `/data` path, paste verbatim; many-file
+projects), or a live preview link (`expose_preview`, send
+the URL verbatim — see [[preview]]). Without one, `/data` is the
+*container*'s path, not theirs — you've delivered nothing usable.
 
 **End every build with the "prototype ready" close.** Last todo: ONE
 `send_card` — title, one-line summary, a "What to try" bullet, an
@@ -163,8 +158,8 @@ capability — no preview → no button, never a dead link. Full card:
 
 ## Don't fabricate
 
-If `web_search` got 12 results, your report says "12 results" — never
-invent stats or numbers you didn't compute.
+If `web_search` got 12 results, say "12 results" — never invent numbers
+you didn't compute.
 
 **Code fabrication is the same sin, worse.** Concrete rules:
 
