@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 C1 — post-edit verify hook)
+
+- **Post-edit verify hook**: after a successful `edit_file` / `multi_edit` /
+  `apply_patch` / `write_file` mutation, the tool now auto-runs the applicable
+  format/typecheck checker (`eslint` for `.js/.jsx/.mjs/.cjs`, `tsc` for
+  `.ts/.tsx/.mts/.cts`, `ruff` for `.py/.pyi`) scoped to just the touched file
+  and appends a concise digest under `post_edit_diagnostics` in the tool
+  result, so a type/lint break feeds back to the model on its next turn
+  instead of leaking to the user. Clean edits and non-source file types add
+  nothing (no spam); an absent toolchain (minimal image) degrades silently.
+  The check reuses the existing `diagnostics.rs` parsers and is strictly
+  best-effort — it can never turn a successful edit into a failure. Default
+  ON; opt out per session with `COPPERCLAW_POST_EDIT_VERIFY=0`. New logic in
+  `crates/copperclaw-mcp/src/tools/diagnostics.rs` (the `post_edit_verify` /
+  `append_post_edit_digest` hook), wired at the four mutation sites in
+  `edit_file.rs`, `multi_edit.rs`, `apply_patch.rs`, and
+  `computer_use.rs` (`write_file`). Recorded-digest fixture under
+  `fixtures/diagnostics/post-edit-digest/`. Security review recorded in
+  `docs/plans/m22-security-reviews.md` (C1): no trust-boundary expansion —
+  runs already-available toolchain commands inside the existing sandbox.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the

@@ -111,11 +111,17 @@ pub async fn handle(
     emit_diff_card(ctx, &result).await;
     crate::tools::verify_gate::mark_dirty_for_write(ctx, &result.path).await;
 
-    Ok(success_json(&json!({
+    // M22 C1: run the post-edit verify hook (format/typecheck the file we
+    // just wrote) and append its digest so type/lint breakage feeds back to
+    // the model next turn instead of leaking to the user. No-op on a clean
+    // edit / unsupported file type / opted-out session.
+    let mut out = json!({
         "path": result.path,
         "replacements": result.replacements,
         "bytes_written": result.bytes_written,
-    })))
+    });
+    crate::tools::diagnostics::append_post_edit_digest(&mut out, &result.path).await;
+    Ok(success_json(&out))
 }
 
 struct EditOutcome {
