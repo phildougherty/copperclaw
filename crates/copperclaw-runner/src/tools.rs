@@ -60,11 +60,11 @@ use copperclaw_db::DbError;
 use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
-    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateBatchOutcome,
-    DelegateBatchRequest, DelegateSpec, EditMessageSpec, EmitTodoListSpec, InstallSpec,
-    OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec, SendCardSpec, SendFileSpec,
-    SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck,
-    ToolEntry, ToolError, UpdateTaskSpec,
+    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, AuthorTaskGrantSpec, CreateAgentSpec,
+    DelegateBatchOutcome, DelegateBatchRequest, DelegateSpec, EditMessageSpec, EmitTodoListSpec,
+    InstallSpec, OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec, SendCardSpec,
+    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext,
+    ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1204,6 +1204,7 @@ fn apply_effect(
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
         OutboundToolEffect::SaveSkill(spec) => apply_save_skill(conn, spec),
         OutboundToolEffect::ScheduleTask(spec) => apply_schedule_create(conn, spec),
+        OutboundToolEffect::AuthorTaskGrant(spec) => apply_author_task_grant(conn, spec),
         OutboundToolEffect::ListTasks => apply_schedule_list(conn),
         OutboundToolEffect::CancelTask { id } => apply_schedule_simple(conn, "cancel", &id),
         OutboundToolEffect::PauseTask { id } => apply_schedule_simple(conn, "pause", &id),
@@ -1790,6 +1791,30 @@ fn apply_schedule_create(
                 "prompt": spec.prompt,
                 "recurrence": spec.recurrence,
             }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_author_task_grant(
+    conn: &mut Connection,
+    spec: AuthorTaskGrantSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // Mirror of `apply_save_skill` (M22 A1, decision (c)): the host's delivery
+    // `task_grant` handler parses this row, resolves the concrete task id from
+    // `task_name`, and raises an approval card. Only on operator approval does a
+    // `task_grants` row persist. Agent-facing validation already happened in the
+    // `schedule_task` tool.
+    let payload = serde_json::json!({
+        "task_grant": {
+            "task_name": spec.task_name,
+            "capability_scope": spec.capability_scope,
+            "token_budget": spec.token_budget,
+            "max_fires": spec.max_fires,
+            "expires_at": spec.expires_at.to_rfc3339(),
+            "reason": spec.reason,
         }
     });
     insert_row(conn, MessageKind::System, payload)?;
@@ -3219,6 +3244,35 @@ mod tests {
         let row = last_row(&ctx).await;
         assert_eq!(row.content["schedule"]["op"], "create");
         assert_eq!(row.content["schedule"]["payload"]["name"], "t");
+    }
+
+    #[tokio::test]
+    async fn author_task_grant_writes_system_row() {
+        let (_tmp, ctx) = fresh_ctx();
+        let expires = chrono::Utc::now() + chrono::Duration::days(30);
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::AuthorTaskGrant(AuthorTaskGrantSpec {
+                task_name: "standup".into(),
+                capability_scope: "send_message:telegram".into(),
+                token_budget: Some(50000),
+                max_fires: Some(30),
+                expires_at: expires,
+                reason: "morning standup".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ack, ToolEffectAck::Accepted);
+        let row = last_row(&ctx).await;
+        assert_eq!(row.content["task_grant"]["task_name"], "standup");
+        assert_eq!(
+            row.content["task_grant"]["capability_scope"],
+            "send_message:telegram"
+        );
+        assert_eq!(row.content["task_grant"]["max_fires"], 30);
+        assert_eq!(
+            row.content["task_grant"]["expires_at"],
+            expires.to_rfc3339()
+        );
     }
 
     #[tokio::test]

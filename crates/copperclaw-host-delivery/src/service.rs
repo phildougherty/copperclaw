@@ -1335,6 +1335,18 @@ impl DeliveryService {
             self.raise_save_skill_approval(sess, row, target, inbound_pool, &action.payload)?;
             return Ok(());
         }
+        // `task_grant` (M22 A1): the runner emits this alongside a `schedule`
+        // create when the agent's `schedule_task` call carried a `grant`. Like
+        // `save_skill` it is APPROVAL-GATED — we resolve the concrete task id
+        // (the schedule create row, processed just before this one, already
+        // created the task), raise a pending approval + card, and persist the
+        // `task_grants` row only when an operator approves (the `task_grant`
+        // apply arm in the host's approvals handler). Nothing is authorized
+        // without approval.
+        if action.name == "task_grant" {
+            self.raise_task_grant_approval(sess, row, target, inbound_pool, &action.payload)?;
+            return Ok(());
+        }
 
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. The payload carries the new
@@ -1793,6 +1805,159 @@ impl DeliveryService {
         }
 
         copperclaw_metrics::inc_self_mod_succeeded("save_skill");
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "ok")?;
+        Ok(())
+    }
+
+    /// Raise an approval for an agent-authored task capability `grant` (M22 A1)
+    /// and dispatch an approve/deny card to the originating channel.
+    ///
+    /// The grant references its task by name (`task_name`); the concrete task id
+    /// is assigned host-side, so we resolve it HERE from the session's tasks
+    /// (the `schedule` create row that created it was processed just before this
+    /// row) and stamp it into the pending payload. Nothing is authorized here —
+    /// the `task_grants` row lands only when an operator approves (the host's
+    /// `task_grant` approval apply arm). Idempotent on `(session, task_name)` via
+    /// a stable `request_id`, so a retry doesn't stack cards. If the task can't
+    /// be resolved (e.g. its create failed), the request is refused with a
+    /// self-mod failure so the agent learns rather than the row silently
+    /// dropping.
+    fn raise_task_grant_approval(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        payload: &serde_json::Value,
+    ) -> Result<(), DeliveryError> {
+        let ag = sess.agent_group_id;
+        let task_name = payload
+            .get("task_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let capability_scope = payload
+            .get("capability_scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if task_name.is_empty() || capability_scope.trim().is_empty() {
+            record_task_grant_failure(
+                sess,
+                row,
+                inbound_pool,
+                "task_grant payload is missing `task_name` or `capability_scope`",
+            )?;
+            return Ok(());
+        }
+
+        // Resolve the concrete task id from the just-created task.
+        let task = match copperclaw_db::tables::tasks::latest_for_session_by_name(
+            &self.central,
+            sess.id,
+            &task_name,
+        ) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!(
+                        "could not find a task named `{task_name}` to attach the grant to; the \
+                         task must be scheduled in the same call"
+                    ),
+                )?;
+                return Ok(());
+            }
+            Err(err) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!("could not resolve the task for the grant: {err}"),
+                )?;
+                return Ok(());
+            }
+        };
+
+        // Host-trusted payload: the resolved task id plus the agent-proposed
+        // (already tool-validated) scope + bounds. The apply arm inserts the
+        // grant from exactly this.
+        let payload_out = serde_json::json!({
+            "task_id": task.id,
+            "task_name": task_name,
+            "capability_scope": capability_scope,
+            "token_budget": payload.get("token_budget").cloned().unwrap_or(serde_json::Value::Null),
+            "max_fires": payload.get("max_fires").cloned().unwrap_or(serde_json::Value::Null),
+            "expires_at": payload.get("expires_at").cloned().unwrap_or(serde_json::Value::Null),
+            "reason": reason,
+        });
+
+        let approval = match pending_approvals::upsert(
+            &self.central,
+            pending_approvals::UpsertPendingApproval {
+                request_id: format!("task-grant:{}:{task_name}", task.id),
+                action: "task_grant".to_string(),
+                payload: payload_out,
+                agent_group_id: Some(ag),
+                session_id: Some(sess.id),
+                channel_type: target.channel_type.clone(),
+                platform_id: target.platform_id.clone(),
+                title: format!("Authorize task `{task_name}`"),
+                ..Default::default()
+            },
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!("could not record the task_grant approval: {err}"),
+                )?;
+                return Ok(());
+            }
+        };
+
+        if target.channel_type.is_some() && target.platform_id.is_some() {
+            let approval_id = approval.approval_id.as_uuid().to_string();
+            let body = if reason.trim().is_empty() {
+                format!(
+                    "The agent wants to pre-authorize the scheduled task `{task_name}` to act \
+                     autonomously within `{capability_scope}`."
+                )
+            } else {
+                format!(
+                    "The agent wants to pre-authorize the scheduled task `{task_name}` to act \
+                     autonomously within `{capability_scope}`.\n\nReason: {reason}"
+                )
+            };
+            let card = OutboundMessage {
+                kind: MessageKind::Card,
+                content: serde_json::json!({
+                    "card": {
+                        "title": format!("Authorize task `{task_name}`"),
+                        "body": body,
+                        "buttons": [
+                            { "label": "Authorize", "value": format!("approve:{approval_id}"), "style": "primary" },
+                            { "label": "Not now", "value": format!("deny:{approval_id}"), "style": "danger" },
+                        ],
+                    },
+                }),
+                files: vec![],
+            };
+            self.dispatcher.dispatch(target, &card);
+        }
+
+        copperclaw_metrics::inc_self_mod_succeeded("task_grant");
         let in_conn = inbound_pool.connect()?;
         delivered::insert(&in_conn, row.id, None, "ok")?;
         Ok(())
@@ -3812,6 +3977,61 @@ fn record_save_skill_failure(
             session = %sess.id.as_uuid(),
             ?insert_err,
             "save_skill self_mod_error inbound write failed; agent will not see the failure"
+        );
+    }
+    Ok(())
+}
+
+/// Record a `task_grant` request that could not be queued for approval
+/// (unresolvable task or malformed payload): mark the delivery row failed and
+/// surface a `self_mod_error` inbound so the agent learns. The M22 A1 twin of
+/// [`record_save_skill_failure`].
+fn record_task_grant_failure(
+    sess: &Session,
+    row: &MessageOutRow,
+    inbound_pool: &SessionPool,
+    reason: &str,
+) -> Result<(), DeliveryError> {
+    warn!(
+        session = %sess.id.as_uuid(),
+        agent_group = %sess.agent_group_id.as_uuid(),
+        reason,
+        "task_grant request refused before approval",
+    );
+    copperclaw_metrics::inc_self_mod_failed("task_grant");
+    let in_conn = inbound_pool.connect()?;
+    delivered::insert(&in_conn, row.id, Some(reason), "failed")?;
+    let inbound_row = messages_in::WriteInbound {
+        id: MessageId::new(),
+        kind: MessageKind::System,
+        timestamp: chrono::Utc::now(),
+        content: serde_json::json!({
+            "kind": "system",
+            "content": {
+                "self_mod_error": {
+                    "action": "task_grant",
+                    "error": reason,
+                    "guidance": "The capability grant could not be authorized. The task itself may still have been scheduled; if you meant to grant it, schedule the task and its grant in the same call.",
+                }
+            }
+        }),
+        trigger: false,
+        on_wake: false,
+        process_after: None,
+        recurrence: None,
+        series_id: None,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        source_session_id: None,
+        reply_to: None,
+        is_group: None,
+    };
+    if let Err(insert_err) = messages_in::insert(&in_conn, &inbound_row) {
+        warn!(
+            session = %sess.id.as_uuid(),
+            ?insert_err,
+            "task_grant self_mod_error inbound write failed; agent will not see the failure"
         );
     }
     Ok(())

@@ -186,6 +186,38 @@ pub struct ScheduleSpec {
     pub recurrence: Option<String>,
 }
 
+/// Spec for a task capability grant authored alongside `schedule_task`
+/// (M22 A1). The agent proposes a bounded authorization for the task it is
+/// scheduling; the runner records it and the host raises an approval card
+/// (reusing the `save_skill` round-trip, decision (c)). ONLY on operator
+/// approval does a `task_grants` row persist — so a pending grant never
+/// authorizes anything.
+///
+/// The grant references the task by `task_name` because the concrete task id is
+/// assigned host-side and is not known when the tool runs; the host resolves
+/// the id when it raises the approval. Grants are bounded (decision (b)):
+/// `expires_at` is required (no standing grants) and at least one of a token or
+/// fire bound should be set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorTaskGrantSpec {
+    /// Name of the task being scheduled in the same call; the host binds the
+    /// grant to that task's id.
+    pub task_name: String,
+    /// Space-separated set of capability-scope tokens (`class` or
+    /// `class:resource`) the grant authorizes. See
+    /// `copperclaw_db::tables::task_grants` for the matching grammar.
+    pub capability_scope: String,
+    /// Max tokens the grant may spend across its fires; `None` = no token bound.
+    pub token_budget: Option<i64>,
+    /// Max autonomous fires the grant authorizes; `None` = no fire bound.
+    pub max_fires: Option<i64>,
+    /// Absolute expiry instant (required by the tool — decision (b): no
+    /// non-expiring grants).
+    pub expires_at: DateTime<Utc>,
+    /// Human-readable reason shown on the approval card.
+    pub reason: String,
+}
+
 /// Spec for `update_task`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateTaskSpec {
@@ -408,6 +440,10 @@ pub enum OutboundToolEffect {
     SaveSkill(SaveSkillSpec),
     /// `schedule_task`.
     ScheduleTask(ScheduleSpec),
+    /// Grant authoring emitted alongside `schedule_task` when the caller
+    /// supplies a `grant` (M22 A1). Approval-gated host-side: raises a card and
+    /// persists a `task_grants` row only on operator approval.
+    AuthorTaskGrant(AuthorTaskGrantSpec),
     /// `list_tasks`.
     ListTasks,
     /// `cancel_task`.
@@ -446,6 +482,7 @@ impl OutboundToolEffect {
             Self::AddMcpServer(_) => "add_mcp_server",
             Self::SaveSkill(_) => "save_skill",
             Self::ScheduleTask(_) => "schedule_task",
+            Self::AuthorTaskGrant(_) => "author_task_grant",
             Self::ListTasks => "list_tasks",
             Self::CancelTask { .. } => "cancel_task",
             Self::PauseTask { .. } => "pause_task",
@@ -1514,6 +1551,17 @@ mod tests {
                     recurrence: Some("0 * * * *".into()),
                 }),
                 "schedule_task",
+            ),
+            (
+                OutboundToolEffect::AuthorTaskGrant(AuthorTaskGrantSpec {
+                    task_name: "t".into(),
+                    capability_scope: "send_message:telegram".into(),
+                    token_budget: Some(1000),
+                    max_fires: Some(30),
+                    expires_at: chrono::Utc::now(),
+                    reason: "r".into(),
+                }),
+                "author_task_grant",
             ),
             (OutboundToolEffect::ListTasks, "list_tasks"),
             (

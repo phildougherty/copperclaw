@@ -113,6 +113,12 @@ const CENTRAL: &[Migration] = &[
         name: "028_tasks_fire_lifecycle",
         sql: include_str!("../migrations/028_tasks_fire_lifecycle.sql"),
     },
+    // M22 A1: task capability grants — the child table that records a durable,
+    // human-approved, bounded authorization for an autonomous task fire to act.
+    Migration {
+        name: "030_task_grants",
+        sql: include_str!("../migrations/030_task_grants.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -303,6 +309,7 @@ mod tests {
             "outbound_dropped_messages",
             "container_configs",
             "tasks",
+            "task_grants",
             "provider_profiles",
             "provider_health",
             "mcp_oauth_tokens",

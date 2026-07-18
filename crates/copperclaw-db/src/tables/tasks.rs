@@ -224,6 +224,34 @@ pub fn list_for_session(db: &CentralDb, session_id: SessionId) -> Result<Vec<Tas
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Find the most recently created task for a session with the given `name`.
+/// Used by the M22 A1 grant-authoring flow: `schedule_task` creates the task
+/// and, in the same tool call, requests a capability grant that references the
+/// task by its (session-unique-enough) name; the host resolves the concrete
+/// `task_id` here when it raises the grant approval, because the id is assigned
+/// host-side and is not known to the agent at authoring time. Newest wins if a
+/// name was reused within the session — for the just-created task that is the
+/// freshest row.
+pub fn latest_for_session_by_name(
+    db: &CentralDb,
+    session_id: SessionId,
+    name: &str,
+) -> Result<Option<Task>, DbError> {
+    let conn = db.conn()?;
+    Ok(conn
+        .query_row(
+            "SELECT id, agent_group_id, session_id, name, prompt, when_spec,
+                    recurrence, next_fire, status, last_fired_at, fire_count, created_at, updated_at
+             FROM tasks
+             WHERE session_id = ?1 AND name = ?2
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+            params![session_id.as_uuid().to_string(), name],
+            row_to_task,
+        )
+        .optional()?)
+}
+
 /// List all tasks in `active` status whose `next_fire <= now`.
 pub fn list_due(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<Task>, DbError> {
     let conn = db.conn()?;
@@ -535,6 +563,36 @@ mod tests {
             mark_fired(&db, "ghost", Utc::now()).unwrap_err(),
             DbError::NotFound
         ));
+    }
+
+    #[test]
+    fn latest_for_session_by_name_returns_newest() {
+        let db = db();
+        let ag = mk_ag(&db, "g");
+        let sess = SessionId::new();
+        let other = SessionId::new();
+        // Two tasks named "standup" in this session; the newest wins.
+        let mut a = mk_task(ag, sess, "a");
+        a.name = Some("standup".into());
+        insert(&db, a).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut b = mk_task(ag, sess, "b");
+        b.name = Some("standup".into());
+        insert(&db, b).unwrap();
+        // A same-named task in a different session must not leak.
+        let mut c = mk_task(ag, other, "c");
+        c.name = Some("standup".into());
+        insert(&db, c).unwrap();
+        let found = latest_for_session_by_name(&db, sess, "standup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "b");
+        // Unknown name → None.
+        assert!(
+            latest_for_session_by_name(&db, sess, "ghost")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

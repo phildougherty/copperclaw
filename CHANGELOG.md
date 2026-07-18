@@ -25,6 +25,43 @@ adheres to [Semantic Versioning](https://semver.org/).
   replay harness (it hard-requires a real in-container CDP chromium with no
   byte-injection seam), so this guards the fixtures that back its deterministic
   in-crate diff coverage instead.
+### Added (M22 A1 — task capability grants: schema + approval-gated authoring)
+
+- **Task capability grants (`task_grants` table, migration 030)**: the durable,
+  human-approved, bounded authorization that lets an AUTONOMOUS (scheduled /
+  heartbeat) fire of a task take a real external action instead of only
+  drafting one. `crates/copperclaw-db/migrations/030_task_grants.sql` adds a
+  child of `tasks` (010/028 lineage) with `capability_scope`, `token_budget` +
+  `tokens_consumed`, `max_fires` + `fires_consumed`, `expires_at`, `granted_by`,
+  `status`, `approved_at`, `revoked_at`. Registered in
+  `crates/copperclaw-db/src/migrate.rs` (030 was the next free number; last
+  released was 029). Why a separate table: a grant has its own lifecycle
+  (approve → consume → revoke / expire) and bounds, distinct from the schedule.
+- **`effective_grant` read API (the A2 contract)**: new
+  `crates/copperclaw-db/src/tables/task_grants.rs` is the single source of
+  truth for "is there a live grant for this task and what's left." It returns
+  `Some(EffectiveGrant)` only when the newest grant is approved, not revoked,
+  not past `expires_at`, and has token/fire budget remaining; every other state
+  (no grant, revoked, expired, exhausted) reads inert (`None`). Includes
+  `insert_approved` / `get` / `list_for_task` / `revoke` / `consume_fire` /
+  `consume_tokens`, and a documented `capability_scope` grammar +
+  `scope_permits` matcher (`class` / `class:resource` tokens, class-level
+  wildcard, no cross-class widening, case-sensitive).
+- **Approval-gated authoring (decision (c), reuses the `save_skill` round-trip)**:
+  `schedule_task` (`crates/copperclaw-mcp/src/tools/scheduling.rs`) gains an
+  optional `grant` arg (`capability_scope`, `token_budget`, `max_fires`,
+  required `expires_at`, `reason`). The tool validates it synchronously
+  (bounded — must expire within `MAX_GRANT_HORIZON_DAYS` = 365 and set at least
+  one spend bound; well-formed scope tokens) then emits a new
+  `OutboundToolEffect::AuthorTaskGrant` alongside the task-create effect. The
+  runner (`crates/copperclaw-runner/src/tools.rs`) writes a `task_grant` system
+  row; the delivery service
+  (`crates/copperclaw-host-delivery/src/service.rs`, `raise_task_grant_approval`)
+  resolves the concrete task id and raises an approval card; and only the
+  approval APPLY arm (`crates/copperclaw-host/src/handlers/approvals.rs`,
+  `apply_task_grant`) inserts the grant — so a grant persists ONLY after a
+  human approves the specific scope + budget + expiry. Grants are revocable
+  (`task_grants::revoke`) and expiring (decision (b): no standing grants).
 
 ### Added (M22 C6 — promote the see→fix loop to a runtime gate)
 
