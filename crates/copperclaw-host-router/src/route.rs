@@ -5,7 +5,7 @@
 //! lives in [`Router::route`]; the supporting types in this module describe
 //! the outcome the caller (typically a channel adapter) sees.
 
-use crate::commands::{self, SlashCommand};
+use crate::commands::{self, ParsedCommand, SlashCommand, SwitchTarget};
 use crate::debounce::{DebounceKey, Debouncer, InflightKey, InflightSet};
 use crate::error::RouterError;
 use crate::hooks::HookChain;
@@ -310,7 +310,9 @@ impl Router {
         // 6. End-user slash-command detection (M18 R1). Detected once per
         //    event; every wiring below takes the same command path. See
         //    [`crate::commands`] for the per-command routing contract.
-        let command = SlashCommand::detect(event);
+        //    `ParsedCommand` covers the bare commands (`/stop`, `/status`,
+        //    `/projects`, …) plus the argument-bearing `/switch <name>`.
+        let command = ParsedCommand::detect(event);
 
         // 7. Fanout to each wiring.
         let mut sessions = Vec::with_capacity(wirings.len());
@@ -318,7 +320,14 @@ impl Router {
         let mut last_pending: Option<PendingReason> = None;
         for wiring in wirings {
             self.fanout_seq.fetch_add(1, Ordering::Relaxed);
-            match self.route_one(event, &mg.id, mg.is_group, &wiring, user_id, command)? {
+            match self.route_one(
+                event,
+                &mg.id,
+                mg.is_group,
+                &wiring,
+                user_id,
+                command.as_ref(),
+            )? {
                 FanoutOutcome::Delivered(d) => sessions.push(d),
                 FanoutOutcome::Answered(d) => answered.push(d),
                 FanoutOutcome::Dropped(reason) => {
@@ -365,7 +374,7 @@ impl Router {
         mg_is_group: bool,
         wiring: &MessagingGroupAgent,
         user_id: Option<copperclaw_types::UserId>,
-        command: Option<SlashCommand>,
+        command: Option<&ParsedCommand>,
     ) -> Result<FanoutOutcome, RouterError> {
         // Access gate per agent group. `resolve_access_gate` applies the
         // host default policy: privileged ops close-fail (a missing or
@@ -511,20 +520,32 @@ impl Router {
             .enter(inflight_key)
             .ok_or_else(|| RouterError::invalid_wiring("re-entered in-flight session"))?;
 
-        // R1: count detected slash commands by op + channel (before `/status`
-        // returns early below, so status is counted too).
+        // R1: count detected slash commands by op + channel (before the
+        // host-answered commands return early below, so they're counted too).
         if let Some(cmd) = command {
             copperclaw_metrics::inc_slash_command(cmd.op(), event.channel_type.as_str());
         }
 
-        // `/status` is answered by the host: synthesize the reply from
-        // central-DB state and write it straight to `messages_out`. No
-        // inbound row is written and the runner is never woken.
-        if command == Some(SlashCommand::Status) {
-            let started = std::time::Instant::now();
-            let answered = self.answer_status(event, &session);
-            copperclaw_metrics::observe_status_answer_seconds(started.elapsed().as_secs_f64());
-            return answered;
+        // Host-answered commands: synthesize a reply from host state / the
+        // session's `/data` dir and write it straight to `messages_out`. No
+        // inbound row is written for `/status` or `/projects` and the runner
+        // is never woken. `/switch` additionally mutates the active workspace
+        // (mkdir + `.shell_state`) and enqueues a context-reset (`/clear`)
+        // row for the runner, but still answers the OPERATOR host-side.
+        match command {
+            Some(ParsedCommand::Bare(SlashCommand::Status)) => {
+                let started = std::time::Instant::now();
+                let answered = self.answer_status(event, &session);
+                copperclaw_metrics::observe_status_answer_seconds(started.elapsed().as_secs_f64());
+                return answered;
+            }
+            Some(ParsedCommand::Bare(SlashCommand::Projects)) => {
+                return self.answer_projects(event, &session);
+            }
+            Some(ParsedCommand::Switch(target)) => {
+                return self.answer_switch(event, &session, target);
+            }
+            _ => {}
         }
 
         // Inbound-file contract (M18 C3): if the adapter staged an
@@ -570,7 +591,14 @@ impl Router {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let (kind, content, trigger) = match command {
+        // Only the passthrough / control BARE commands reach here; the
+        // host-answered ones (`/status`, `/projects`, `/switch`) returned
+        // above.
+        let bare = match command {
+            Some(ParsedCommand::Bare(cmd)) => Some(*cmd),
+            Some(ParsedCommand::Switch(_)) | None => None,
+        };
+        let (kind, content, trigger) = match bare {
             Some(cmd @ SlashCommand::Stop) => (
                 MessageKind::System,
                 commands::control_content(cmd, original_text),
@@ -581,9 +609,11 @@ impl Router {
                 commands::passthrough_content(cmd, &event_content, original_text),
                 true,
             ),
-            // `/status` returned above; everything else routes unchanged
-            // (modulo attachment materialization above).
-            Some(SlashCommand::Status) | None => (event.message.kind, event_content, true),
+            // `/status` / `/projects` returned above; everything else routes
+            // unchanged (modulo attachment materialization above).
+            Some(SlashCommand::Status | SlashCommand::Projects) | None => {
+                (event.message.kind, event_content, true)
+            }
         };
         // M19 U7: a reaction is a lightweight steering signal, NOT a task. It
         // persists as a non-trigger row (like a `/stop` control row) so it
@@ -612,7 +642,7 @@ impl Router {
         let seq = pool.with_conn(|c| insert_in(c, &write))?;
 
         // R1: a `/stop` persists a CONTROL row for the runner to consume.
-        if command == Some(SlashCommand::Stop) {
+        if bare == Some(SlashCommand::Stop) {
             copperclaw_metrics::inc_control_rows_written("stop");
         }
 
@@ -659,7 +689,94 @@ impl Router {
             .inbound_pool(&session.agent_group_id, &session.id)?;
         let queued = inbound.with_conn(count_due)?;
         let text = commands::render_status(&group.name, &full, queued);
+        self.write_host_reply(event, session, &text)
+    }
 
+    /// Answer `/projects` from the session's on-disk `/data` dir: list the
+    /// workspace directories (marking the active one resolved from
+    /// `.shell_state`) and write the rendered reply straight to
+    /// `messages_out`, mirroring [`Self::answer_status`]. No inbound row is
+    /// written and the runner is never woken.
+    fn answer_projects(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+    ) -> Result<FanoutOutcome, RouterError> {
+        let root = self
+            .session_paths
+            .ensure_session_dir(&session.agent_group_id, &session.id)?;
+        let workspaces = crate::workspaces::list_workspaces(&root);
+        let text = crate::workspaces::render_projects(&workspaces);
+        self.write_host_reply(event, session, &text)
+    }
+
+    /// Handle `/switch <name>`: make `/data/<name>` the active workspace
+    /// (creating it when missing), reset the conversation so the agent
+    /// starts fresh there, and reply to the operator.
+    ///
+    /// The switch is realized by OVERWRITING the session's `.shell_state`
+    /// with a single `cd '/data/<name>'` line: the container `shell` tool
+    /// sources that file before every command, so the agent's next shell
+    /// command runs in the new dir (see
+    /// `copperclaw-mcp/src/tools/computer_use.rs`). The context reset
+    /// reuses the `/clear` passthrough — a trigger `messages_in` row shaped
+    /// exactly like a user-typed `/clear`, which the runner's clear-history
+    /// sentinel handles on its next spawn. The operator still gets an
+    /// immediate host-synthesized confirmation; an invalid name short-
+    /// circuits to a rule-explaining reply and mutates nothing.
+    fn answer_switch(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+        target: &SwitchTarget,
+    ) -> Result<FanoutOutcome, RouterError> {
+        let name = match target {
+            SwitchTarget::Valid(name) => name,
+            SwitchTarget::Invalid(raw) => {
+                let text = crate::workspaces::render_switch_invalid(raw);
+                return self.write_host_reply(event, session, &text);
+            }
+        };
+
+        let root = self
+            .session_paths
+            .ensure_session_dir(&session.agent_group_id, &session.id)?;
+        // `name` is validated to a single safe segment upstream, so
+        // `root.join(name)` can never escape the session dir.
+        let target_dir = root.join(name);
+        let created = !target_dir.exists();
+        if created {
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                RouterError::session_create(format!("create workspace {name}: {e}"))
+            })?;
+        }
+
+        // Point the container shell at the new workspace for the agent's
+        // next command.
+        std::fs::write(
+            root.join(".shell_state"),
+            crate::workspaces::switch_shell_state(name),
+        )
+        .map_err(|e| RouterError::session_create(format!("write .shell_state: {e}")))?;
+
+        // Reset context via the existing `/clear` passthrough.
+        self.write_clear_row(event, session)?;
+
+        let text = crate::workspaces::render_switch_ok(name, created);
+        self.write_host_reply(event, session, &text)
+    }
+
+    /// Write a host-synthesized chat reply straight into the session's
+    /// `messages_out` (the shared tail of every host-answered command:
+    /// `/status`, `/projects`, `/switch`). The reply carries the
+    /// originating event's channel routing explicitly so the delivery loop
+    /// does not depend on `session_routing`.
+    fn write_host_reply(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+        text: &str,
+    ) -> Result<FanoutOutcome, RouterError> {
         let outbound = self
             .session_paths
             .outbound_pool(&session.agent_group_id, &session.id)?;
@@ -683,6 +800,48 @@ impl Router {
             message_id,
             seq,
         }))
+    }
+
+    /// Enqueue a `/clear` passthrough `messages_in` row for the runner's
+    /// clear-history sentinel — the context-reset half of `/switch`. Shaped
+    /// byte-identically to how a user-typed `/clear` routes (trigger row,
+    /// `content.command = "clear"`, text normalised) so the runner sentinel
+    /// fires unchanged. The container manager is woken so the reset lands
+    /// on the next spawn rather than waiting out the poll interval.
+    fn write_clear_row(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+    ) -> Result<(), RouterError> {
+        let pool = self
+            .session_paths
+            .inbound_pool(&session.agent_group_id, &session.id)?;
+        let canonical = SlashCommand::Clear.canonical();
+        let content = commands::passthrough_content(
+            SlashCommand::Clear,
+            &serde_json::json!({ "text": canonical }),
+            canonical,
+        );
+        let write = WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::Chat,
+            timestamp: chrono::Utc::now(),
+            content,
+            trigger: true,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: Some(event.platform_id.clone()),
+            channel_type: Some(event.channel_type.clone()),
+            thread_id: event.thread_id.clone(),
+            source_session_id: None,
+            reply_to: None,
+            is_group: event.message.is_group,
+        };
+        pool.with_conn(|c| insert_in(c, &write))?;
+        self.inbound_wake.notify_one();
+        Ok(())
     }
 
     /// Session-local materialization of a staged inbound attachment
@@ -1995,6 +2154,192 @@ mod tests {
             .unwrap();
         pool.with_conn(|c| copperclaw_db::tables::messages_in::get_pending(c, true, 50))
             .unwrap()
+    }
+
+    /// The single outbound chat text a host-answered command synthesized.
+    fn host_reply_text(fx: &Fixture, target: &DeliveredTo) -> String {
+        let outbound = fx
+            .router
+            .session_paths()
+            .outbound_pool(&target.agent_group_id, &target.session_id)
+            .unwrap();
+        let rows = outbound
+            .with_conn(copperclaw_db::tables::messages_out::list_due)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one host reply: {rows:?}");
+        rows[0].content["text"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn slash_projects_empty_reports_friendly_message() {
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "cmd-projects-empty");
+        ev.message.content = serde_json::json!({"text": "/projects"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("/projects must be host-answered, got {out:?}");
+        };
+        // No inbound row written (host-answered, like /status).
+        assert!(inbound_rows(&fx, &sessions[0]).is_empty());
+        let text = host_reply_text(&fx, &sessions[0]);
+        assert_eq!(
+            text,
+            "No workspaces yet — say 'build me X', or /switch <name> to start one."
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_projects_lists_workspaces_marks_active_and_git() {
+        let fx = fixture(SessionMode::Shared);
+        // Route a normal message first to materialize the session + dir.
+        let seed = fx.router.route(event(None, "seed-1")).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = seed else {
+            panic!("seed route should deliver");
+        };
+        let root = session_dir(&fx, &sessions[0]);
+        // Two workspaces (one a git repo) plus a system dir that must be
+        // excluded, and a shell-state pointing at the git one (active).
+        std::fs::create_dir_all(root.join("alpha/.git")).unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".shell_state"), "cd '/data/alpha'\n").unwrap();
+
+        let mut ev = event(None, "cmd-projects-list");
+        ev.message.content = serde_json::json!({"text": "/projects"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("/projects must be host-answered, got {out:?}");
+        };
+        let text = host_reply_text(&fx, &sessions[0]);
+        assert!(text.starts_with("Workspaces (/data):"), "{text}");
+        assert!(text.contains("\u{2192} alpha (git)"), "active+git: {text}");
+        assert!(text.contains("  notes"), "inactive plain: {text}");
+        assert!(
+            !text.contains("node_modules"),
+            "system dir excluded: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_projects_bypasses_mention_gate_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("cmd-projects-gate");
+        ev.message.content = serde_json::json!({"text": "/projects"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Answered { .. }),
+            "unmentioned /projects in a gated group must be answered: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_switch_creates_dir_writes_state_and_resets_context() {
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        let mut ev = event(Some("t-9"), "cmd-switch-new");
+        ev.message.content = serde_json::json!({"text": "/switch fairway-focus"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("/switch must be host-answered, got {out:?}");
+        };
+        let target = &sessions[0];
+
+        // 1. The workspace dir was created under the session root.
+        let root = session_dir(&fx, target);
+        assert!(
+            root.join("fairway-focus").is_dir(),
+            "/switch must mkdir the new workspace"
+        );
+
+        // 2. `.shell_state` points the container shell at /data/<name>.
+        let state = std::fs::read_to_string(root.join(".shell_state")).unwrap();
+        assert_eq!(state, "cd '/data/fairway-focus'\n");
+
+        // 3. A `/clear` context-reset trigger row was enqueued for the runner.
+        let rows = inbound_rows(&fx, target);
+        assert_eq!(rows.len(), 1, "exactly the context-reset row: {rows:?}");
+        assert_eq!(rows[0].content["text"], "/clear");
+        assert_eq!(rows[0].content["command"], "clear");
+        assert!(rows[0].trigger, "the clear row must wake the runner");
+
+        // 4. The clear row is a trigger row, so the manager was woken.
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("/switch's clear row must wake the manager");
+
+        // 5. The operator got an immediate host confirmation.
+        let text = host_reply_text(&fx, target);
+        assert!(
+            text.contains("Switched to workspace `fairway-focus`"),
+            "{text}"
+        );
+        assert!(text.contains("/data/fairway-focus (new)"), "{text}");
+        assert!(text.contains("context reset"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn slash_switch_existing_dir_reports_existing() {
+        let fx = fixture(SessionMode::Shared);
+        let seed = fx.router.route(event(None, "seed-2")).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = seed else {
+            panic!("seed route should deliver");
+        };
+        let root = session_dir(&fx, &sessions[0]);
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+
+        let mut ev = event(None, "cmd-switch-existing");
+        ev.message.content = serde_json::json!({"text": "/switch notes"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("/switch must be host-answered, got {out:?}");
+        };
+        let text = host_reply_text(&fx, &sessions[0]);
+        assert!(text.contains("/data/notes (existing)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn slash_switch_rejects_traversal_and_mutates_nothing() {
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        let mut ev = event(None, "cmd-switch-bad");
+        ev.message.content = serde_json::json!({"text": "/switch .."});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("an invalid /switch is still host-answered, got {out:?}");
+        };
+        let target = &sessions[0];
+
+        // The reply explains the rule; nothing on disk changed.
+        let text = host_reply_text(&fx, target);
+        assert!(text.contains("Invalid workspace name"), "{text}");
+        let root = session_dir(&fx, target);
+        assert!(!root.join("..").join("escaped").exists());
+        assert!(
+            !root.join(".shell_state").exists(),
+            "rejected /switch must not write .shell_state"
+        );
+        assert!(
+            inbound_rows(&fx, target).is_empty(),
+            "rejected /switch must not enqueue a clear row"
+        );
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(
+            waited.is_err(),
+            "rejected /switch must not wake the manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_switch_bypasses_mention_gate_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("cmd-switch-gate");
+        ev.message.content = serde_json::json!({"text": "/switch scratch"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Answered { .. }),
+            "unmentioned /switch in a gated group must be answered: {out:?}"
+        );
     }
 
     #[tokio::test]

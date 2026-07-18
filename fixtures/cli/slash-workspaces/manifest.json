@@ -1,0 +1,14 @@
+{
+  "name": "cli-slash-workspaces",
+  "channel": "cli",
+  "description": "Multi-workspace UX: /switch <name> creates /data/<name>, points .shell_state at it, enqueues a context-reset /clear row, and host-answers the operator; a following /projects host-answers the workspace listing with the active one marked. Both are host-answered (no runner turn).",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}
