@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Text-only models no longer wedge on a screenshot in the transcript.** When
+  the active model is text-only and the conversation history carries an image
+  block (a `ui_screenshot` / `view_image` result), an OpenRouter-style gateway
+  rejects the whole turn with `404 "No endpoints found that support image
+  input"` — and because the image stays in the re-sent history, *every*
+  subsequent turn fails too, stranding the agent. `AnthropicProvider::query`
+  (`crates/copperclaw-providers/src/anthropic.rs`) now detects that specific
+  rejection, strips the image blocks to a text placeholder, and retries the
+  request once, so the agent keeps going (blind to the image) instead of
+  dead-ending. Vision-capable models are unaffected — they accept the image on
+  the first try. Covered by a wiremock end-to-end test (image attempt → 404 →
+  stripped retry → 200) plus unit tests for the detector and the stripper.
+
 ### Added (M22 SX — Wave-3 skills fixtures: materialized-script + relevance + versioning)
 
 - **The Wave-3 X-rider — deterministic replay/integration coverage for the

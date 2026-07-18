@@ -4,7 +4,7 @@ use copperclaw_providers::{
     AgentProvider, AnthropicProvider, HistoryMessage, ProviderError, QueryInput,
 };
 use copperclaw_types::ProviderEvent;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn sse_body(events: &[(&str, &str)]) -> String {
@@ -623,6 +623,98 @@ async fn cache_usage_tokens_surface_from_usage_event() {
         }
     }
     assert_eq!(found, Some((12, 4000, 50)));
+}
+
+#[tokio::test]
+async fn image_input_404_strips_screenshots_and_retries() {
+    // A text-only model behind an OpenRouter-style gateway rejects a transcript
+    // carrying an image with a 404 "No endpoints found that support image
+    // input". The provider must strip the image to a placeholder and retry
+    // once, so a screenshot the agent took can't wedge every turn.
+    let server = MockServer::start().await;
+    let ok_body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_v1"}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+
+    // Higher-priority mock: any request whose body carries an image block is
+    // rejected exactly like a text-only OpenRouter model.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains("\"type\":\"image\""))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Fallback: a request with NO image (the stripped retry) streams success.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(ok_body),
+        )
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let mut q = QueryInput::new("sys", "z-ai/glm-5.2");
+    q.history.push(HistoryMessage::User {
+        content: "build the UI".into(),
+    });
+    q.history.push(HistoryMessage::Image {
+        media_type: "image/png".into(),
+        data: "QUJD".into(),
+    });
+
+    let mut query = p
+        .query(q)
+        .await
+        .expect("query should succeed after stripping images and retrying");
+    let mut result = None;
+    while let Some(ev) = query.next_event().await {
+        if let ProviderEvent::Result { text } = ev {
+            result = Some(text);
+            break;
+        }
+    }
+    assert_eq!(result.unwrap().as_deref(), Some("done"));
+
+    // Two requests: the image attempt (404) then the stripped retry (200).
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "expected one image attempt + one retry");
+    let first = String::from_utf8(requests[0].body.clone()).unwrap();
+    let second = String::from_utf8(requests[1].body.clone()).unwrap();
+    assert!(
+        first.contains("\"type\":\"image\""),
+        "first attempt must carry the image block"
+    );
+    assert!(
+        !second.contains("\"type\":\"image\""),
+        "the retry must not carry any image block; body was: {second}"
+    );
+    assert!(
+        second.contains("does not support image input"),
+        "the retry must carry the text placeholder"
+    );
 }
 
 #[tokio::test]
