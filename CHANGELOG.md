@@ -882,6 +882,41 @@ real call site in the crate that owns the signal — no dangling metrics.
   run continues); provider error → truncation; retry path uses the second
   summary; truncation keeps recent + pins, drops oldest, and fits back under
   the threshold. The happy-path summary is unchanged.
+### Added (multi-workspace UX — `/projects` + `/switch <name>`)
+
+- Two operator slash commands for managing the many working directories a
+  single session's `/data` dir can hold side by side ("workspaces" — a git
+  repo OR just a folder of files), both delivered in-chat and HOST-ANSWERED
+  (no container spawn), mirroring `/status`:
+  - **`/projects`** lists the session's workspaces — one line each, the
+    active one marked with `→`, a `(git)` tag when the dir holds a `.git`
+    entry — or a friendly "No workspaces yet …" line when empty. System dirs
+    (`skills`, `memory`, `inbox`, `outbox`, `node_modules`) and dot-entries
+    are excluded. The active workspace is resolved from the session's
+    `.shell_state` cwd (first path segment under `/data`).
+  - **`/switch <name>`** makes `/data/<name>` the active workspace (creating
+    it when missing — works for any dir, not just repos), realized by
+    overwriting `<session_root>/.shell_state` with a single
+    `cd '/data/<name>'` line (the container `shell` tool sources that file
+    before every command, so the agent's next command runs there). It then
+    resets the conversation by enqueuing the existing `/clear` passthrough
+    row for the runner, and replies confirming `(new)` vs `(existing)`.
+    `name` is validated to `^[A-Za-z0-9._-]+$` (rejecting `.`, `..`, and any
+    path separator) so it can never escape the session dir; an invalid name
+    mutates nothing and returns the naming rule.
+- New `crates/copperclaw-host-router/src/workspaces.rs` (workspace discovery
+  + active-dir resolution + reply rendering); `Projects` variant +
+  `ParsedCommand`/`SwitchTarget` argument-bearing detection in
+  `crates/copperclaw-host-router/src/commands.rs`; `answer_projects` /
+  `answer_switch` / `write_host_reply` / `write_clear_row` handlers wired
+  into the host-answer early-return in
+  `crates/copperclaw-host-router/src/route.rs`. Replay fixture
+  `fixtures/cli/slash-workspaces/` (registered as
+  `cli_slash_workspaces_switch_then_projects`) pins the
+  `/switch` → `.shell_state` write + context-reset row and the following
+  `/projects` active-marked listing byte-for-byte. Slash-command metrics are
+  counted under the existing `inc_slash_command` helper with the new
+  `projects` / `switch` op labels.
 
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 

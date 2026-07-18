@@ -16,8 +16,10 @@ pub mod hooks;
 pub mod mention;
 pub mod route;
 pub mod session;
+pub mod workspaces;
 
 pub use commands::SlashCommand;
+pub use commands::{ParsedCommand, SwitchTarget};
 pub use debounce::{DEBOUNCE_WINDOW, DebounceKey, Debouncer, InflightKey, InflightSet};
 pub use error::RouterError;
 pub use hooks::HookChain;

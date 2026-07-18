@@ -789,6 +789,39 @@ async fn telegram_slash_compact_runner_sentinel() {
     run_fixture("telegram", "slash-compact").await;
 }
 
+/// Multi-workspace UX (`/switch` + `/projects`). Two host-answered steps
+/// on the cli channel:
+///
+/// - `/switch fairway-focus` creates `/data/fairway-focus`, overwrites
+///   `.shell_state` with `cd '/data/fairway-focus'`, enqueues a
+///   context-reset `/clear` trigger row (left pending — the runner is not
+///   driven for a host-answered command in the harness), and host-answers
+///   the operator with the switch confirmation.
+/// - `/projects` then host-answers the workspace listing, marking the
+///   just-created workspace active (resolved from `.shell_state`).
+///
+/// Neither step writes a runner turn; both reply straight to
+/// `messages_out`. Beyond the byte-stable JSONL diff this pins that
+/// `/switch` really wrote the `cd` shell-state to the session root.
+#[tokio::test]
+async fn cli_slash_workspaces_switch_then_projects() {
+    let harness = run_fixture_into_harness("cli", "slash-workspaces").await;
+    let (ag, sess) = harness.touched_sessions[0];
+    let state = harness
+        .tempdir
+        .path()
+        .join("sessions")
+        .join(ag.as_uuid().to_string())
+        .join(sess.as_uuid().to_string())
+        .join(".shell_state");
+    let contents = std::fs::read_to_string(&state)
+        .unwrap_or_else(|e| panic!(".shell_state missing at {state:?}: {e}"));
+    assert_eq!(
+        contents, "cd '/data/fairway-focus'\n",
+        "/switch must point the container shell at the new workspace"
+    );
+}
+
 /// D2 e2e: after a real replayed turn (per-session DBs on disk, WAL
 /// outbound), `sessions.get` attaches the recent message rows its help
 /// text promises and `sessions.tail` returns the merged, time-ordered

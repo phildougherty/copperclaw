@@ -1,0 +1,2 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"message":{"id":"fixture-slash-switch-001","kind":"chat","content":{"text":"/switch fairway-focus"},"timestamp":"<TS>","is_mention":null,"is_group":null},"reply_to":null,"sender":null}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"message":{"id":"fixture-slash-projects-002","kind":"chat","content":{"text":"/projects"},"timestamp":"<TS>","is_mention":null,"is_group":null},"reply_to":null,"sender":null}
