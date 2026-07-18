@@ -10,7 +10,8 @@ use crate::checks::integrity::{INTEGRITY_ROTATION_SLOTS, IntegrityFinding};
 use crate::checks::questions::QuestionExpiryEmit;
 use crate::checks::stuck::StuckSeverity;
 use crate::checks::{
-    apology, heartbeat, integrity, processing, questions, recurrence, scheduling, stuck, wake,
+    apology, goals, heartbeat, integrity, processing, questions, recurrence, scheduling, stuck,
+    wake,
 };
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
@@ -208,6 +209,14 @@ pub struct SweepReport {
     /// sidecar predates this pass). Observational; excluded from
     /// [`Self::is_empty`] / [`Self::total`].
     pub integrity_excluded: Vec<SessionId>,
+    /// M22 A3: one [`SeriesFanout`] per long-running goal whose check-in fired
+    /// this pass (a `kind:task` wake synthesised into the goal's session). The
+    /// series id is the goal id. Empty when no goal was due a check-in.
+    pub goal_checkins_fired: Vec<SeriesFanout>,
+    /// M22 A3: goal ids paused this pass because their (grant-backed) budget was
+    /// exhausted — the sweep stops spending on a goal whose authority is spent.
+    /// A real state change: counted in [`Self::is_empty`] / [`Self::total`].
+    pub goals_budget_paused: Vec<String>,
     /// M21 O2: true if the central DB was `quick_check`ed this pass (at
     /// boot, then daily). Observational.
     pub central_integrity_checked: bool,
@@ -230,6 +239,8 @@ impl SweepReport {
             && self.condition_checkins_fired.is_empty()
             && self.questions_expired.is_empty()
             && self.integrity_quarantined.is_empty()
+            && self.goal_checkins_fired.is_empty()
+            && self.goals_budget_paused.is_empty()
             && !self.central_integrity_corrupt
     }
 
@@ -244,6 +255,8 @@ impl SweepReport {
             + self.condition_checkins_fired.len()
             + self.questions_expired.len()
             + self.integrity_quarantined.len()
+            + self.goal_checkins_fired.len()
+            + self.goals_budget_paused.len()
     }
 }
 
@@ -533,6 +546,8 @@ impl SweepService {
                                     condition_checkins = report.condition_checkins_fired.len(),
                                     questions_expired = report.questions_expired.len(),
                                     integrity_quarantined = report.integrity_quarantined.len(),
+                                    goal_checkins = report.goal_checkins_fired.len(),
+                                    goals_budget_paused = report.goals_budget_paused.len(),
                                     central_integrity_corrupt = report.central_integrity_corrupt,
                                     "sweep pass produced report",
                                 );
@@ -682,6 +697,26 @@ impl SweepService {
                 target: "copperclaw_host_sweep",
                 error = %e,
                 "scheduled-task fan-out failed",
+            ),
+        }
+
+        // M22 A3: goal check-in fan-out. Like the scheduled-task scan above,
+        // this is a global central-DB scan (`goals` table) that synthesises a
+        // `kind:task` wake per due goal and pauses goals whose grant-backed
+        // budget is exhausted. Additive + self-contained so later lane-W cards
+        // (A4/A5) rebase alongside it. Errors are logged and swallowed so a
+        // sqlite hiccup here never aborts the per-session checks below.
+        match goals::check(&self.central, self.session_paths.as_ref(), now) {
+            Ok(mut goal_report) => {
+                report.goal_checkins_fired.append(&mut goal_report.fired);
+                report
+                    .goals_budget_paused
+                    .append(&mut goal_report.budget_paused);
+            }
+            Err(e) => tracing::warn!(
+                target: "copperclaw_host_sweep",
+                error = %e,
+                "goal check-in fan-out failed",
             ),
         }
 

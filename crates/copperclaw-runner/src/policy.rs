@@ -92,6 +92,10 @@ const READONLY_TOOLS: &[&str] = &[
     "web_search",
     "web_fetch",
     "list_tasks",
+    // M22 A3: read-only goal listing, the goal sibling of `list_tasks`. The
+    // mutating goal verbs (`create_goal` / `update_goal`) live in
+    // [`SCHEDULING_MUTATION_TOOLS`] so the guest role floor denies them.
+    "list_goals",
 ];
 
 /// Scheduler-mutation verbs layered on top of [`READONLY_TOOLS`] by the
@@ -107,6 +111,13 @@ const SCHEDULING_MUTATION_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "update_task",
+    // M22 A3: goal authoring/reporting mutates the central `goals` scheduler
+    // state (a goal indexes over the task scheduler), so it rides here with the
+    // task-mutation verbs — reachable from the messaging profile up, denied to a
+    // guest sender via the mutating floor. `list_goals` (read-only) stays in
+    // [`READONLY_TOOLS`].
+    "create_goal",
+    "update_goal",
 ];
 
 /// Filesystem-mutation, shell, and agent-spawning tools layered on by the

@@ -39,6 +39,7 @@ pub mod git_diff;
 pub mod git_log;
 pub mod git_status;
 pub mod glob;
+pub mod goals;
 pub mod grep;
 pub mod interactive;
 pub mod load_skill;
@@ -101,6 +102,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         scheduling::pause_task::entry(),
         scheduling::resume_task::entry(),
         scheduling::update_task::entry(),
+        // M22 A3: first-class long-running goals — durable objectives the sweep
+        // drives check-ins against (create/list/update). Registered alongside
+        // the scheduling tools they extend (a goal indexes over the scheduler).
+        goals::create_goal::entry(),
+        goals::list_goals::entry(),
+        goals::update_goal::entry(),
         computer_use::shell::entry(),
         edit_file::entry(),
         multi_edit::entry(),
@@ -255,6 +262,9 @@ mod tests {
             "pause_task",
             "resume_task",
             "update_task",
+            "create_goal",
+            "list_goals",
+            "update_goal",
             "shell",
             "edit_file",
             "multi_edit",

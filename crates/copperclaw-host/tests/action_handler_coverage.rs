@@ -80,6 +80,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // in-place edit of the prior HUD message via
         // `deliver_breadcrumb(..., existing_message_id)`.
         "update_breadcrumb",
+        // M22 A3: long-running goal authoring/reporting (apply_goal_create /
+        // apply_goal_update). Both `create_goal` / `update_goal` emit the same
+        // top-level "goal" key with an inner `op`. Intercepted inline (see
+        // `inline_handler_set`): a goal is internal state, so the delivery
+        // service persists it immediately into the central `goals` table.
+        "goal",
     ]
     .into_iter()
     .collect()
@@ -114,6 +120,10 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // the module-registered handler when the adapter is `Unsupported`.
         "edit",
         "reaction",
+        // M22 A3: `goal` is intercepted inline so the delivery service can
+        // persist the goal immediately into the central `goals` table (with
+        // `self.central`) — a goal is internal state, not approval-gated.
+        "goal",
     ]
     .into_iter()
     .collect()

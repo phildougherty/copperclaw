@@ -231,6 +231,64 @@ pub struct UpdateTaskSpec {
     pub recurrence: Option<Option<String>>,
 }
 
+/// Spec for `create_goal` (M22 A3). The agent declares a durable long-running
+/// objective the sweep will drive check-ins against. Persisted host-side into
+/// the central `goals` table (decision (d): the goal INDEXES over the todo /
+/// memory stores, it does not replace them). Not approval-gated — a goal is
+/// internal state, it authorizes nothing on its own (any autonomous ACTION a
+/// check-in wake takes is still gated by A2's grant machinery).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGoalSpec {
+    /// The durable objective text (what the goal is for).
+    pub objective: String,
+    /// Optional cron (croner) the sweep re-arms the next check-in from.
+    pub checkin_recurrence: Option<String>,
+    /// Optional first check-in instant. When omitted and `checkin_recurrence`
+    /// is set, the host computes the first fire from the recurrence.
+    pub first_checkin: Option<DateTime<Utc>>,
+    /// Optional prompt injected on a check-in wake; `None` = the sweep
+    /// synthesises one from the objective.
+    pub checkin_prompt: Option<String>,
+    /// The goal's own cumulative token cap (used only when no grant is linked).
+    pub token_budget: Option<i64>,
+}
+
+/// Spec for `update_goal` (M22 A3). Records progress and/or moves the goal's
+/// lifecycle state. At least one of `status` / `progress` / `objective` is set
+/// (validated by the tool). `status` is one of `active`/`paused`/`completed`/
+/// `abandoned`; illegal transitions are rejected host-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateGoalSpec {
+    /// Goal id (assigned host-side; the agent learns it from a check-in wake).
+    pub id: String,
+    /// New lifecycle status, if transitioning.
+    pub status: Option<String>,
+    /// A progress note to append to the goal's log, if reporting progress.
+    pub progress: Option<String>,
+    /// Tokens attributed to this progress report (accrued cumulatively), if any.
+    pub progress_tokens: Option<i64>,
+    /// A revised objective, if refining the goal.
+    pub objective: Option<String>,
+}
+
+/// A description of one goal as surfaced by `list_goals` (M22 A3). Runner-facing
+/// view; the host owns the full row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSummary {
+    /// Goal id.
+    pub id: String,
+    /// Objective text.
+    pub objective: String,
+    /// Lifecycle status (`active`/`paused`/`completed`/`abandoned`).
+    pub status: String,
+    /// Next scheduled check-in, if any.
+    pub next_checkin: Option<DateTime<Utc>>,
+    /// Count of check-in fires so far.
+    pub checkin_count: i64,
+    /// Cumulative tokens accrued against the goal.
+    pub tokens_consumed: i64,
+}
+
 /// One memory hit surfaced to the `memory_search` / `memory_get` tools.
 ///
 /// `provenance` is the wire form (`"trusted"` / `"untrusted"`) of the stored
@@ -463,6 +521,12 @@ pub enum OutboundToolEffect {
     },
     /// `update_task`.
     UpdateTask(UpdateTaskSpec),
+    /// `create_goal` (M22 A3) — persist a durable long-running goal into the
+    /// central `goals` table host-side.
+    CreateGoal(CreateGoalSpec),
+    /// `update_goal` (M22 A3) — record progress and/or transition a goal's
+    /// lifecycle state host-side.
+    UpdateGoal(UpdateGoalSpec),
 }
 
 impl OutboundToolEffect {
@@ -488,6 +552,8 @@ impl OutboundToolEffect {
             Self::PauseTask { .. } => "pause_task",
             Self::ResumeTask { .. } => "resume_task",
             Self::UpdateTask(_) => "update_task",
+            Self::CreateGoal(_) => "create_goal",
+            Self::UpdateGoal(_) => "update_goal",
         }
     }
 }
@@ -715,6 +781,15 @@ pub trait ToolContext: Send + Sync {
     /// pathway. Implementors may delegate to whatever scheduler state they
     /// own; the mock keeps a synthetic table.
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError>;
+
+    /// Read hook for the `list_goals` MCP tool (M22 A3). Goal state lives on the
+    /// host (central `goals` table), not the container, so the runner's context
+    /// returns an empty `Vec` (exactly like `list_tasks`); the mock returns
+    /// whatever `set_goals` seeded. Default `Ok(Vec::new())` so contexts that
+    /// don't track goals (subagent adapters) compile unchanged.
+    async fn list_goals(&self) -> Result<Vec<GoalSummary>, ToolError> {
+        Ok(Vec::new())
+    }
 
     /// Open an in-process LLM subagent loop. Default impl returns
     /// `ToolError::Context("subagent not supported in this context")` so
@@ -1068,6 +1143,8 @@ struct MockInner {
     next_list_err: Option<ToolError>,
     /// Pre-seeded list of tasks.
     task_summaries: Vec<TaskSummary>,
+    /// Pre-seeded list of goals returned by `list_goals` (M22 A3).
+    goal_summaries: Vec<GoalSummary>,
     /// Override ack returned by the next `emit_outbound`.
     next_ack: Option<ToolEffectAck>,
     /// Subagent requests recorded in order.
@@ -1164,6 +1241,14 @@ impl MockToolContext {
             .lock()
             .expect("MockToolContext mutex poisoned")
             .task_summaries = tasks;
+    }
+
+    /// Seed the goal list returned by `list_goals` (M22 A3).
+    pub fn set_goals(&self, goals: Vec<GoalSummary>) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .goal_summaries = goals;
     }
 
     /// Snapshot of subagent requests recorded so far.
@@ -1273,6 +1358,14 @@ impl ToolContext for MockToolContext {
             return Err(err);
         }
         Ok(g.task_summaries.clone())
+    }
+
+    async fn list_goals(&self) -> Result<Vec<GoalSummary>, ToolError> {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        if let Some(err) = g.next_list_err.take() {
+            return Err(err);
+        }
+        Ok(g.goal_summaries.clone())
     }
 
     async fn spawn_subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {

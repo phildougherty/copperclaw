@@ -61,10 +61,10 @@ use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, AuthorTaskGrantSpec, CreateAgentSpec,
-    DelegateBatchOutcome, DelegateBatchRequest, DelegateSpec, EditMessageSpec, EmitTodoListSpec,
-    InstallSpec, OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec, SendCardSpec,
-    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext,
-    ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
+    CreateGoalSpec, DelegateBatchOutcome, DelegateBatchRequest, DelegateSpec, EditMessageSpec,
+    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec,
+    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary,
+    ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateGoalSpec, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1210,6 +1210,11 @@ fn apply_effect(
         OutboundToolEffect::PauseTask { id } => apply_schedule_simple(conn, "pause", &id),
         OutboundToolEffect::ResumeTask { id } => apply_schedule_simple(conn, "resume", &id),
         OutboundToolEffect::UpdateTask(spec) => apply_schedule_update(conn, spec),
+        // M22 A3: goal authoring/reporting. Like the `schedule` ops, these land
+        // as `{"goal": {...}}` system rows the host's delivery `goal` handler
+        // persists into the central `goals` table.
+        OutboundToolEffect::CreateGoal(spec) => apply_goal_create(conn, spec),
+        OutboundToolEffect::UpdateGoal(spec) => apply_goal_update(conn, spec),
     }
 }
 
@@ -1860,6 +1865,52 @@ fn apply_schedule_update(
     let id_for_ack = spec.id.clone();
     insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Task { id: id_for_ack })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_goal_create(
+    conn: &mut Connection,
+    spec: CreateGoalSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's delivery `goal` handler parses this row and INSERTs a `goals`
+    // row (M22 A3). A goal is internal tracking state — not approval-gated (it
+    // authorizes nothing on its own), so it applies immediately host-side like
+    // `install_packages`, unlike the approval-gated `save_skill` / `task_grant`.
+    let payload = serde_json::json!({
+        "goal": {
+            "op": "create",
+            "payload": {
+                "objective": spec.objective,
+                "checkin_recurrence": spec.checkin_recurrence,
+                "first_checkin": spec.first_checkin,
+                "checkin_prompt": spec.checkin_prompt,
+                "token_budget": spec.token_budget,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_goal_update(
+    conn: &mut Connection,
+    spec: UpdateGoalSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    let payload = serde_json::json!({
+        "goal": {
+            "op": "update",
+            "payload": {
+                "id": spec.id,
+                "status": spec.status,
+                "progress": spec.progress,
+                "progress_tokens": spec.progress_tokens,
+                "objective": spec.objective,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
 }
 
 fn insert_row(

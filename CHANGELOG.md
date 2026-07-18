@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 A3 — first-class long-running goal object)
+
+- **Goals schema (`goals` + `goal_progress` tables, migration 031)**: a durable
+  long-running objective the sweep can drive against — status, an append-only
+  progress log, cumulative token spend, and a link to the driving task/grant.
+  `crates/copperclaw-db/migrations/031_goals.sql` (031 was the next free number;
+  030 is A1's), registered in `crates/copperclaw-db/src/migrate.rs`. Decision
+  (d): a goal INDEXES OVER `agent_todos.json` (the in-session plan) and the
+  memory store (the fact store), it does not replace them.
+- **Goals model (`crates/copperclaw-db/src/tables/goals.rs`)**: CRUD +
+  explicit, validated state transitions (`transition`/`set_status`:
+  `active`⇄`paused`, `active`/`paused`→`completed`/`abandoned`, terminal states
+  frozen), the append-only progress log (`record_progress`/`list_progress`) with
+  cumulative token accrual, check-in bookkeeping (`list_due_checkin`,
+  `mark_checkin`, `set_next_checkin`), and `budget_remaining` — which draws on
+  the linked A1 grant (`task_grants::effective_grant`/`tokens_remaining`) as the
+  budget AUTHORITY when a `grant_id` is set (decision (d)), falling back to the
+  goal's own `token_budget` otherwise.
+- **Goal check-in sweep (`crates/copperclaw-host-sweep/src/checks/goals.rs`)**:
+  a new sweep module that, each pass, fans out a `kind:task` wake into the
+  session of every active goal whose `next_checkin` elapsed — reusing the SAME
+  scheduler fan-out scheduled tasks use, not a parallel wake mechanism — then
+  re-arms `next_checkin` from `checkin_recurrence`. A goal whose grant-backed
+  budget is exhausted is PAUSED instead of woken. Registered in
+  `crates/copperclaw-host-sweep/src/service.rs` (new `goal_checkins_fired` /
+  `goals_budget_paused` report fields) and `checks/mod.rs`.
+- **Goal MCP tools (`crates/copperclaw-mcp/src/tools/goals.rs`)**:
+  `create_goal` / `list_goals` / `update_goal`, registered in `tools/mod.rs`
+  alongside the scheduling tools. New `CreateGoalSpec` / `UpdateGoalSpec` /
+  `GoalSummary` + `OutboundToolEffect::CreateGoal`/`UpdateGoal` +
+  `ToolContext::list_goals` in `crates/copperclaw-mcp/src/context.rs` (additive,
+  alongside A1's grant effect). The runner writes them as `{"goal": {...}}`
+  system rows (`crates/copperclaw-runner/src/tools.rs` `apply_goal_create` /
+  `apply_goal_update`); the host's delivery `goal` action handler
+  (`crates/copperclaw-host-delivery/src/service.rs` `apply_goal`) persists them
+  immediately into the central `goals` table — a goal is internal state and
+  authorizes nothing on its own, so it is not approval-gated (any action a
+  check-in wake later takes stays gated by A2's grant machinery).
+
 ### Added (M22 CX — Wave-1 coding replay fixtures)
 - `fixtures/cli/post-edit-digest/` + `tests/replay.rs::cli_post_edit_digest_feeds_diagnostics_back`:
   deterministic replay coverage for the C1 post-edit verify hook. A `write_file`
