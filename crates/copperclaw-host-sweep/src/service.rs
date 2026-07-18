@@ -908,7 +908,13 @@ impl SweepService {
                 ),
             }
 
+            // M22 A5: the per-session recurrence engine is now a deprecation
+            // shim that forwards each legacy recurring series into the central
+            // `tasks` scheduler (and neutralises the source rows), so all
+            // recurrence gains list/pause/resume/cancel. It therefore needs the
+            // central DB handle to create/inspect the target task rows.
             match recurrence::check(
+                &self.central,
                 self.session_paths.as_ref(),
                 &session.agent_group_id,
                 &session.id,
@@ -919,7 +925,7 @@ impl SweepService {
                     target: "copperclaw_host_sweep",
                     session = %session.id,
                     error = %e,
-                    "recurrence-fanout check failed",
+                    "recurrence-consolidation check failed",
                 ),
             }
 
