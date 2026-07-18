@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 AX — Wave-2 autonomy fixtures: grant wakes + goal progress)
+
+- **Grant-wake replay fixtures (`fixtures/cli/grant-wake-granted`,
+  `fixtures/cli/grant-wake-ungranted`)** now run deterministically, registered in
+  `crates/copperclaw-host/tests/replay.rs`. Both seed the scheduled `kind:task`
+  wake via `inbound.sql` + a central `tasks` row and fire it through the M21
+  sweep wake path. **granted-act** additionally seeds an *approved* `task_grants`
+  row (`central.sql`); the real A2H writer (`write_tasks_snapshot`, now invoked at
+  the harness's spawn-mirror) renders the live `grant.json` the runner's A2 gate
+  reads, so the fixture drives the OPEN gate end-to-end: the granted `web_fetch`
+  is admitted (no `autonomous (heartbeat/scheduled) turn` deny), exactly one fire
+  is charged as a `grant_consume` System row, and the delivery loop applies it
+  back to central (`task_grants.fires_consumed == 1`). **ungranted-propose** seeds
+  no grant, so the action stays blocked, no fire is charged, and the read-then-
+  propose reply still reaches the user. The granted URL is a loopback literal so
+  the tool's own SSRF net-guard rejects it offline/instantly — the autonomy gate
+  (the behaviour under test) opens and charges the fire *before* that guard runs,
+  so `grant_consume` is the deterministic proof, not the fetch body.
+- **Goal-progress replay fixture (`fixtures/cli/goal-progress`)**: an A3
+  long-running goal, due a check-in and re-arming every 5 minutes, is driven
+  across two controlled `SweepService::run_once` passes (the sweep `MockClock`
+  seam) that straddle the croner-re-armed `next_checkin`. Each pass fires a
+  `kind:task` check-in wake; the woken agent records progress via `update_goal`,
+  so the goal accrues two check-ins and two progress-log rows across the wakes
+  (`goals.checkin_count == 2`, `list_progress().len() == 2`, `tokens_consumed ==
+  100`).
+- **Replay harness (`crates/copperclaw-host/tests/replay/harness.rs`, test-only,
+  additive):** `run_one_turn` now mirrors the container manager's spawn-time
+  `write_tasks_snapshot` so the runner's A2 gate reads the same host-produced
+  `grant.json` production writes (byte-neutral for every fixture without a seeded
+  grant — no `task_grants` row means no `grant.json`, so the brake stays closed);
+  a new `run_goal_sweep_at(now)` runs one goal sweep pass on a `MockClock` and
+  drives a turn per goal check-in fired; `apply_inbound_sql` /
+  `snapshot_messages_out` / `snapshot_messages_in` are widened to `pub` for
+  bespoke autonomy assertions.
+
 ### Changed (M22 A5 — consolidate recurrence into the central tasks scheduler)
 
 - **One recurrence mechanism, not two.** The per-session `messages_in.recurrence`

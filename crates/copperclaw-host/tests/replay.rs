@@ -552,6 +552,177 @@ async fn cli_scheduled_wake() {
     run_fixture("cli", "scheduled-wake").await;
 }
 
+// ---- M22 AX (Wave 2): autonomy grant + goal fixtures ----
+//
+// Deterministic proof of the M22 A2 autonomy gate (granted-act vs
+// ungranted-propose) and the A3 goal check-in fan-out (progress across ≥2
+// wakes), driven end-to-end through the replay pipeline (sweep wake → runner
+// turn → outbound → delivery). The grant snapshot the runner's gate reads is
+// produced by the REAL A2H writer (`container_manager::tasks_snapshot::
+// write_tasks_snapshot`, which the harness now invokes at its spawn-mirror in
+// `run_one_turn`) from a seeded, approved `task_grants` row — not a hand-copied
+// file — so these fixtures exercise the writer + gate together.
+
+/// A2 marquee (granted-act): a scheduled autonomous fire whose firing task
+/// carries a live, approved grant OPENS the autonomy gate for the granted
+/// `web_fetch`, dispatches it, and charges exactly one fire — a `grant_consume`
+/// System row the delivery loop applies back to central. The granted URL is a
+/// loopback literal: the gate opens and charges the fire BEFORE the tool's own
+/// SSRF net-guard runs, so the emitted+applied `grant_consume` is the
+/// deterministic proof of "the gate opened and the action fired", not the fetch
+/// body. See `fixtures/cli/grant-wake-granted/README.md`.
+#[tokio::test]
+async fn cli_grant_wake_granted_opens_gate_and_charges_fire() {
+    let fixture = Fixture::load(fixture_path("cli", "grant-wake-granted")).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    // Exactly one `grant_consume` System row, for the seeded grant, one fire.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let consumes: Vec<&serde_json::Value> = out
+        .iter()
+        .filter(|r| {
+            r.get("content")
+                .and_then(|c| c.get("grant_consume"))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(consumes.len(), 1, "exactly one grant_consume row: {out:#?}");
+    let gc = &consumes[0]["content"]["grant_consume"];
+    assert_eq!(gc["grant_id"], "grant-standup-001");
+    assert_eq!(gc["task_id"], "t-standup");
+    assert_eq!(gc["fires"], 1);
+
+    // The gate OPENED — no outbound row surfaces the autonomous deny reason.
+    assert!(
+        !out.iter().any(|r| {
+            r.to_string()
+                .contains("autonomous (heartbeat/scheduled) turn")
+        }),
+        "granted turn must not surface the autonomous deny: {out:#?}"
+    );
+
+    // Delivery applied the consume back to central: `fires_consumed == 1`.
+    let grant = copperclaw_db::tables::task_grants::get(&harness.central, "grant-standup-001")
+        .expect("read grant")
+        .expect("grant row exists");
+    assert_eq!(
+        grant.fires_consumed, 1,
+        "delivery must apply exactly one fire to the central grant"
+    );
+    assert_eq!(
+        grant.status,
+        copperclaw_db::tables::task_grants::GrantStatus::Approved,
+        "a single-fire consume leaves the multi-fire grant approved"
+    );
+
+    // The round-2 report reached the user (the turn is not a silent no-op).
+    let cli = mock_for(&harness, "cli");
+    assert!(
+        cli.deliveries()
+            .iter()
+            .any(|d| d.message.content.to_string().contains("standup digest")),
+        "the granted turn's report should reach the user: {:?}",
+        cli.deliveries()
+    );
+}
+
+/// A2 safe-default (ungranted-propose): the same scheduled autonomous fire with
+/// NO matching grant leaves the autonomy brake CLOSED — the credentialed
+/// external action is blocked (no fire charged, no `grant_consume`) and the
+/// agent falls back to read-then-propose, whose reply still reaches the user.
+#[tokio::test]
+async fn cli_grant_wake_ungranted_blocks_and_proposes() {
+    let fixture = Fixture::load(fixture_path("cli", "grant-wake-ungranted")).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    // ZERO grant_consume rows — a blocked action is never charged.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    assert!(
+        !out.iter().any(|r| {
+            r.get("content")
+                .and_then(|c| c.get("grant_consume"))
+                .is_some()
+        }),
+        "an ungranted autonomous fire must charge no fire: {out:#?}"
+    );
+
+    // The fixture seeds no grant, so the gate had nothing to open against.
+    assert!(
+        copperclaw_db::tables::task_grants::get(&harness.central, "grant-standup-001")
+            .expect("read grant")
+            .is_none(),
+        "ungranted fixture seeds no task_grants row"
+    );
+
+    // Blocked ≠ silent: the read-then-propose reply reached the user.
+    let cli = mock_for(&harness, "cli");
+    assert!(
+        cli.deliveries()
+            .iter()
+            .any(|d| d.message.content.to_string().contains("without approval")),
+        "the ungranted turn must propose the action to a human: {:?}",
+        cli.deliveries()
+    );
+}
+
+/// A3 goal-progress: a long-running goal fires check-in wakes across two
+/// controlled sweep passes (the sweep `MockClock` seam) that straddle the
+/// croner-re-armed `next_checkin`; the woken agent records progress via
+/// `update_goal` on each wake, so the goal accrues two check-ins and two
+/// progress-log rows across the run.
+#[tokio::test]
+async fn cli_goal_progress_reports_across_wakes() {
+    use copperclaw_db::tables::goals;
+
+    let fixture = Fixture::load(fixture_path("cli", "goal-progress")).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    // Seed session_routing so each wake's progress-report reply can deliver.
+    harness.apply_inbound_sql().expect("seed session_routing");
+
+    // Pass 1: the goal's seeded `next_checkin` (00:00:00Z) is due at 00:00:30Z.
+    let t0 = "2026-06-01T00:00:30Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    let r0 = harness
+        .run_goal_sweep_at(t0)
+        .await
+        .expect("goal sweep pass 1");
+    assert_eq!(
+        r0.goal_checkins_fired.len(),
+        1,
+        "pass 1 fires exactly one check-in"
+    );
+
+    // Pass 2: past the re-armed next_checkin (*/5 → 00:05:00Z).
+    let t1 = "2026-06-01T00:06:00Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    let r1 = harness
+        .run_goal_sweep_at(t1)
+        .await
+        .expect("goal sweep pass 2");
+    assert_eq!(
+        r1.goal_checkins_fired.len(),
+        1,
+        "pass 2 fires exactly one check-in"
+    );
+
+    // The goal accrued two check-ins and two progress reports across the wakes.
+    let goal = goals::get(&harness.central, "g-standup")
+        .expect("read goal")
+        .expect("goal row exists");
+    assert_eq!(goal.checkin_count, 2, "two check-in fires across the run");
+    assert_eq!(goal.status, goals::GoalStatus::Active, "goal stays active");
+    let progress = goals::list_progress(&harness.central, "g-standup").expect("list progress");
+    assert_eq!(progress.len(), 2, "one progress row per wake");
+    assert_eq!(
+        goal.tokens_consumed, 100,
+        "cumulative progress accrued (50 tokens per wake)"
+    );
+}
+
 // ---- M18 R1: end-user slash commands (fixture per command, cli + telegram) ----
 
 /// `/stop` persists a control{op:stop} row (kind=system, trigger=0,

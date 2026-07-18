@@ -1,0 +1,10 @@
+{
+  "_note": "Goal check-in wake 1, round 1: the woken agent records progress against the goal via update_goal. The id (g-standup) is the one seeded in central.sql and carried in the check-in wake's content.goal_id. The UpdateGoal effect becomes a `goal` System row the delivery loop applies with goals::record_progress (one progress row + 50 tokens accrued).",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_goal_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_goal_1", "name": "update_goal", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"id\": \"g-standup\", \"progress\": \"Day 1: refreshed the API reference section.\", \"progress_tokens\": 50}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

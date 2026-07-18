@@ -1,0 +1,10 @@
+{
+  "_note": "Granted-act, round 2: after the tool result comes back the model ends the turn with a short report. This is the second provider call inside the single autonomous run_loop turn (the grant is loaded once at turn start; the fire latch means round 2 charges no additional fire).",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_grant_granted_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Posted the morning standup digest."}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}
