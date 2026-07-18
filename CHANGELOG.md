@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (F1: compaction never crash-loops on an empty summary, 2026-07-18)
+
+- **Safety-critical self-recovery fix.** A large-enough session history
+  triggers compaction, which asks the model to summarise the oldest half.
+  When the model returned an **empty** summary, `compact()` in
+  `crates/copperclaw-runner/src/compaction.rs` did
+  `bail!("provider returned an empty summary")`, which propagated through the
+  `run_loop` call site in `crates/copperclaw-runner/src/run/mod.rs` as a fatal
+  `?` and **crashed the runner process**. The host respawned it into the same
+  oversized history → the same empty summary → an **infinite crash-loop that
+  bricked the session** until an operator manually cleared the history. A
+  session must NEVER brick this way.
+- **`compaction.rs`: retry then truncate, never bail.** `summarise` no longer
+  treats an empty response as an error (it returns the possibly-empty text). A
+  new `summarise_with_retry` asks the provider once more on an empty/errored
+  summary; if the retry also yields nothing, `compact()` falls back to
+  **deterministic, LLM-free truncation** — it keeps the recent split it already
+  computes (`history[pivot..]`) plus the verbatim pinned project-facts header
+  (todos / verify stages / DECISIONS / file inventory), drops the oldest
+  messages, and emits an honest `compact_boundary` marker noting the summary
+  was unavailable and history was truncated. Losing old context is vastly
+  better than bricking. Archive-write failure is likewise now non-fatal
+  (logged, compaction continues) for the same reason.
+- **`run/mod.rs`: the auto-compaction call site can no longer exit `run_loop`.**
+  The `.context("compaction failed")?` is replaced with a match that degrades
+  an (now unreachable) unexpected error to a truncated tail instead of
+  propagating. The call is wrapped in a `HeartbeatTicker` so the container's
+  heartbeat is refreshed every 5s across the possibly-slow summary provider
+  call — the host supervisor no longer misreads a healthy compaction as a
+  stale/crashed container and SIGKILLs it.
+- Regression tests in `compaction.rs`: empty summary → truncation (no error,
+  run continues); provider error → truncation; retry path uses the second
+  summary; truncation keeps recent + pins, drops oldest, and fits back under
+  the threshold. The happy-path summary is unchanged.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the

@@ -840,9 +840,32 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             // token count at the trigger point.
             copperclaw_metrics::inc_compaction_triggered(deps.policy.profile().as_str());
             copperclaw_metrics::observe_compaction_estimated_tokens(est_tokens as u64);
-            state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
-                .await
-                .context("compaction failed")?;
+            // F1 (2026-07-18 incident): compaction must NEVER crash the
+            // runner. An empty/failed summary used to `bail!`, which
+            // propagated here as a fatal `?` and exited `run_loop`; the host
+            // respawned into the same oversized history and the same empty
+            // summary — an infinite crash-loop that bricked the session until
+            // an operator cleared history. `compact()` now degrades every
+            // failure (empty summary, provider error, archive write) to
+            // deterministic truncation and returns Ok. The `HeartbeatTicker`
+            // keeps the container marked alive across the (possibly slow)
+            // summary provider call so the host supervisor doesn't SIGKILL a
+            // healthy compaction as "stale". The Err arm is defense-in-depth:
+            // if some future internal error ever escaped `compact()`, continue
+            // with a truncated tail rather than exiting the loop.
+            state.history = {
+                let _hb = provider_call::HeartbeatTicker::start(deps.heartbeat_path.clone());
+                match compact(state.history, deps.provider.as_ref(), &deps.compaction).await {
+                    Ok(compacted) => compacted,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "compaction returned an unexpected error; continuing with truncated history"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
         }
 
         // Resume-after-crash guard — see `is_prompt_already_in_history`.

@@ -341,20 +341,89 @@ pub async fn compact(
     let oldest = history[..pivot].to_vec();
     let newest = history[pivot..].to_vec();
 
-    write_archive(&cfg.archive_dir, &history)
-        .with_context(|| format!("archive transcript to {}", cfg.archive_dir.display()))?;
+    // Archiving the pre-compaction transcript is best-effort. A failed
+    // archive write must NEVER abort compaction — bailing here would
+    // propagate a fatal `?` out of `run_loop` and crash-loop the runner
+    // (the 2026-07-18 crash-loop-brick class of failure). Log and continue;
+    // losing an archive file is vastly better than bricking the session.
+    if let Err(e) = write_archive(&cfg.archive_dir, &history) {
+        tracing::warn!(
+            error = %e,
+            archive_dir = %cfg.archive_dir.display(),
+            "compaction: failed to archive pre-compaction transcript; continuing without archive"
+        );
+    }
 
-    let summary = summarise(provider, cfg, oldest).await?;
+    // Ask the provider for a summary, retrying ONCE on an empty/failed
+    // response. If both attempts come back empty or error, fall back to
+    // deterministic, LLM-free truncation rather than bailing: keep the
+    // recent split (`newest`) plus the re-pinned facts header, drop the
+    // oldest messages, and emit an honest `compact_boundary` marker noting
+    // the summary was unavailable. An empty summary must NEVER crash the
+    // runner (F1 — 2026-07-18 incident). See `summarise_with_retry`.
+    let boundary = if let Some(summary) = summarise_with_retry(provider, cfg, &oldest).await {
+        format!("compact_boundary: {summary}")
+    } else {
+        tracing::error!(
+            oldest_dropped = oldest.len(),
+            newest_kept = newest.len(),
+            "compaction: summary unavailable after retry; falling back to \
+             deterministic truncation (dropping oldest messages, keeping \
+             recent turns + pinned facts). Run continues."
+        );
+        "compact_boundary: [summary unavailable — older messages were \
+         truncated to fit the context window]"
+            .to_string()
+    };
 
     let mut out = Vec::with_capacity(newest.len() + 2);
     if let Some(header) = facts {
         out.push(HistoryMessage::User { content: header });
     }
-    out.push(HistoryMessage::User {
-        content: format!("compact_boundary: {summary}"),
-    });
+    out.push(HistoryMessage::User { content: boundary });
     out.extend(newest);
     Ok(out)
+}
+
+/// Ask the provider to summarise `oldest`, retrying **once** on an empty or
+/// failed response.
+///
+/// Returns `Some(summary)` on a non-empty summary from either attempt, or
+/// `None` when both attempts come back empty/errored — the signal for
+/// [`compact`] to fall back to deterministic truncation instead of bailing.
+/// An empty summary is treated as "no summary", never a hard error: the
+/// original `bail!("provider returned an empty summary")` was the exact line
+/// that crash-looped and bricked a session on 2026-07-18.
+///
+/// The retry is a fresh, identical [`summarise`] call. An empty or errored
+/// summary is most often a transient provider hiccup, so a plain re-ask is
+/// the simplest nudge that recovers it without complicating the request
+/// shape; if it still fails, truncation is the safe, deterministic backstop.
+async fn summarise_with_retry(
+    provider: &dyn AgentProvider,
+    cfg: &CompactionCfg,
+    oldest: &[HistoryMessage],
+) -> Option<String> {
+    match summarise(provider, cfg, oldest.to_vec()).await {
+        Ok(s) if !s.trim().is_empty() => return Some(s),
+        Ok(_) => {
+            tracing::warn!("compaction: provider returned an empty summary; retrying once");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "compaction: summary attempt failed; retrying once");
+        }
+    }
+    match summarise(provider, cfg, oldest.to_vec()).await {
+        Ok(s) if !s.trim().is_empty() => Some(s),
+        Ok(_) => {
+            tracing::warn!("compaction: retry also returned an empty summary; truncating");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "compaction: retry summary attempt also failed; truncating");
+            None
+        }
+    }
 }
 
 /// Prepend the pinned facts header (if any) to `history`. Used on the
@@ -713,9 +782,12 @@ async fn summarise(
             _ => continue,
         }
     }
-    if summary.trim().is_empty() {
-        anyhow::bail!("provider returned an empty summary");
-    }
+    // An empty response is NOT an error here. The caller
+    // (`summarise_with_retry`) treats an empty summary as "no summary" and
+    // retries, then falls back to deterministic truncation — it must never
+    // become a fatal `bail!` that crash-loops and bricks the session (the
+    // 2026-07-18 incident). Return the (possibly-empty) text and let the
+    // caller decide.
     Ok(summary)
 }
 
@@ -1140,30 +1212,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_propagates_provider_error() {
+    async fn compact_falls_back_to_truncation_on_provider_error() {
+        // F1: a provider that errors on every summary attempt must NOT crash
+        // the runner (pre-fix this bubbled a fatal error out of `compact`).
+        // `compact` retries once, then falls back to deterministic truncation
+        // and returns Ok — the run continues.
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_dir(tmp.path().to_path_buf());
         let provider = ErrorProvider;
-        let err = compact(long_history(8), &provider, &cfg).await.unwrap_err();
-        assert!(err.to_string().contains("synthetic"));
+        let out = compact(long_history(8), &provider, &cfg).await.unwrap();
+        // No pinned facts header (empty data root), so out[0] is the honest
+        // truncation boundary marker; the recent half is retained.
+        match &out[0] {
+            HistoryMessage::User { content } => {
+                assert!(content.starts_with("compact_boundary: "));
+                assert!(content.contains("unavailable"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // len 8 -> pivot 4 -> newest 4, + boundary = 5 (oldest 4 dropped).
+        assert_eq!(out.len(), 5);
+    }
+
+    /// Provider that returns an empty summary on every attempt — the exact
+    /// shape that crash-looped and bricked a session on 2026-07-18.
+    struct EmptyProvider;
+    #[async_trait]
+    impl AgentProvider for EmptyProvider {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            Ok(Box::new(StubQuery {
+                events: Mutex::new(vec![ProviderEvent::Result {
+                    text: Some(String::new()),
+                }]),
+            }))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
-    async fn compact_errors_on_empty_summary() {
-        struct EmptyProvider;
+    async fn compact_falls_back_to_truncation_on_empty_summary() {
+        // The 2026-07-18 incident, pinned as a regression test: an EMPTY
+        // summary used to `bail!("provider returned an empty summary")`, which
+        // propagated as a fatal `?` out of `run_loop` and crash-looped the
+        // runner until an operator cleared history. Post-F1 it degrades to
+        // deterministic truncation and returns Ok — the run MUST continue and
+        // NO error is returned.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let out = compact(long_history(8), &EmptyProvider, &cfg)
+            .await
+            .expect("empty summary must NOT return an error — it truncates");
+        let boundary = match &out[0] {
+            HistoryMessage::User { content } => content,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(boundary.starts_with("compact_boundary: "));
+        assert!(
+            boundary.contains("unavailable"),
+            "truncation boundary must be honest that the summary was unavailable"
+        );
+        // Recent half retained (len 8 -> pivot 4 -> newest 4), oldest dropped.
+        assert_eq!(out.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn compact_retries_once_and_uses_the_second_summary() {
+        // Part (b): the first summary attempt comes back empty; the retry
+        // succeeds. `compact` must use the retry's summary and NOT truncate.
+        struct FlakyProvider {
+            calls: std::sync::atomic::AtomicUsize,
+        }
         #[async_trait]
-        impl AgentProvider for EmptyProvider {
+        impl AgentProvider for FlakyProvider {
             fn name(&self) -> &'static str {
-                "empty"
+                "flaky"
             }
             async fn query(
                 &self,
                 _input: QueryInput,
             ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let text = if n == 0 {
+                    String::new() // first attempt: empty
+                } else {
+                    "RETRY-SUMMARY".to_string() // retry: real summary
+                };
                 Ok(Box::new(StubQuery {
-                    events: Mutex::new(vec![ProviderEvent::Result {
-                        text: Some(String::new()),
-                    }]),
+                    events: Mutex::new(vec![ProviderEvent::Result { text: Some(text) }]),
                 }))
             }
             fn is_session_invalid(&self, _err: &ProviderError) -> bool {
@@ -1172,10 +1312,87 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_dir(tmp.path().to_path_buf());
-        let err = compact(long_history(8), &EmptyProvider, &cfg)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("empty summary"));
+        let provider = FlakyProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let out = compact(long_history(8), &provider, &cfg).await.unwrap();
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "compact must have retried the empty summary exactly once"
+        );
+        match &out[0] {
+            HistoryMessage::User { content } => {
+                assert!(content.starts_with("compact_boundary: "));
+                assert!(
+                    content.contains("RETRY-SUMMARY"),
+                    "the retry's summary must be used, not a truncation marker"
+                );
+                assert!(!content.contains("unavailable"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_fallback_keeps_recent_and_pins_drops_oldest_under_threshold() {
+        // Part (c): with a project seeded (pins) and a provider that only ever
+        // returns empty summaries, `compact` truncates: it keeps the pinned
+        // facts header + the recent split, drops the oldest messages, and the
+        // result fits back under the compaction threshold. Deterministic — no
+        // LLM output is used.
+        let data = tempfile::tempdir().unwrap();
+        seed_project_state(data.path());
+        let archive = tempfile::tempdir().unwrap();
+
+        // A long history that is over-threshold before compaction, whose
+        // recent half is comfortably under it. Compute the split estimates and
+        // pick a threshold strictly between the recent half and the full
+        // transcript so the assertions can't be off-by-a-token.
+        let history: Vec<HistoryMessage> = (0..600)
+            .map(|i| HistoryMessage::User {
+                content: format!("this is message number {i} with some filler text"),
+            })
+            .collect();
+        let pivot = history.len() / 2; // all User rows, no tool pairs -> plain midpoint
+        let recent_est = estimate_tokens(&history[pivot..]);
+        let full_est = estimate_tokens(&history);
+        // Threshold: recent half + slack for the pinned header, well under full.
+        let threshold = recent_est + 800;
+        assert!(
+            threshold < full_est,
+            "test setup: threshold {threshold} must be below full transcript {full_est}"
+        );
+        let cfg = CompactionCfg {
+            data_root: data.path().to_path_buf(),
+            soft_target_tokens: threshold,
+            ..cfg_with_dir(archive.path().to_path_buf())
+        };
+        assert!(
+            cfg.should_compact(full_est),
+            "precondition: full transcript must be over threshold"
+        );
+
+        let out = compact(history, &EmptyProvider, &cfg).await.unwrap();
+
+        // Pinned facts header survives verbatim at the front...
+        assert!(is_pinned_facts_header(&out[0]), "pins must be kept");
+        // ...followed by the honest truncation boundary marker...
+        match &out[1] {
+            HistoryMessage::User { content } => {
+                assert!(content.starts_with("compact_boundary: "));
+                assert!(content.contains("unavailable"));
+            }
+            other => panic!("expected truncation boundary, got {other:?}"),
+        }
+        // ...and only the recent split (oldest dropped).
+        assert_eq!(out.len(), pivot + 2, "header + boundary + recent half only");
+        // The truncated history fits back under the threshold — the whole
+        // point of compaction, achieved without an LLM.
+        assert!(
+            !cfg.should_compact(estimate_tokens(&out)),
+            "truncated history must fit under the threshold"
+        );
     }
 
     #[test]
