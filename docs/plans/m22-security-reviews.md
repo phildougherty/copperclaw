@@ -133,3 +133,92 @@ enforcing boundaries. No new privilege, no new network reach.
 **Verdict: PASS** — reuses the existing egress/SSRF posture, adds no outward
 capability, and the attach flow is read-only-plus-`.copperclaw/`-writes with
 allowlisted, injection-safe stage inference.
+
+---
+
+## A1 — Task capability grants: schema + approval-gated authoring (Wave 2, lanes DB+H+MCP)
+
+**Scope.** A1 introduces the *data + authoring* half of the autonomy brake in
+reverse: a `task_grants` table (migration 030) that records a durable,
+human-approved authorization for an AUTONOMOUS fire of a scheduled task to take
+a real external action; a `schedule_task` `grant` arg that proposes one; the
+approval round-trip that persists it; and the `effective_grant` read API A2
+consumes. A1 does NOT itself open any gate — it stores authorization and
+provides inert-by-default reads. Enforcement (turning a live grant into an
+`approved` turn) is A2. New/changed code:
+`crates/copperclaw-db/migrations/030_task_grants.sql`,
+`crates/copperclaw-db/src/tables/task_grants.rs` (+ `tasks.rs` lookup helper +
+`migrate.rs` registration), `crates/copperclaw-mcp/src/tools/scheduling.rs`
+(+ `context.rs` spec/effect), `crates/copperclaw-runner/src/tools.rs`
+(system-row serialization), `crates/copperclaw-host-delivery/src/service.rs`
+(`raise_task_grant_approval`), `crates/copperclaw-host/src/handlers/approvals.rs`
+(`apply_task_grant`).
+
+**Threat model.** This is a NEW capability to *record authorization to act*, so
+the questions are: (a) can a grant be created without a human approving it;
+(b) can a grant authorize more than the human agreed to (scope creep, unbounded
+spend, non-expiring / standing grants); (c) can a stale, revoked, or exhausted
+grant still read as live; (d) can the agent forge or self-elevate a grant by
+steering the payload the host trusts; (e) blast radius if the matcher is wrong.
+
+**Mitigations / argument.**
+
+- **No grant without human approval.** There is deliberately no "insert pending"
+  path in the DB layer — the ONLY writer of a `task_grants` row is
+  `apply_task_grant`, which runs on the operator-approve edge. The pending state
+  lives entirely in `pending_approvals`. So "no row" and "not approved" are the
+  same observable state: `effective_grant` returns `None` until a human
+  approves. Unit-tested end-to-end (`approve_task_grant_persists_and_reads_live`
+  vs `deny_task_grant_leaves_no_grant`: deny persists nothing).
+- **Bounded, never standing (decision (b)).** The authoring tool REQUIRES an
+  absolute `expires_at`, caps it at `MAX_GRANT_HORIZON_DAYS` (365) so a
+  "bounded" grant can't be effectively perpetual, requires at least one spend
+  bound (`token_budget` or `max_fires`, both validated positive), and rejects a
+  past-dated expiry. Every bound is re-derived at read time by `effective_grant`
+  (expiry vs supplied `now`, `tokens_consumed >= token_budget`,
+  `fires_consumed >= max_fires`) — an over-budget / expired grant reads inert
+  regardless of `status`. Unit-tested (`over_fire_budget_reads_inert`,
+  `over_token_budget_reads_inert`, `expired_grant_reads_inert`,
+  `expiry_is_evaluated_against_supplied_now`).
+- **Revocable + inert-by-default reads.** `revoke` flips `status` + stamps
+  `revoked_at`; `effective_grant` requires approved-AND-not-revoked, so a
+  revoked grant reads `None` even with budget/time left
+  (`revoked_grant_reads_inert`). The newest grant is authoritative and does NOT
+  fall back to an older live one, so re-authoring supersedes cleanly
+  (`newest_grant_is_authoritative_and_supersedes`).
+- **The host, not the agent, controls the trusted fields.** The agent proposes
+  scope + bounds, but the *task binding* is host-resolved: the delivery raise
+  looks up the concrete `task_id` from the session's own tasks
+  (`latest_for_session_by_name`, scoped to the firing session) and stamps it
+  into the pending payload — the agent cannot point a grant at another session's
+  or group's task. `granted_by` is the approving operator identity
+  (`decided_by`), never agent-supplied. Scope tokens are validated against a
+  fixed grammar (non-empty class per token) before an approval is ever raised.
+- **Tight, auditable matcher.** `scope_permits` is case-sensitive, does class /
+  resource matching only, and has NO implicit cross-class or wildcard-widening
+  behavior beyond an explicit `class:*`/bare-class class-level grant. An empty
+  scope permits nothing. Exhaustively unit-tested (exact, resource-no-widen,
+  class-level-covers-all, no-cross-class, multi-token-any, empty-permits-nothing,
+  colon-in-resource). A2 depends on these exact semantics — documented in the
+  module doc-comment.
+- **Fail-safe raise.** If the task can't be resolved (e.g. its create failed) or
+  the payload is malformed, `raise_task_grant_approval` records a self-mod
+  failure the agent sees rather than silently dropping — and NO approval is
+  raised, so nothing can be approved into existence for a non-existent task.
+
+**Residual risk.** Low-moderate, and bounded to the authoring surface. The grant
+merely *records* permission; the actual gate that turns permission into action
+is A2 (reviewed separately, MOST security-sensitive). The one soft edge is task
+binding by (session, name) rather than a client-chosen id — mitigated by
+resolving newest-in-session at raise time (the just-created task) and by the
+FK to `tasks(id)`; a reused name within a session picks the freshest row, which
+is the intended target. Grant *consumption* accounting (`consume_fire` /
+`consume_tokens`) is exposed but only wired by A2; until then a grant's fires/
+tokens do not auto-decrement, which is safe (it can only read MORE inert, never
+less, than reality once A2 records spend).
+
+**Verdict: PASS** — approval-gated (no persist without human approval), bounded
+(mandatory capped expiry + required spend bound), revocable, inert-by-default at
+every read, host-controlled task binding + granter identity, and a tight
+exhaustively-tested scope matcher. A1 adds authorization *data*, not an open
+gate; the gate itself is A2's review.

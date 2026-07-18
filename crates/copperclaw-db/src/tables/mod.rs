@@ -33,6 +33,7 @@ pub mod provider_profiles;
 pub mod session_routing;
 pub mod session_state;
 pub mod sessions;
+pub mod task_grants;
 pub mod tasks;
 pub mod unregistered_senders;
 pub mod user_dms;

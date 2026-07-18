@@ -67,6 +67,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Scheduling — every op (create / list / cancel / pause / resume /
         // update) emits the same top-level "schedule" key with an inner `op`.
         "schedule",
+        // M22 A1: agent-authored task capability grant (apply_author_task_grant).
+        // Emitted alongside a `schedule` create when `schedule_task` carried a
+        // `grant`. Intercepted inline (see `inline_handler_set`): the delivery
+        // service resolves the task id, raises an approval, and persists the
+        // grant only on operator approval.
+        "task_grant",
         // M18 Task HUD in-place edits. `RunnerToolCtx::emit_task_hud`
         // (via `insert_update_breadcrumb_row` in tools.rs) writes a
         // System row carrying this action; the host's delivery service
@@ -92,6 +98,11 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // can raise a pending approval (with `self.central`) and dispatch the
         // approval card, then write the skill only on operator approval.
         "save_skill",
+        // M22 A1: `task_grant` is intercepted inline so the delivery service
+        // can resolve the concrete task id (with `self.central`), raise a
+        // pending approval, and dispatch the approval card — persisting the
+        // grant only on operator approval.
+        "task_grant",
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. Intercepted inline (rather than
         // via the module registry) so the host can resolve the prior

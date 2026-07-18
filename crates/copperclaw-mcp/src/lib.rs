@@ -29,7 +29,7 @@ pub mod tools;
 
 pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, SharedMcpClient};
 pub use context::{
-    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec,
+    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, AuthorTaskGrantSpec, CreateAgentSpec,
     DEFAULT_DELEGATE_BATCH_TIMEOUT_SECS, DelegateBatchOutcome, DelegateBatchRequest,
     DelegateBatchWorker, DelegateSpec, EditMessageSpec, EmitTodoListSpec, InstallScope,
     InstallSpec, MAX_DELEGATE_BATCH_TIMEOUT_SECS, MAX_DELEGATE_BATCH_WIDTH, MemoryHitView,
