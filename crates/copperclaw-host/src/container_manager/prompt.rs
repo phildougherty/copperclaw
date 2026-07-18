@@ -871,6 +871,13 @@ pub(crate) fn db_selector_to_skills_selector(
         container_configs::SkillsSelector::Explicit(names) => {
             copperclaw_skills::SkillsSelector::Explicit(names.clone())
         }
+        // M22 S2: relevance narrowing carries through 1:1.
+        container_configs::SkillsSelector::Relevant { query, limit } => {
+            copperclaw_skills::SkillsSelector::Relevant {
+                query: query.clone(),
+                limit: *limit,
+            }
+        }
     }
 }
 
@@ -1406,7 +1413,19 @@ mod tests {
         let mapped = db_selector_to_skills_selector(&DbSel::Explicit(names.clone()));
         match mapped {
             copperclaw_skills::SkillsSelector::Explicit(out) => assert_eq!(out, names),
-            copperclaw_skills::SkillsSelector::All => panic!("expected Explicit, got All"),
+            other => panic!("expected Explicit, got {other:?}"),
+        }
+        // M22 S2: relevance narrowing maps through with query + limit intact.
+        let rel = db_selector_to_skills_selector(&DbSel::Relevant {
+            query: "deploy".to_string(),
+            limit: 5,
+        });
+        match rel {
+            copperclaw_skills::SkillsSelector::Relevant { query, limit } => {
+                assert_eq!(query, "deploy");
+                assert_eq!(limit, 5);
+            }
+            other => panic!("expected Relevant, got {other:?}"),
         }
     }
 
