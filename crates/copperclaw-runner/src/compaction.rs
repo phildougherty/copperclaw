@@ -385,6 +385,42 @@ pub async fn compact(
     Ok(out)
 }
 
+/// Deterministically truncate `history` to at most the last `keep` messages,
+/// with no LLM call. The safe, LLM-free backstop: F1's compaction falls back
+/// to keeping a recent slice when the summariser is unavailable, and F2's
+/// host-driven recovery mode reuses this to aggressively shrink an oversized
+/// persisted history at runner startup so a context/history problem that
+/// crash-loops a session self-heals instead of looping forever.
+///
+/// Keeps the tail — the most recent turns, the working context a resumed
+/// session actually needs — and drops the oldest. To stay compatible with
+/// strict providers that reject a transcript beginning on an orphan tool
+/// result ("tool call and result not match"), any leading `Tool` result in
+/// the kept window (whose matching `ToolUse` was truncated away, so it can
+/// only be an orphan — a result always follows its use) is stripped so the
+/// window never starts mid-pair.
+///
+/// Edge cases are handled gracefully: `keep == 0` yields an empty history,
+/// and a history already at or under `keep` is returned unchanged apart from
+/// any leading orphan tool result.
+#[must_use]
+pub fn truncate_to_recent(history: Vec<HistoryMessage>, keep: usize) -> Vec<HistoryMessage> {
+    let start = history.len().saturating_sub(keep);
+    let mut tail: Vec<HistoryMessage> = history.into_iter().skip(start).collect();
+    // Advance past any leading orphan `Tool` results: a kept window that
+    // begins on a tool result whose `ToolUse` was dropped is rejected by
+    // strict providers. A `Tool` at the front of the kept slice is always an
+    // orphan because a result never precedes its use in a valid transcript.
+    let mut lead = 0;
+    while lead < tail.len() && matches!(tail[lead], HistoryMessage::Tool { .. }) {
+        lead += 1;
+    }
+    if lead > 0 {
+        tail.drain(..lead);
+    }
+    tail
+}
+
 /// Ask the provider to summarise `oldest`, retrying **once** on an empty or
 /// failed response.
 ///
@@ -898,6 +934,55 @@ mod tests {
         HistoryMessage::User {
             content: "x".into(),
         }
+    }
+
+    #[test]
+    fn truncate_to_recent_keeps_the_tail() {
+        // Keeps the last `keep` messages, drops the oldest.
+        let h = vec![txt(), txt(), txt(), txt(), txt()];
+        let out = truncate_to_recent(h, 2);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn truncate_to_recent_shorter_than_keep_is_unchanged() {
+        let h = vec![txt(), txt()];
+        let out = truncate_to_recent(h.clone(), 10);
+        assert_eq!(out, h);
+    }
+
+    #[test]
+    fn truncate_to_recent_zero_keep_is_empty() {
+        let h = vec![txt(), txt(), txt()];
+        assert!(truncate_to_recent(h, 0).is_empty());
+    }
+
+    #[test]
+    fn truncate_to_recent_strips_leading_orphan_tool_result() {
+        // The window boundary lands so the kept slice would start on a
+        // `Tool` result whose `ToolUse` was dropped — a strict provider
+        // rejects that. The helper strips the orphan so the window starts
+        // clean on a real message.
+        let h = vec![txt(), tu("a"), tr("a"), txt(), txt()];
+        // keep=3 → tail is [tr("a"), txt, txt]; the leading orphan tr is
+        // stripped, leaving [txt, txt].
+        let out = truncate_to_recent(h, 3);
+        assert!(
+            !matches!(out.first(), Some(HistoryMessage::Tool { .. })),
+            "kept window must not start on an orphan tool result"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn truncate_to_recent_strips_parallel_leading_orphans() {
+        // Two orphan tool results at the front (a parallel batch whose uses
+        // were dropped) are both stripped.
+        let h = vec![txt(), tu("a"), tu("b"), tr("a"), tr("b"), txt()];
+        // keep=3 → tail [tr a, tr b, txt]; both orphan results stripped.
+        let out = truncate_to_recent(h, 3);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], HistoryMessage::User { .. }));
     }
 
     #[test]

@@ -1008,6 +1008,9 @@ impl ReplayHarness {
             active_grant: std::sync::Arc::new(std::sync::Mutex::new(
                 copperclaw_runner::run::GrantGateState::default(),
             )),
+            // F2: replay fixtures exercise the healthy path — recovery-mode
+            // startup truncation off, so loaded history is byte-identical.
+            recovery_mode: false,
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS
