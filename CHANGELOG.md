@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **New `web-backend` skill** (`skills/web-backend/SKILL.md`): the backend
+  counterpart to `web-app-scaffold`, for apps that go past static files.
+  Covers choosing a datastore deliberately (SQLite for single-node prototypes
+  with the kill-safe `journal_mode = DELETE` caveat, Postgres for concurrent /
+  production-shaped data, and when NOT to hand-roll over a JSON blob), designing
+  HTTP endpoints that return proper status codes + validated input + structured
+  errors instead of raw 500s, laying out `server/` (db/data-access layer,
+  routes, seed) separately from the frontend with env-based config, and wiring
+  the two via the vite `/api` proxy. Motivated by a real build that shipped
+  SQLite-only with WAL-on-bind-mount and an API that 500'd the caller. Cross-
+  linked from `web-app-scaffold`.
+
 ### Fixed
 
 - **Preview links can advertise a stable off-LAN host (e.g. Tailscale).** When
