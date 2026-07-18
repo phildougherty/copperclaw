@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 S2 — relevance scorer for skill selection)
+
+- `SkillsSelector::Relevant { query, limit }` in
+  `crates/copperclaw-skills/src/registry.rs` — a third skills selector
+  alongside `All`/`Explicit`. It inlines only the up-to-`limit` skills whose
+  frontmatter `description` is most relevant to the current task `query`,
+  cutting the all-skills prompt bloat noted in `copperclaw-runner`'s
+  `compaction.rs` (all ~41 skills previously spliced whole into the system
+  prompt regardless of the task). Inline-`All` stays the default (M22 decision
+  **e**: relevance narrows what inlines, it does not replace the default);
+  `All`/`Explicit` behavior is byte-identical. Serializes as
+  `{"relevant": {"query": "...", "limit": N}}`.
+- `crates/copperclaw-skills/src/relevance.rs` (new module) — the scoring pass.
+  It **reuses the memory store's full-text path** rather than inventing a
+  ranking: an in-memory `SQLite` FTS5 index over the descriptions, matched with
+  the same tokenized `MATCH` expression and ranked by `bm25`, then normalized
+  to `[0, 1]` (best match = 1.0) exactly as `copperclaw_db::memory::search`
+  does (migration 021 `memory_store`/`memory_fts`). The tokenizer + normalizer
+  are reproduced to the same contract because the two crates deliberately don't
+  depend on each other and the memory helpers are private to `copperclaw-db`.
+  Exposed as `rank_descriptions()` + `SkillRegistry::select_relevant()`; the
+  latter fails open to the full set on an empty/tokenless query or an FTS error
+  so a scoring hiccup never strips every skill. Adds `rusqlite` (workspace,
+  bundled — same dep the memory store uses) to `copperclaw-skills`.
+- Unit tests cover the ranking (on-topic skill ranks first, off-topic query
+  selects fewer skills than `All`, `limit` cap, tie-break by name, FTS-operator
+  safety) and the `Relevant` selector serde round-trip.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the
