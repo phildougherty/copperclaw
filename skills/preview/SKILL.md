@@ -35,10 +35,15 @@ URL.
    (and an optional short `name`). It returns a URL plus a validity
    note.
 
-4. **Send the returned URL to the user verbatim.** Do not shorten,
-   rewrite, or invent a URL — the token in the link is what grants
-   access, and only the exact string the tool returned works. Include
-   the note about idle expiry.
+4. **Send the returned URL to the user verbatim, as copyable text.** Do
+   not shorten, rewrite, or invent a URL — the token in the link is what
+   grants access, and only the exact string the tool returned works. Put
+   the FULL link (scheme + `:port` + `/__preview/<token>`) in the message
+   body as plain text (not only a card button), so the operator can
+   long-press → Copy Link and open it in any browser. Tell them: the link
+   works in Safari/Chrome too, but they must open THIS whole link — the
+   bare domain (what the address bar or a share sheet shows after the
+   redirect) 403s because it has no token. Include the idle-expiry note.
 
 5. **Call `close_preview` with the same port** when the user says
    they are done, asks you to take it down, or the task is finished.
