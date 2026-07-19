@@ -15,8 +15,8 @@ use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outboun
 use copperclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use copperclaw_runner::{
     RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps, compaction::CompactionCfg,
-    resolve_max_task_tokens, resolve_max_tool_turns, resolve_provider_deadline,
-    resolve_tool_deadline_secs, run_loop,
+    resolve_max_task_tokens, resolve_max_tool_turns, resolve_max_tool_turns_hard,
+    resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -153,6 +153,13 @@ async fn main() -> Result<()> {
     tool_defs.extend(copperclaw_runner::run::preview::preview_tool_defs());
     let external_tools = std::sync::Arc::new(external_routes);
 
+    // Resolve the smart auto-continue budget: the SOFT per-block cap and the
+    // HARD ceiling (default soft * 6, clamped) that bounds the worst-case total
+    // tool turns for a single inbound. Resolved together so the hard ceiling is
+    // sized off the operator's actual soft cap.
+    let max_tool_turns = resolve_max_tool_turns(&env);
+    let max_tool_turns_hard = resolve_max_tool_turns_hard(&env, max_tool_turns);
+
     // Wire the subagent deps onto the ctx so the `explore` tool can
     // open a fresh bounded LLM loop with the same provider, model,
     // and tool inventory the parent runner uses.
@@ -211,7 +218,8 @@ async fn main() -> Result<()> {
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         external_tools,
-        max_tool_turns: resolve_max_tool_turns(&env),
+        max_tool_turns,
+        max_tool_turns_hard,
         max_task_tokens: resolve_max_task_tokens(&env),
         provider_deadline,
         tool_deadline_secs: resolve_tool_deadline_secs(&env),

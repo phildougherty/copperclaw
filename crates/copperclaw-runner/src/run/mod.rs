@@ -220,6 +220,109 @@ pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
     parsed
 }
 
+/// Env var operators use to override the HARD tool-turn ceiling — the
+/// absolute maximum number of tool-use cycles a single inbound may run
+/// across ALL smart auto-continue blocks before the runner stops and asks
+/// the operator to send `continue`. This is the runaway backstop for the
+/// progress-gated budget (see [`drive_turn`]): the soft cap
+/// ([`MAX_TOOL_TURNS_ENV`]) is one "block", and a block that made real
+/// progress extends the budget by another block WITHOUT interrupting the
+/// operator — but the total is always bounded by this hard ceiling so a
+/// productive-looking loop can never run unbounded.
+///
+/// Resolved next to [`resolve_max_tool_turns`] via
+/// [`resolve_max_tool_turns_hard`]. Set it EQUAL to the soft cap to disable
+/// extension entirely (the historical flat-cap behaviour). The default is
+/// `soft * 6` (so a fresh install extends generously), clamped to
+/// [`MAX_MAX_TOOL_TURNS_HARD`] and to `>= soft`.
+///
+/// [`drive_turn`]: crate::run::drive_turn
+pub const MAX_TOOL_TURNS_HARD_ENV: &str = "COPPERCLAW_MAX_TOOL_TURNS_HARD";
+
+/// Absolute ceiling for the hard tool-turn bound. Even an operator who
+/// cranks [`MAX_TOOL_TURNS_HARD_ENV`] up cannot push a single inbound past
+/// this many tool turns — beyond it a "productive" loop is a runaway by any
+/// measure, so we refuse to honour a higher configured value and clamp to
+/// this (with a WARN). At the default soft cap of 150 the default hard
+/// ceiling is 900, comfortably under this clamp; the clamp only bites for an
+/// operator who sets both the soft cap and the hard ceiling very high.
+pub const MAX_MAX_TOOL_TURNS_HARD: usize = 1200;
+
+/// The default hard ceiling derived from a resolved `soft` cap: `soft * 6`,
+/// clamped to [`MAX_MAX_TOOL_TURNS_HARD`] and floored at `soft` (so the hard
+/// ceiling can never sit below the soft cap even for a pathological `soft`).
+/// A fresh install (soft = [`DEFAULT_MAX_TOOL_TURNS`] = 150) gets a hard
+/// ceiling of 900.
+#[must_use]
+fn default_max_tool_turns_hard(soft: usize) -> usize {
+    soft.saturating_mul(6)
+        .min(MAX_MAX_TOOL_TURNS_HARD)
+        .max(soft)
+}
+
+/// Resolve the HARD tool-turn ceiling from the env, given the already-resolved
+/// `soft` cap. Mirrors [`resolve_max_tool_turns`]'s shape: unset returns the
+/// derived default (`soft * 6`, clamped — see [`default_max_tool_turns_hard`]);
+/// an unparseable value warns once and returns that default; an in-range value
+/// is honoured; an out-of-range value is CLAMPED into `[soft,
+/// MAX_MAX_TOOL_TURNS_HARD]` (with a one-shot WARN) rather than reset to the
+/// default, so an operator who asks for "as high as possible" gets the max
+/// rather than a surprise drop back to `soft * 6`.
+///
+/// Setting the env EQUAL to `soft` is a legitimate configuration (extension
+/// disabled → flat-cap behaviour), not a misconfig, so it never warns. The
+/// misconfig warn fires exactly once per process via a `OnceLock<()>` guard,
+/// same as its sibling.
+#[must_use]
+pub fn resolve_max_tool_turns_hard(env: &dyn crate::config::EnvLookup, soft: usize) -> usize {
+    static MISCONFIG_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let default = default_max_tool_turns_hard(soft);
+    let warn_once = |line: &str, raw: &str| {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TOOL_TURNS_HARD_ENV,
+                value = %raw,
+                "{line} (clamped; suppressing further warnings this process)",
+            );
+        });
+    };
+    let Some(raw) = env.get(MAX_TOOL_TURNS_HARD_ENV) else {
+        return default;
+    };
+    let Ok(parsed) = raw.parse::<usize>() else {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TOOL_TURNS_HARD_ENV,
+                value = %raw,
+                "hard tool-turn ceiling is not a valid integer (using default {default}; suppressing further warnings this process)",
+            );
+        });
+        return default;
+    };
+    // Clamp into [soft, MAX_MAX_TOOL_TURNS_HARD]. A value below the soft cap
+    // would make the run bail before even one soft block completes, so we
+    // floor it at `soft` (which also disables extension) rather than honour it.
+    if parsed < soft {
+        warn_once(
+            &format!(
+                "hard tool-turn ceiling {parsed} is below the soft cap {soft}; clamping up to {soft} (extension disabled)"
+            ),
+            &raw,
+        );
+        return soft;
+    }
+    if parsed > MAX_MAX_TOOL_TURNS_HARD {
+        warn_once(
+            &format!(
+                "hard tool-turn ceiling {parsed} exceeds the absolute max {MAX_MAX_TOOL_TURNS_HARD}; clamping down"
+            ),
+            &raw,
+        );
+        return MAX_MAX_TOOL_TURNS_HARD;
+    }
+    parsed
+}
+
 /// Env var operators use to override the per-TASK token ceiling — the
 /// total input+output tokens a single inbound's tool-loop may spend
 /// before the runner hard-aborts. Distinct from the per-DAY group cap
@@ -387,9 +490,31 @@ pub struct RunnerDeps {
     /// ([`external_mcp::dispatch_external`]) instead of the in-container
     /// `tool_map`. Empty when the group configures no external MCP servers.
     pub external_tools: Arc<HashMap<String, external_mcp::ExternalToolRoute>>,
-    /// Hard cap on consecutive tool-use turns per inbound. Stops a
-    /// confused model from looping forever. Default 20.
+    /// SOFT cap on consecutive tool-use turns per inbound — one smart
+    /// auto-continue "block". When a full block completes without an earlier
+    /// bail (loop-breaker / token ceiling / parse-error), [`drive_turn`]
+    /// consults [`Self::max_tool_turns_hard`]: if the block made real progress
+    /// (a successful non-read-only tool call) it EXTENDS by another block
+    /// without interrupting the operator; otherwise it stops and asks. Resolved
+    /// from [`MAX_TOOL_TURNS_ENV`]; the `minimal` default is
+    /// [`DEFAULT_MAX_TOOL_TURNS`].
+    ///
+    /// [`drive_turn`]: crate::run::drive_turn
     pub max_tool_turns: usize,
+    /// HARD ceiling on the TOTAL tool-use turns per inbound across ALL smart
+    /// auto-continue blocks — the runaway backstop. Once the cumulative turn
+    /// count reaches this, [`drive_turn`] stops and surfaces a "hit the hard
+    /// ceiling — send 'continue'" message EVEN IF the agent is still making
+    /// progress, so a productive-looking loop can never run unbounded: the
+    /// worst-case total tool turns for a single inbound is exactly this value.
+    /// Must be `>= max_tool_turns`; set EQUAL to it to disable extension (the
+    /// historical flat-cap behaviour). The runner binary resolves it from
+    /// [`MAX_TOOL_TURNS_HARD_ENV`] via [`resolve_max_tool_turns_hard`]; the
+    /// `minimal` default is `soft * 6` ([`default_max_tool_turns_hard`], = 900
+    /// at the default soft cap of 150).
+    ///
+    /// [`drive_turn`]: crate::run::drive_turn
+    pub max_tool_turns_hard: usize,
     /// Per-TASK token ceiling: the cumulative input+output tokens a
     /// single inbound's tool-loop may spend before [`drive_turn`]
     /// hard-aborts with a surfaced "task budget reached" message and a
@@ -562,6 +687,10 @@ impl RunnerDeps {
             // the host's `mcp_tools.json` manifest, tests opt in explicitly.
             external_tools: Arc::new(HashMap::new()),
             max_tool_turns: DEFAULT_MAX_TOOL_TURNS,
+            // Smart auto-continue backstop: soft * 6 = 900 at the default soft
+            // cap. Extension is ON by default (hard > soft); tests that want
+            // the old flat-cap behaviour set this equal to `max_tool_turns`.
+            max_tool_turns_hard: default_max_tool_turns_hard(DEFAULT_MAX_TOOL_TURNS),
             max_task_tokens: DEFAULT_MAX_TASK_TOKENS,
             compaction: CompactionCfg {
                 model_input_window: 200_000,
@@ -1545,9 +1674,9 @@ async fn finalize_messages(
 /// channel the inbound came in on. Idempotent at the per-row level
 /// because each inbound has a stable id that flows into `in_reply_to`.
 ///
-/// `reason` is a short phrase from `TurnOutcome::Failed` ("the agent
-/// ran out of turns after 60 tool calls without finishing the task",
-/// "the model's provider call did not return a complete response",
+/// `reason` is a short phrase from `TurnOutcome::Failed` ("stopped after
+/// 900 tool turns (hit the 900 hard ceiling) — send 'continue' to keep
+/// going", "the model's provider call did not return a complete response",
 /// etc.) which we splice into the apology so the user knows
 /// *which* snag instead of being told to "see runner stderr".
 fn apology_text(reason: &str) -> String {
@@ -3863,24 +3992,31 @@ mod tests {
             .unwrap();
         match turn.outcome {
             TurnOutcome::Failed(reason) => {
+                // `noop_loop` isn't in the tool_map, so every call errors → the
+                // block scores no progress and the smart auto-continue budget
+                // stops the run at the soft cap. The point still stands: the
+                // (disabled) per-task token budget is NOT what ended the run.
                 assert!(
-                    reason.contains("ran out of turns"),
-                    "with the budget disabled the turn cap must be what stops it: {reason:?}"
+                    reason.contains("no visible progress"),
+                    "with the budget disabled the soft-cap stop must be what ends it: {reason:?}"
                 );
                 assert!(
                     !reason.contains("task budget"),
                     "budget abort must not fire when disabled: {reason:?}"
                 );
             }
-            TurnOutcome::Done => panic!("expected the turn-cap breaker to stop the loop"),
+            TurnOutcome::Done => panic!("expected the soft-cap stop to end the loop"),
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn task_budget_independent_of_max_turns_breaker() {
-        // Per-task budget set high enough that it never trips; the loop
-        // must still bail on `max_tool_turns` exactly as before. Proves
-        // adding the budget check didn't disturb the existing breaker.
+        // Per-task budget set high enough that it never trips; the loop must
+        // still bail on the tool-turn cap. `looping_turn_with_usage` calls
+        // `noop_loop` (absent from the tool_map → every call errors), so the
+        // block makes no progress and the smart auto-continue budget stops it
+        // at the soft cap of 3. Proves the token budget check didn't disturb
+        // the turn-cap stop.
         let scripts: Vec<Vec<ProviderEvent>> = (0..10)
             .map(|_| looping_turn_with_usage(1_000, 1_000))
             .collect();
@@ -3894,10 +4030,10 @@ mod tests {
             .unwrap();
         match turn.outcome {
             TurnOutcome::Failed(reason) => assert!(
-                reason.contains("ran out of turns after 3"),
-                "max-turns breaker must still fire independently: {reason:?}"
+                reason.contains("no visible progress") && reason.contains("3 tool turns"),
+                "the soft-cap stop must still fire independently of the token budget: {reason:?}"
             ),
-            TurnOutcome::Done => panic!("expected the max-turns breaker to stop the loop"),
+            TurnOutcome::Done => panic!("expected the soft-cap stop to end the loop"),
         }
     }
 
@@ -4038,6 +4174,72 @@ mod tests {
     fn resolve_max_task_tokens_rejects_garbage() {
         let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "lots")]);
         assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    // ── smart auto-continue: resolve_max_tool_turns_hard (test (f)) ──────
+
+    #[test]
+    fn resolve_hard_defaults_to_soft_times_six_when_unset() {
+        // Fresh install: no env → soft * 6. At the default soft cap of 150
+        // that's 900 — the SAFE default the design calls out.
+        let env = crate::config::MapEnv::default();
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 900);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 10), 60);
+    }
+
+    #[test]
+    fn resolve_hard_default_is_clamped_to_absolute_max() {
+        // soft * 6 would be 3000 for soft = 500; the default is clamped to the
+        // absolute ceiling so even a maxed-out soft cap can't push it past it.
+        let env = crate::config::MapEnv::default();
+        assert_eq!(
+            resolve_max_tool_turns_hard(&env, 500),
+            MAX_MAX_TOOL_TURNS_HARD
+        );
+    }
+
+    #[test]
+    fn resolve_hard_uses_env_when_in_range() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "600")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 600);
+    }
+
+    #[test]
+    fn resolve_hard_equal_to_soft_is_honoured_and_disables_extension() {
+        // Setting the ceiling EQUAL to the soft cap is a legitimate config
+        // (extension off / flat cap), so it is returned verbatim.
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "150")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 150);
+    }
+
+    #[test]
+    fn resolve_hard_below_soft_clamps_up_to_soft() {
+        // A ceiling below the soft cap would bail before a block completes —
+        // clamp it up to soft (which disables extension) rather than honour it.
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "40")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 150);
+    }
+
+    #[test]
+    fn resolve_hard_above_absolute_max_clamps_down() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "99999")]);
+        assert_eq!(
+            resolve_max_tool_turns_hard(&env, 150),
+            MAX_MAX_TOOL_TURNS_HARD
+        );
+    }
+
+    #[test]
+    fn resolve_hard_rejects_garbage_and_uses_default() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "soon")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 900);
+    }
+
+    #[test]
+    fn default_hard_never_below_soft() {
+        // Even a pathological tiny soft cap keeps hard >= soft.
+        assert!(default_max_tool_turns_hard(1) >= 1);
+        assert_eq!(default_max_tool_turns_hard(1), 6);
     }
 
     // ── F2: actionable "I'm blocked" wall cards ─────────────────────────

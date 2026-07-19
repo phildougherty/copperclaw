@@ -36,16 +36,17 @@ pub use destinations::{ResolvedRoute, resolve_recipient};
 pub use formatter::{ElisionCfg, FormattedTurn, elide_stale_tool_results, format_messages};
 pub use policy::{
     PolicyDecision, SenderRole, ToolPolicy, ToolProfile, TurnTrust, is_credentialed_external,
-    is_lan_preview,
+    is_lan_preview, is_readonly_tool,
 };
 pub use redact::{REDACTED, redact_secrets};
 pub use run::{
     ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TASK_TOKENS, DEFAULT_MAX_TOOL_TURNS,
     DEFAULT_PROVIDER_DEADLINE_MS, DEFAULT_TOOL_DEADLINE_SECS, MAX_MAX_TASK_TOKENS,
-    MAX_MAX_TOOL_TURNS, MAX_PROVIDER_DEADLINE_MS, MAX_TASK_TOKENS_ENV, MAX_TOOL_DEADLINE_SECS,
-    MAX_TOOL_TURNS_ENV, MIN_MAX_TASK_TOKENS, MIN_MAX_TOOL_TURNS, MIN_PROVIDER_DEADLINE_MS,
-    MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, RunnerDeps, TOOL_DEADLINE_ENV,
-    resolve_max_task_tokens, resolve_max_tool_turns, resolve_provider_deadline,
+    MAX_MAX_TOOL_TURNS, MAX_MAX_TOOL_TURNS_HARD, MAX_PROVIDER_DEADLINE_MS, MAX_TASK_TOKENS_ENV,
+    MAX_TOOL_DEADLINE_SECS, MAX_TOOL_TURNS_ENV, MAX_TOOL_TURNS_HARD_ENV, MIN_MAX_TASK_TOKENS,
+    MIN_MAX_TOOL_TURNS, MIN_PROVIDER_DEADLINE_MS, MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS,
+    PROVIDER_DEADLINE_ENV, RunnerDeps, TOOL_DEADLINE_ENV, resolve_max_task_tokens,
+    resolve_max_tool_turns, resolve_max_tool_turns_hard, resolve_provider_deadline,
     resolve_tool_deadline_secs, run_loop,
 };
 // Provider resilience (M16 Phase 4): the runner builds the per-turn

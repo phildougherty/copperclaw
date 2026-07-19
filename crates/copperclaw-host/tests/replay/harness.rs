@@ -966,6 +966,11 @@ impl ReplayHarness {
             // count fits under it); `max_tool_turns` in the manifest
             // raises it for scripted sequences with more tool rounds.
             max_tool_turns: self.fixture.manifest.max_tool_turns.unwrap_or(5),
+            // Hard ceiling == soft cap: smart auto-continue extension is OFF for
+            // replay fixtures, so every existing fixture keeps its deterministic
+            // flat-cap behaviour byte-for-byte (a productive run stops at the
+            // soft cap exactly as before, rather than silently extending).
+            max_tool_turns_hard: self.fixture.manifest.max_tool_turns.unwrap_or(5),
             // Replay fixtures bound the run via the tool-turn cap; the
             // per-task token ceiling is disabled (0) so deterministic
             // replays never trip the cost backstop.
