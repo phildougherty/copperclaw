@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (smart auto-continue at the tool-turn cap — progress-gated budget with a hard-ceiling backstop)
+
+- The runner's per-inbound tool loop
+  (`crates/copperclaw-runner/src/run/drive_turn.rs`) no longer bails the moment
+  it hits the flat `COPPERCLAW_MAX_TOOL_TURNS` cap. That cap is now a **soft**
+  per-block budget: when a full block of soft-cap tool turns completes and the
+  agent **made real progress** in it (a successful non-read-only tool call —
+  `edit_file` / `write_file` / `shell` / `todo_update` / …, classified via the
+  new `copperclaw_runner::is_readonly_tool` reusing `policy::READONLY_TOOLS`),
+  the budget **extends by another block silently**, with no operator
+  interruption. A big legitimate build no longer forces the operator to type
+  "continue" repeatedly. Progress is computed per block: a block of only
+  reads/greps/globs or only errored calls counts as no progress.
+- Added a **hard ceiling** (`COPPERCLAW_MAX_TOOL_TURNS_HARD`, resolved by the
+  new `resolve_max_tool_turns_hard` in `crates/copperclaw-runner/src/run/mod.rs`)
+  — the runaway backstop bounding the **worst-case total tool turns for a single
+  inbound to exactly this value**. Default `soft * 6` (so a fresh install: soft
+  150 → hard 900), clamped to `MAX_MAX_TOOL_TURNS_HARD` (1200) and to `>= soft`.
+  Threaded onto `RunnerDeps::max_tool_turns_hard`. Setting it **equal to the soft
+  cap disables extension** → the historical flat-cap behaviour (back-compat).
+- The single "ran out of turns" apology is replaced by three honest,
+  reason-specific messages chosen by *why* the run stopped: hitting the hard
+  ceiling ("stopped after N tool turns (hit the H hard ceiling) — send 'continue'
+  to keep going", logged ERROR), a no-progress block ("stopped after N tool turns
+  with no visible progress — send 'continue' or a smaller step", logged WARN), or
+  extending on progress (debug log, no user interruption).
+- **Unchanged and byte-identical:** the content-loop breaker, the per-task token
+  ceiling (`COPPERCLAW_MAX_TASK_TOKENS`), the parse-error cap, provider-failure
+  and empty-reply bails all still fire EARLY, mid-block, before the budget logic
+  is consulted — this change only governs what happens when a full block
+  completes without any of those firing. Default is safe: a productive agent runs
+  up to 900 turns then checkpoints; a stuck/looping one still bails early via the
+  unchanged breakers.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the

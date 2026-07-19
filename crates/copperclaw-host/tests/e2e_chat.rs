@@ -349,6 +349,10 @@ async fn run_one_turn(
         tool_map,
         external_tools: Arc::new(std::collections::HashMap::new()),
         max_tool_turns: 5,
+        // Hard ceiling == soft cap disables smart auto-continue extension, so
+        // this e2e keeps the historical flat 5-turn cap (its wiremock scripts
+        // finish well inside it; nothing here exercises the extend path).
+        max_tool_turns_hard: 5,
         // No per-task token ceiling in this e2e — the tool-turn cap and
         // wiremock scripts bound the run; 0 disables the cost backstop.
         max_task_tokens: 0,

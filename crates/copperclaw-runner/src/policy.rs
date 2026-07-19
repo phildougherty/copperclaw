@@ -382,6 +382,22 @@ pub fn is_provider_pinned_search(tool: &str) -> bool {
     PROVIDER_PINNED_SEARCH_TOOLS.contains(&tool)
 }
 
+/// True when `tool` is a read-only / informational verb (see
+/// [`READONLY_TOOLS`]) — it observes but never mutates the filesystem, shell,
+/// scheduler, or memory store.
+///
+/// The smart auto-continue budget in [`crate::run::drive_turn`] uses this to
+/// classify tool-turn *progress*: a block whose only successful tool calls are
+/// read-only (reads / greps / globs / git inspection / list verbs) made no
+/// visible progress, whereas a successful call to a NON-read-only tool
+/// (`edit_file`, `write_file`, `shell`, `todo_update`, …) is real progress that
+/// earns another budget block. Exposed as a `pub fn` so the runner reuses this
+/// single classification instead of duplicating the tool-name list.
+#[must_use]
+pub fn is_readonly_tool(tool: &str) -> bool {
+    READONLY_TOOLS.contains(&tool)
+}
+
 /// A group's tool profile: the positive allow-list the agent is scoped
 /// to. Profiles are cumulative — each tier adds to the one below it.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
