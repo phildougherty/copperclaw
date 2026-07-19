@@ -301,6 +301,68 @@ pub fn list_running(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// A child session eligible for auto-reaping: a `create_agent`-spawned
+/// child (`source_session_id IS NOT NULL`) whose container is `Stopped`
+/// and whose `last_active` predates the caller's idle cutoff. Carries
+/// just the two ids the host reaper needs to delete the session rows +
+/// on-disk dir and then the agent group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapableChild {
+    pub session_id: SessionId,
+    pub agent_group_id: AgentGroupId,
+}
+
+/// List child sessions that are candidates for auto-reaping.
+///
+/// A row is returned only when **all** of the following hold (the SQL
+/// enforces them; the host reaper adds the pending-inbound check that
+/// needs the per-session `inbound.db`):
+///
+/// - `source_session_id IS NOT NULL AND source_session_id != ''` — it is
+///   a `create_agent` child, never a top-level/user session. This is the
+///   paramount safety invariant: a session with a NULL/empty
+///   `source_session_id` (a root agent) MUST NEVER be returned, because
+///   reaping deletes the session **and** its agent group.
+/// - `container_status = 'stopped'` — never an actively-running child (a
+///   running container would also make `sessions::delete` refuse without
+///   `force`, and the reaper never forces).
+/// - `last_active < idle_before` — past the caller's TTL grace, so a
+///   just-finished or briefly-paused child isn't reaped prematurely.
+///
+/// The empty-string guard mirrors the `row_to_session` defence against
+/// legacy `source_session_id = ''` rows written before the column had a
+/// clean NULL writer — such a row is NOT a child and must not be reaped.
+pub fn list_reapable_children(
+    db: &CentralDb,
+    idle_before: DateTime<Utc>,
+) -> Result<Vec<ReapableChild>, DbError> {
+    let conn = db.conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, agent_group_id
+             FROM sessions
+             WHERE source_session_id IS NOT NULL
+               AND source_session_id != ''
+               AND container_status = 'stopped'
+               AND last_active < ?1
+             ORDER BY last_active ASC",
+    )?;
+    let rows = stmt.query_map(params![idle_before.to_rfc3339()], |row| {
+        let id_str: String = row.get("id")?;
+        let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        let ag_str: String = row.get("agent_group_id")?;
+        let ag = uuid::Uuid::parse_str(&ag_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        Ok(ReapableChild {
+            session_id: SessionId(id),
+            agent_group_id: AgentGroupId(ag),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Delete one session and every central-DB row that references it.
 ///
 /// Cleanup is atomic (single transaction) and covers:
@@ -878,5 +940,198 @@ mod tests {
         touch_last_active(&db, s.id).unwrap();
         let after = get(&db, s.id).unwrap().last_active;
         assert!(after > before, "{after} should be > {before}");
+    }
+
+    // ---- list_reapable_children (auto-reap of create_agent children) ----
+
+    /// Force a session's `last_active` to an explicit instant so TTL
+    /// boundaries can be exercised without sleeping.
+    fn set_last_active(db: &CentralDb, id: SessionId, when: DateTime<Utc>) {
+        let conn = db.conn().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE sessions SET last_active = ?1 WHERE id = ?2",
+                params![when.to_rfc3339(), id.as_uuid().to_string()],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "set_last_active should touch exactly one row");
+    }
+
+    /// Create a child session (non-NULL `source_session_id`) that is
+    /// stopped and last-active `age_secs` ago.
+    fn stopped_child(
+        db: &CentralDb,
+        ag: AgentGroupId,
+        parent: SessionId,
+        age_secs: i64,
+    ) -> Session {
+        let s = create(
+            db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: Some(parent),
+            },
+        )
+        .unwrap();
+        // create() writes container_status = 'stopped' already; be explicit
+        // so the test doesn't silently depend on that default.
+        mark_container_stopped(db, s.id).unwrap();
+        set_last_active(db, s.id, Utc::now() - chrono::Duration::seconds(age_secs));
+        s
+    }
+
+    /// THE paramount safety invariant: a top-level session (NULL
+    /// `source_session_id`) that is otherwise a perfect reap candidate
+    /// (stopped + long-idle) is NEVER returned; only the child is.
+    #[test]
+    fn reapable_children_never_returns_top_level_session() {
+        let (db, ag) = db_with_agent();
+        // Top-level session: NULL source_session_id, stopped, ancient.
+        let top = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        mark_container_stopped(&db, top.id).unwrap();
+        set_last_active(&db, top.id, Utc::now() - chrono::Duration::hours(24));
+        // Child of `top`: reap candidate.
+        let child = stopped_child(&db, ag, top.id, 3600);
+
+        let idle_before = Utc::now() - chrono::Duration::seconds(900);
+        let reapable = list_reapable_children(&db, idle_before).unwrap();
+        assert_eq!(
+            reapable.len(),
+            1,
+            "only the child is reapable, never the top"
+        );
+        assert_eq!(reapable[0].session_id, child.id);
+        assert_eq!(reapable[0].agent_group_id, ag);
+        assert!(
+            reapable.iter().all(|r| r.session_id != top.id),
+            "top-level session must never appear in the reap set"
+        );
+    }
+
+    /// An empty-string `source_session_id` (legacy sentinel) is NOT a
+    /// child and must be excluded even though the SQL column is non-NULL.
+    #[test]
+    fn reapable_children_excludes_empty_string_source() {
+        let (db, ag) = db_with_agent();
+        let parent = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Legit child, plus a bogus empty-string-source row. The empty
+        // string is a legacy sentinel that predates the clean NULL writer;
+        // the `source_session_id` FK rejects it today, so inject it with
+        // FK enforcement briefly off to reproduce the on-disk legacy shape.
+        let child = stopped_child(&db, ag, parent.id, 3600);
+        let ghost = stopped_child(&db, ag, parent.id, 3600);
+        {
+            let conn = db.conn().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute(
+                "UPDATE sessions SET source_session_id = '' WHERE id = ?1",
+                params![ghost.id.as_uuid().to_string()],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        }
+        let reapable =
+            list_reapable_children(&db, Utc::now() - chrono::Duration::seconds(900)).unwrap();
+        assert_eq!(reapable.len(), 1);
+        assert_eq!(reapable[0].session_id, child.id);
+    }
+
+    /// A running child is never returned (we only reap stopped ones).
+    #[test]
+    fn reapable_children_excludes_running_child() {
+        let (db, ag) = db_with_agent();
+        let parent = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        let child = stopped_child(&db, ag, parent.id, 3600);
+        // Flip it to running (which also bumps last_active — push it back).
+        mark_container_running(&db, child.id).unwrap();
+        set_last_active(&db, child.id, Utc::now() - chrono::Duration::seconds(3600));
+
+        let reapable =
+            list_reapable_children(&db, Utc::now() - chrono::Duration::seconds(900)).unwrap();
+        assert!(
+            reapable.is_empty(),
+            "a running child must not be reapable: {reapable:?}"
+        );
+    }
+
+    /// A within-TTL child (recently active) is never returned.
+    #[test]
+    fn reapable_children_excludes_within_ttl_child() {
+        let (db, ag) = db_with_agent();
+        let parent = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Active 60s ago; TTL cutoff is 900s → NOT past the grace.
+        let _child = stopped_child(&db, ag, parent.id, 60);
+        let reapable =
+            list_reapable_children(&db, Utc::now() - chrono::Duration::seconds(900)).unwrap();
+        assert!(
+            reapable.is_empty(),
+            "a child inside the TTL grace must not be reapable: {reapable:?}"
+        );
+    }
+
+    /// A stopped + idle + past-TTL child IS returned.
+    #[test]
+    fn reapable_children_includes_stopped_idle_past_ttl_child() {
+        let (db, ag) = db_with_agent();
+        let parent = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        let child = stopped_child(&db, ag, parent.id, 3600);
+        let reapable =
+            list_reapable_children(&db, Utc::now() - chrono::Duration::seconds(900)).unwrap();
+        assert_eq!(reapable.len(), 1);
+        assert_eq!(reapable[0].session_id, child.id);
+        assert_eq!(reapable[0].agent_group_id, ag);
     }
 }

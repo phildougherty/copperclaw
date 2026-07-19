@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Auto-reap of orphaned `create_agent` child sessions.** A new supervised
+  `child_reaper` loop (`crates/copperclaw-host/src/child_reaper.rs`, registered
+  in `boot.rs`, 120s interval) periodically reclaims child agents left behind by
+  botched or abandoned delegations — previously each leaked child persisted as an
+  idle-but-warm, cost-burning agent (its own `agent_group` + session, sometimes
+  with a container still making provider calls; one flaky delegation leaked seven
+  overnight). A child is reaped only when ALL conservative criteria hold:
+  `source_session_id IS NOT NULL` (it is a `create_agent` child — a top-level /
+  user session with a NULL/empty `source_session_id` is **never** reaped, the
+  paramount safety invariant, enforced in SQL by the new
+  `copperclaw_db::tables::sessions::list_reapable_children`), `container_status =
+  'stopped'` (never touch a running child; we never force), `last_active` older
+  than a TTL grace, and no `status='pending'` row in the child's per-session
+  `inbound.db` (never drop queued work). Reap order is FK-safe and best-effort:
+  `sessions::delete` (central rows) → remove the on-disk `/data` session tree →
+  `agent_groups::delete`; a failure on one child logs a `warn!` and continues.
+  Config: `COPPERCLAW_CHILD_REAP=0` disables the reaper (default ON; a disabled
+  loop PARKS on shutdown instead of returning, so the supervisor doesn't
+  restart-storm it), `COPPERCLAW_CHILD_REAP_IDLE_SECS` sets the idle grace
+  (default 900s, floored at 60s).
+
 - **New `web-backend` skill** (`skills/web-backend/SKILL.md`): the backend
   counterpart to `web-app-scaffold`, for apps that go past static files.
   Covers choosing a datastore deliberately (SQLite for single-node prototypes
