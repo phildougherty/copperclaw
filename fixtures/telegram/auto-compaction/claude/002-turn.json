@@ -1,0 +1,33 @@
+{
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "id": "msg_replay_autocompact_002"
+      }
+    },
+    {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "text",
+        "text": ""
+      }
+    },
+    {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "text_delta",
+        "text": "The capacity section says the new fleet is sized for peak plus forty percent headroom. Each inference host carries two replicas of the model server, pinned to separate NUMA nodes, with the router weighting requests by observed p99 latency rather than round robin. The failure-mode table covers three scenarios: a single host loss (absorbed by headroom, no action), an availability-zone loss (router drains the zone and pages the on-call), and a full regional failover (manual runbook, forty-five minute target). The doc recommends rehearsing the regional failover once a quarter and wiring the drain procedure into the deploy tooling so an operator can trigger it with one command instead of editing routing tables by hand during an incident."
+      }
+    },
+    {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    {
+      "type": "message_stop"
+    }
+  ]
+}

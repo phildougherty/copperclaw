@@ -83,6 +83,8 @@ const READONLY_TOOLS: &[&str] = &[
     "view_image",
     "glob",
     "grep",
+    // M22 C3: read-only symbol navigation (go-to-def / find-refs / hover).
+    "find_symbol",
     "git_blame",
     "git_diff",
     "git_log",
@@ -90,6 +92,15 @@ const READONLY_TOOLS: &[&str] = &[
     "web_search",
     "web_fetch",
     "list_tasks",
+    // M22 A3: read-only goal listing, the goal sibling of `list_tasks`. The
+    // mutating goal verbs (`create_goal` / `update_goal`) live in
+    // [`SCHEDULING_MUTATION_TOOLS`] so the guest role floor denies them.
+    "list_goals",
+    // M22 S3: read-only enumeration of the session's selected skills (name +
+    // version + description). Reads the per-session skills catalogue only — no
+    // mutation, no egress — so it is safe for a guest sender and rides the
+    // messaging profile alongside the other read tools.
+    "list_skills",
 ];
 
 /// Scheduler-mutation verbs layered on top of [`READONLY_TOOLS`] by the
@@ -105,6 +116,20 @@ const SCHEDULING_MUTATION_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "update_task",
+    // M22 A3: goal authoring/reporting mutates the central `goals` scheduler
+    // state (a goal indexes over the task scheduler), so it rides here with the
+    // task-mutation verbs — reachable from the messaging profile up, denied to a
+    // guest sender via the mutating floor. `list_goals` (read-only) stays in
+    // [`READONLY_TOOLS`].
+    "create_goal",
+    "update_goal",
+    // M22 A4: condition/event-trigger authoring + the settable flag latch.
+    // Registering an event-driven wake (and toggling the latch it fires on)
+    // mutates the same autonomy-affecting sweep state the scheduler/goal verbs
+    // do, so it rides here — reachable from the messaging profile up, denied to
+    // a guest sender via the mutating floor.
+    "register_condition",
+    "set_condition_flag",
 ];
 
 /// Filesystem-mutation, shell, and agent-spawning tools layered on by the
@@ -380,6 +405,22 @@ pub fn is_lan_preview(tool: &str) -> bool {
 #[must_use]
 pub fn is_provider_pinned_search(tool: &str) -> bool {
     PROVIDER_PINNED_SEARCH_TOOLS.contains(&tool)
+}
+
+/// True when `tool` is a read-only / informational verb (see
+/// [`READONLY_TOOLS`]) — it observes but never mutates the filesystem, shell,
+/// scheduler, or memory store.
+///
+/// The smart auto-continue budget in [`crate::run::drive_turn`] uses this to
+/// classify tool-turn *progress*: a block whose only successful tool calls are
+/// read-only (reads / greps / globs / git inspection / list verbs) made no
+/// visible progress, whereas a successful call to a NON-read-only tool
+/// (`edit_file`, `write_file`, `shell`, `todo_update`, …) is real progress that
+/// earns another budget block. Exposed as a `pub fn` so the runner reuses this
+/// single classification instead of duplicating the tool-name list.
+#[must_use]
+pub fn is_readonly_tool(tool: &str) -> bool {
+    READONLY_TOOLS.contains(&tool)
 }
 
 /// A group's tool profile: the positive allow-list the agent is scoped

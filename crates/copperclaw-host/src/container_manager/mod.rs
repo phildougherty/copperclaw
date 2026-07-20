@@ -42,6 +42,7 @@ pub mod cold_start;
 pub mod config;
 pub mod crash_loop;
 pub mod egress;
+pub mod host_resources;
 pub mod mcp_tools;
 pub mod mount_guard;
 pub mod prompt;
@@ -77,6 +78,9 @@ pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
 pub use classify::ReconcileAction;
 pub use cold_start::{SLOW_SPAWN_NOTICE_AFTER, SLOW_SPAWN_NOTICE_TEXT, SpawnActivity};
 pub use crash_loop::{CrashCause, CrashLoopTracker, OOM_CARD_THRESHOLD};
+pub use host_resources::{
+    DiskProbe, DiskSpace, ENV_FAULT_SESSION_THRESHOLD, ENV_FAULT_WINDOW, EnvFaultBreaker,
+};
 
 use self::config::read_env_file;
 use copperclaw_container_rt::{ContainerRuntime, RtError};
@@ -121,6 +125,20 @@ pub enum ManagerError {
         "host degraded; refusing to spawn sessions until the operator restarts after `./rebuild.sh`"
     )]
     HostDegraded,
+    /// The *environment* cannot support a container right now — the box
+    /// is out of disk, or enough distinct sessions crash-restarted in one
+    /// window that the fault is clearly shared rather than per-session
+    /// (see [`host_resources`]).
+    ///
+    /// Distinct from [`Self::HostDegraded`] in one important way: this is
+    /// self-clearing. `HostDegraded` is a boot-time verdict that needs an
+    /// operator to run `./rebuild.sh` and restart; this one clears itself
+    /// the moment the disk probe comes back clean. Both are collapsed to
+    /// `Ok` by the reconcile loop's `Spawn` arm — the session stays
+    /// `Stopped` with its inbound pending, which is precisely the point:
+    /// no doomed container spawn, no lost message.
+    #[error("host resources exhausted; refusing to spawn sessions until the environment recovers")]
+    HostResourceExhausted,
 }
 
 /// Manager service. Cheap to clone via `Arc`.
@@ -241,6 +259,22 @@ pub struct ContainerManager {
     /// configured, those thresholds enqueue one deduped, rate-limited alert
     /// row through the existing delivery pipeline.
     pub(crate) operator_alerts: Option<Arc<crate::operator_alerts::OperatorAlerts>>,
+    /// Cached free-space reading for `cfg.data_dir`, refreshed once per
+    /// reconcile tick by [`Self::refresh_host_resources`] and read by the
+    /// spawn preflight. Cached deliberately: probing per session per pass
+    /// would add `statvfs` traffic to a box that is already sick.
+    pub(crate) disk_probe: host_resources::DiskProbe,
+    /// Global circuit breaker for whole-box faults — trips when
+    /// [`ENV_FAULT_SESSION_THRESHOLD`] distinct sessions crash-restart
+    /// inside [`ENV_FAULT_WINDOW`]. See [`host_resources`] for why
+    /// per-session backoff cannot substitute for this.
+    pub(crate) env_breaker: host_resources::EnvFaultBreaker,
+    /// Whether the environment is currently considered unable to host a
+    /// container (disk below the FAIL threshold, or the breaker open).
+    /// Separate from [`Self::degraded`] because this one self-clears:
+    /// `degraded` is a sticky boot verdict, this is a live condition.
+    /// `AtomicBool` so the spawn hot path reads it lock-free.
+    pub(crate) env_exhausted: AtomicBool,
 }
 
 impl ContainerManager {
@@ -272,6 +306,9 @@ impl ContainerManager {
             crash_loop: crash_loop::CrashLoopTracker::new(),
             wake: None,
             operator_alerts: None,
+            disk_probe: host_resources::DiskProbe::new(),
+            env_breaker: host_resources::EnvFaultBreaker::new(),
+            env_exhausted: AtomicBool::new(false),
             cfg,
         }
     }
@@ -386,6 +423,119 @@ impl ContainerManager {
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::SeqCst)
+    }
+
+    /// Whether the *environment* is currently unable to host a container.
+    /// Unlike [`Self::is_degraded`] this is a live condition, not a boot
+    /// verdict — it clears on its own as soon as the disk recovers.
+    #[must_use]
+    pub fn is_env_exhausted(&self) -> bool {
+        self.env_exhausted.load(Ordering::SeqCst)
+    }
+
+    /// The current (cached) free-space reading for the data dir, or
+    /// `None` when the filesystem could not be stat'd. `None` is
+    /// *unknown*, never *full*.
+    #[must_use]
+    pub fn current_disk(&self) -> Option<host_resources::DiskSpace> {
+        self.disk_probe
+            .get(&self.cfg.data_dir, tokio::time::Instant::now())
+    }
+
+    /// Re-`statvfs` the data dir and reconcile the environment-fault
+    /// state. Called once at the top of every [`Self::tick`] — once per
+    /// *tick*, not once per session, which is what keeps the preflight
+    /// from adding N `statvfs` calls per pass to a sick box.
+    ///
+    /// Transitions are edge-logged so a full disk produces one WARN and
+    /// one recovery INFO, not one line per tick per session (the 2026-07-18
+    /// incident's log volume was itself part of the problem).
+    pub(crate) fn refresh_host_resources(&self) {
+        let now = tokio::time::Instant::now();
+        let reading = self.disk_probe.refresh(&self.cfg.data_dir, now);
+        // Unknown free space is not evidence of exhaustion: keep whatever
+        // the breaker already decided rather than inventing a fault.
+        let disk_full = reading.is_some_and(host_resources::DiskSpace::is_exhausted);
+        // A clean disk is the signal that lets the breaker re-arm — but
+        // only after it has held for one full window, so a non-disk fault
+        // (sick daemon, wedged mount) still gets a real pause instead of
+        // being waved through on the very next tick.
+        if !disk_full {
+            self.env_breaker.maybe_rearm(now);
+        }
+        let exhausted = disk_full || self.env_breaker.is_tripped();
+        let was = self.env_exhausted.swap(exhausted, Ordering::SeqCst);
+        if exhausted && !was {
+            warn!(
+                disk = reading
+                    .map_or_else(|| "unknown".to_string(), host_resources::DiskSpace::summary),
+                breaker_tripped = self.env_breaker.is_tripped(),
+                "host resources exhausted; refusing container spawns until the environment recovers"
+            );
+        } else if !exhausted && was {
+            // Recovered. The deferred sessions spawn on this very pass —
+            // their inbound rows stayed pending throughout, so nothing was
+            // lost to the outage.
+            tracing::info!(
+                disk = reading
+                    .map_or_else(|| "unknown".to_string(), host_resources::DiskSpace::summary),
+                "host resources recovered; resuming container spawns"
+            );
+        }
+    }
+
+    /// Clear the environment-fault state by operator request (the
+    /// self-clearing path is [`Self::refresh_host_resources`] noticing the
+    /// disk recovered). Re-arms the breaker; the next tick re-evaluates
+    /// the disk, so this cannot paper over a filesystem that is still full.
+    pub fn clear_env_exhausted(&self) {
+        self.env_breaker.reset();
+        self.env_exhausted.store(false, Ordering::SeqCst);
+    }
+
+    /// Record one session's crash-restart against the global breaker. On
+    /// the trip edge — and ONLY on the trip edge — flip the manager into
+    /// environment-degraded mode and fire exactly one operator alert.
+    ///
+    /// This is the piece that actually caps the storm. Before it, N
+    /// sessions sharing one broken disk produced N independent per-session
+    /// backoff curves that all bottomed out at the 300s cap and retried
+    /// forever; the remedy could not work because the fault was not
+    /// per-session.
+    pub(crate) fn note_crash_for_env_breaker(&self, session: &copperclaw_types::Session) {
+        if !self
+            .env_breaker
+            .record_crash(session.id, tokio::time::Instant::now())
+        {
+            return;
+        }
+        self.env_exhausted.store(true, Ordering::SeqCst);
+        let disk = self
+            .current_disk()
+            .map_or_else(|| "unknown".to_string(), host_resources::DiskSpace::summary);
+        warn!(
+            distinct_sessions = ENV_FAULT_SESSION_THRESHOLD,
+            window_secs = ENV_FAULT_WINDOW.as_secs(),
+            disk = disk,
+            "environment fault: multiple distinct sessions crash-restarted in one window; \
+             respawns paused globally (this is NOT a per-session bug)"
+        );
+        let Some(alerts) = self.operator_alerts.as_ref() else {
+            return;
+        };
+        // One dedup key for the whole fault (not per session): the entire
+        // point is that the operator gets ONE page, not one per session.
+        alerts.fire(
+            crate::operator_alerts::AlertSeverity::Critical,
+            "env_fault",
+            &format!(
+                "{ENV_FAULT_SESSION_THRESHOLD}+ distinct agent sessions crash-restarted within \
+                 {}s — this looks like a host-wide fault, not a per-session bug. Container \
+                 spawns are paused until it clears. Disk: {disk}. {}",
+                ENV_FAULT_WINDOW.as_secs(),
+                copperclaw_cclaw::disk::DISK_FIX,
+            ),
+        );
     }
 
     /// Re-read the `.env` file at `env_file` (or use no file when
@@ -524,6 +674,12 @@ impl ContainerManager {
     /// - `Running` + `last_active` stale → idle, stop, mark `Idle`.
     /// - `Running` + alive + recently active → leave alone.
     pub async fn tick(&self) -> Result<(), ManagerError> {
+        // One `statvfs` per tick (NOT per session) — the spawn preflight
+        // below reads the cached result. This also drives the
+        // self-clearing half of the environment-fault state: when the disk
+        // recovers, the breaker re-arms here and the deferred sessions
+        // spawn on this very pass.
+        self.refresh_host_resources();
         let sessions = sessions::list_active(&self.central).map_err(ManagerError::Db)?;
         for session in sessions {
             if !matches!(session.status, SessionStatus::Active) {

@@ -13,8 +13,9 @@
 //! collapsible renderer emits only the summary + preview (never the full
 //! body), so no renderer here can blow the limit.
 
+use crate::factory::CHANNEL_TYPE_STR;
 use copperclaw_channels_core::{
-    Card, DiffCard, ErrorCard, ThinkingBlock, TodoItemStatus, TodoList,
+    Card, DiffCard, ErrorCard, ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 
 /// Render a [`Card`] as a `WhatsApp` text message: a `*bold*` title, the
@@ -141,22 +142,31 @@ pub fn render_todo_list(list: &TodoList) -> String {
     out.push('*');
     out.push_str(list.title_or_default());
     out.push_str(&format!("* ({done}/{total})"));
+    // ASCII checkbox glyphs via the vocab binding, per the project's
+    // no-emoji rule. Deliberate divergence for `InProgress`: `WhatsApp`
+    // text has no half-checked box, so the active item reuses the
+    // *pending* glyph (`[ ]`) plus the `_(in progress)_` suffix —
+    // byte-identical to the pre-vocab output.
+    let todo = vocab::for_channel(CHANNEL_TYPE_STR).todo;
     for item in &list.items {
         out.push('\n');
         let text = item.text.trim();
         match item.status {
             TodoItemStatus::Completed => {
-                out.push_str("[x] ~");
+                out.push_str(todo.completed);
+                out.push_str(" ~");
                 out.push_str(text);
                 out.push('~');
             }
             TodoItemStatus::InProgress => {
-                out.push_str("[ ] ");
+                out.push_str(todo.pending);
+                out.push(' ');
                 out.push_str(text);
                 out.push_str(" _(in progress)_");
             }
             TodoItemStatus::Blocked => {
-                out.push_str("[!] ");
+                out.push_str(todo.blocked);
+                out.push(' ');
                 out.push_str(text);
                 match item.blocked_reason_text() {
                     Some(reason) => {
@@ -168,7 +178,8 @@ pub fn render_todo_list(list: &TodoList) -> String {
                 }
             }
             TodoItemStatus::Pending => {
-                out.push_str("[ ] ");
+                out.push_str(todo.pending);
+                out.push(' ');
                 out.push_str(text);
             }
         }
@@ -338,6 +349,52 @@ mod tests {
         assert!(out.starts_with("*Plan* (1/2)"));
         assert!(out.contains("[x] ~done~"));
         assert!(out.contains("[ ] now _(in progress)_"));
+    }
+
+    #[test]
+    fn todo_list_is_byte_identical_to_pre_vocab_literals() {
+        // M22 A4 byte-identity gate for the vocab rerouting: the
+        // expected string is a hardcoded literal of the exact pre-vocab
+        // output (all four statuses) — deliberately NOT read through
+        // vocab constants, which would be circular. Note in-progress
+        // deliberately reuses the unchecked box.
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on API key".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Build".into()),
+        };
+        assert_eq!(
+            render_todo_list(&list),
+            "*Build* (1/4)\n\
+             [x] ~done item~\n\
+             [ ] active item _(in progress)_\n\
+             [!] stuck item _(blocked: waiting on API key)_\n\
+             [ ] later item"
+        );
     }
 
     #[test]

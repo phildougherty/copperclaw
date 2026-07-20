@@ -6,6 +6,1279 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 — Claude Code-style transcript UI across channels)
+
+- **Live tool-step transcript in the Task HUD.** The HUD now accumulates the
+  turn's tool steps (tool name, capped arg detail, status, first result line)
+  and attaches them to every frame via `Breadcrumb.steps` — the four
+  construction sites in `crates/copperclaw-runner/src/run/hud.rs` that
+  hardcoded `steps: Vec::new()` now feed the already-existing (and previously
+  dead) Telegram step-log renderer. Capped at 40 steps, reset per inbound;
+  the excess folds into the renderer's `+N earlier` line.
+- **Status line with progress, tokens, and spend.** HUD running frames carry
+  `[N tool calls, M:SS, step N/M, tokens, cost]` and the collapse line reads
+  `done in M:SS, N tool calls, Nk tokens, $N.NN`. Live spend is tracked
+  in-container via a new `Arc<TurnSpend>` on `RunnerDeps` (atomic tokens +
+  cost micros, bumped at both `provider_call.rs` emit sites). Tokens round to
+  the nearest 100 and cost to the nearest cent so frame fingerprints do not
+  force an edit on every LLM call; the summary is capped at four fields
+  (cost drops first when a note is pending) and unit-tested to stay under
+  100 chars. Cost renders only when every call in the turn was priced —
+  unknown models render absence, never `$0.00`.
+- **Auto-compaction notice.** The silent automatic compaction path in
+  `run_loop` now queues `history auto-compacted (N msgs -> N, ~Nk tokens)`
+  on a new `Notices` queue on `RunnerDeps`; the note rides exactly one HUD
+  frame (rich channels) or one status row (bare channels) via the existing
+  one-shot note machinery, and re-queues if a text-only turn never rendered
+  a frame. The `/compact` slash path already confirmed; now the automatic
+  one does too.
+- **Budget-extension notice.** When the smart auto-continue extends the
+  tool-turn budget past the soft cap, the HUD notes
+  `extended tool budget (N/M turns)` — a HUD note, not a chat row.
+- **Structured `cclaw chat` transcript.** The cli channel adapter now
+  overrides the seven rich delivery hooks and appends JSONL frames to
+  `chat.log` (public `CliFrame` enum in
+  `crates/copperclaw-channels/cli/src/lib.rs`: chat, card, breadcrumb, diff,
+  collapsible, todo_list, error, thinking) instead of flattening to text.
+  Readers sniff per line (`{`-prefixed = frame, else legacy text); the stdio
+  path keeps the legacy label format. This also fixes multi-line bodies
+  corrupting the line-oriented tail.
+- **`cclaw chat` renders the transcript like Claude Code.** Tool steps on a
+  geometric rail with status coloring, checkbox todos with strikethrough,
+  dimmed thinking, green/red diffs, red errors; the status line repaints in
+  place at the bottom. The log tail and stdin reader are unified under one
+  event loop (single terminal writer) so repaints cannot race input; repeat
+  HUD edit frames dedupe client-side into new-steps-only output. The prompt
+  goes to stderr, and all color/repaint bytes route through the
+  `Palette`/`color_enabled` path — `cclaw chat > out.txt` stays ANSI- and
+  CR-free, enforced by a new spawned-binary test in `no_ansi_when_piped.rs`.
+- **cli promoted out of StatusRows.** New
+  `capabilities::renders_client_side_transcript` predicate and a
+  `Behavior::Transcript` HUD arm emit breadcrumb frames as append-only
+  events (never edits — cli stays out of `EDIT_CAPABLE_CHANNELS` and the
+  drift guard still passes) at the same fingerprint-suppressed cadence as
+  the edit path, plus the finalize collapse. The 30s clock ticker stays
+  edit-only by design: on an append-only log every tick would be a permanent
+  line; the client repaints the clock itself.
+- **Transcript vocabulary as source of truth.**
+  `crates/copperclaw-channels/core/src/vocab.rs`: flat const `Vocabulary`
+  tables (`ASCII` — today's exact `[ ]`/`[~]`/`[!]`/`[x]`/`[ok]` literals —
+  and `RAIL` — Claude Code's geometric U+23FA/U+23BF/U+25B0/U+25B1 markers)
+  bound per channel via `vocab::for_channel`; cli and telegram bind RAIL,
+  everything else ASCII, and the binding is a one-line flip per surface.
+  Reaction emoji (`core/src/reaction.rs`, `*/src/config.rs`) are protocol
+  values and deliberately never route through vocab.
+- **Pricing table.** `crates/copperclaw-types/src/pricing.rs`:
+  `price_for(provider, model) -> Option<ModelPrice>` in integer micros per
+  MTok (exact match then most-specific prefix, mirroring
+  `is_anthropic_family_model`), `PRICING_AS_OF` marker, ollama pinned as
+  known-free zero, unknown models `None` — every surface renders a blank,
+  never a confidently wrong `$0.00`.
+- **Per-model usage rollup with cost.** `rollup_by_model_since` in
+  `crates/copperclaw-db/src/tables/agent_turns.rs` (pure read on the
+  existing index, no migration); `usage.rollup` JSON gains a per-group
+  `models` array with `cost_micros` (null when unpriced; group total null
+  unless every slice priced) and `pricing_as_of`. `cclaw usage` grows a COST
+  column (`$0.42`, em dash for unknown) and a `pricing as of` footer;
+  `--json` passes the handler payload through untouched.
+- **Replay fixtures pinning the pipeline end-to-end**:
+  `fixtures/telegram/hud-transcript/` (multi-batch HUD frames byte-for-byte,
+  the program's byte-anchor), `fixtures/telegram/auto-compaction/` (the note
+  exactly once, compaction proven by archive + summary request),
+  `fixtures/telegram/budget-extension/` (extension note exactly once, never
+  a chat row), `fixtures/cli/transcript-render/` (breadcrumb/todo/diff JSONL
+  frames), plus two additive replay-harness knobs (`max_tool_turns_hard`,
+  `compaction_soft_target_tokens`, both default-off).
+- **Adoption gate for the transcript vocabulary**
+  (`crates/copperclaw-host-delivery/tests/vocab_adoption.rs`): walks every
+  `crates/copperclaw-channels/*/src/**/*.rs` and fails if non-test,
+  non-comment adapter code hardcodes a transcript glyph — the RAIL codepoints
+  (U+23FA, U+23BF, U+25B0, U+25B1, U+25CB, U+00D7; raw or `\u{...}`-escaped)
+  or the ASCII literals `[x]` / `[~]` / `[!]` / `[ ]` / `[ok]` inside string
+  literals — instead of routing through
+  `copperclaw_channels_core::vocab::for_channel`. Allowlist:
+  `core/src/vocab.rs` (the source of truth), `core/src/reaction.rs` and
+  `*/src/config.rs` (reaction emoji are protocol values, not presentation).
+  Test modules are exempt by design: byte-identity tests MUST pin rendered
+  output with hardcoded literals.
+
+### Changed (M22 — Claude Code-style transcript UI across channels)
+
+- **Telegram is the reference transcript surface**
+  (`crates/copperclaw-channels/telegram/src/adapter.rs`): the step log now
+  renders in a plain `<blockquote>` (expanded by default) when it fits 1500
+  rendered bytes, falling back to `<blockquote expandable>` beyond; the HUD
+  frame drops the noisy `<code>task</code>` chip for a bold status headline
+  over the step log; todo lists with 3+ items gain a 10-cell
+  `U+25B0`/`U+25B1` progress bar; breadcrumb markers switch from ASCII to
+  the geometric RAIL glyphs via vocab (one-line fallback to ASCII if real
+  devices promote them to emoji). Pin discipline documented and verified:
+  todo list = the one pinned message, HUD = live transcript, never pinned.
+- **Progressive reveal widened, cadence unchanged**
+  (`crates/copperclaw-runner/src/run/progressive.rs`): eligibility gates
+  lowered (elapsed 30s -> 15s, length 280 -> 200 chars) and `MAX_STEPS`
+  raised 6 -> 8; `STEP_INTERVAL` stays 800ms so worst-case edit frequency is
+  unchanged (~7 edits over ~5.6s). Final values are documented in-code as
+  pending live verification against a real Telegram client.
+- **Core renderers route glyphs through vocab**
+  (`core/src/todo_list.rs`, `core/src/breadcrumb.rs`):
+  `TodoItemStatus::glyph()` and `to_text_fallback()` now delegate through
+  `vocab::ASCII` with new `to_text_fallback_with(&Vocabulary)` variants —
+  byte-identical, proven by tests asserting against hardcoded pre-vocab
+  literals. Matrix and discord adapters likewise rerouted (byte-identical),
+  with stale doc comments claiming emoji output corrected in
+  `matrix/src/adapter.rs` and `discord/src/adapter.rs`.
+- **slack, gchat, teams, webex, mattermost, whatsapp-cloud now render
+  transcript glyphs through `vocab::for_channel`** — the adoption gate found
+  hardcoded breadcrumb rail markers and todo checkbox glyphs beyond the
+  telegram/matrix/discord sweeps (`slack/src/adapter.rs`,
+  `gchat/src/adapter.rs` incl. the error-card `[!]` attention prefix,
+  `teams/src/api.rs`, `webex/src/api.rs`, `mattermost/src/render.rs`,
+  `whatsapp-cloud/src/render.rs`). All six channels bind `vocab::ASCII`, so
+  output is byte-identical — proven by new
+  `*_byte_identical_to_pre_vocab_literals` tests in each crate whose expected
+  strings are hardcoded pre-vocab literals (all four todo statuses and all
+  three breadcrumb statuses). The deliberate mattermost / whatsapp-cloud
+  quirk is preserved and documented in-code: their in-progress todo item
+  reuses the *pending* glyph (`[ ]`, markdown has no half-checked box) plus
+  an `_(in progress)_` suffix.
+
+### Added
+
+- **Auto-reap of orphaned `create_agent` child sessions.** A new supervised
+  `child_reaper` loop (`crates/copperclaw-host/src/child_reaper.rs`, registered
+  in `boot.rs`, 120s interval) periodically reclaims child agents left behind by
+  botched or abandoned delegations — previously each leaked child persisted as an
+  idle-but-warm, cost-burning agent (its own `agent_group` + session, sometimes
+  with a container still making provider calls; one flaky delegation leaked seven
+  overnight). A child is reaped only when ALL conservative criteria hold:
+  `source_session_id IS NOT NULL` (it is a `create_agent` child — a top-level /
+  user session with a NULL/empty `source_session_id` is **never** reaped, the
+  paramount safety invariant, enforced in SQL by the new
+  `copperclaw_db::tables::sessions::list_reapable_children`), `container_status =
+  'stopped'` (never touch a running child; we never force), `last_active` older
+  than a TTL grace, and no `status='pending'` row in the child's per-session
+  `inbound.db` (never drop queued work). Reap order is FK-safe and best-effort:
+  `sessions::delete` (central rows) → remove the on-disk `/data` session tree →
+  `agent_groups::delete`; a failure on one child logs a `warn!` and continues.
+  Config: `COPPERCLAW_CHILD_REAP=0` disables the reaper (default ON; a disabled
+  loop PARKS on shutdown instead of returning, so the supervisor doesn't
+  restart-storm it), `COPPERCLAW_CHILD_REAP_IDLE_SECS` sets the idle grace
+  (default 900s, floored at 60s).
+
+- **New `web-backend` skill** (`skills/web-backend/SKILL.md`): the backend
+  counterpart to `web-app-scaffold`, for apps that go past static files.
+  Covers choosing a datastore deliberately (SQLite for single-node prototypes
+  with the kill-safe `journal_mode = DELETE` caveat, Postgres for concurrent /
+  production-shaped data, and when NOT to hand-roll over a JSON blob), designing
+  HTTP endpoints that return proper status codes + validated input + structured
+  errors instead of raw 500s, laying out `server/` (db/data-access layer,
+  routes, seed) separately from the frontend with env-based config, and wiring
+  the two via the vite `/api` proxy. Motivated by a real build that shipped
+  SQLite-only with WAL-on-bind-mount and an API that 500'd the caller. Cross-
+  linked from `web-app-scaffold`.
+
+### Fixed
+
+- **`ChannelAdapter` default rich-kind renderers no longer bypass the
+  splitter.** The trait's default `deliver_thinking` / `deliver_error` /
+  `deliver_diff` / `deliver_card` / `deliver_breadcrumb` / `deliver_todo_list`
+  / `deliver_collapsible` each rendered an UNBOUNDED `to_text_fallback()` and
+  called `self.deliver(...)` from *inside* the adapter
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Because they never
+  return `AdapterError::Unsupported`, they never reached the host's newly
+  cap-aware `call_adapter` in `copperclaw-host-delivery`, so any adapter
+  relying on the defaults could still hand the platform an over-length body
+  and take a permanent `BadRequest` — the reasoning block / error card / diff
+  was dropped, not truncated. All seven now route through a new provided
+  method `ChannelAdapter::deliver_text_capped`, which applies the same
+  `markdown::effective_max` render headroom the host applies and delegates to
+  the shared fence-aware `markdown::split_into_chunks` — no second splitter,
+  no duplicated headroom math. Fence balance is preserved, so a split diff or
+  thinking block never leaves a code fence dangling open, and the first part's
+  platform id is still returned as the edit/reaction anchor. In-cap bodies are
+  unaffected (exactly one `deliver` call, as before).
+
+- **Byte-denominated platform caps are no longer mis-declared as char caps.**
+  `max_message_chars()` counts chars, but three platforms document their limit
+  in UTF-8 **bytes**: Webex `POST /messages` at 7 439 bytes
+  (`crates/copperclaw-channels/webex/src/adapter.rs`), MS Graph `chatMessage`
+  at 28 KB (`teams/src/adapter.rs`), and Work Weixin `message/send` at 2 048
+  bytes (`wechat/src/adapter.rs`). A CJK reply is 3 bytes/char and many emoji
+  are 4, so a body that passed a 7 439-*char* split arrived at up to ~3x the
+  byte budget — far past what the 10% render headroom absorbs — and was
+  rejected outright. New trait method `ChannelAdapter::max_message_bytes()`
+  (default `None`) expresses the real constraint; the shared splitter gained
+  `markdown::split_into_chunks_within_bytes`, which runs the existing char
+  splitter first and re-splits ONLY the chunks that actually exceed the byte
+  budget, using each chunk's own bytes-per-char density. Ordinary ASCII
+  chunking is therefore byte-for-byte unchanged — the alternative, declaring
+  `bytes / 4` as a char cap, would have fragmented every plain English reply
+  fourfold. Honored by the host split path (`split_chat_content_if_needed` and
+  the streaming-edit split in `copperclaw-host-delivery/src/service.rs`, plus
+  the too-long re-split retry) and by the trait's own `deliver_text_capped`.
+  Webex and Teams keep their existing numbers as char ceilings (one char is at
+  least one byte); wechat's char cap goes 600 → 2 048, retiring the deliberate
+  under-approximation its own comment flagged as "requires a byte-aware
+  splitter — out of scope".
+
+- **Over-long outbound replies no longer drop permanently.** A correct
+  fence-aware splitter already existed and was wired into `dispatch_chat`, but
+  only there — so `BadRequest("Bad Request: message is too long")` /
+  `MESSAGE_TOO_LONG` / `text is too long` kept recurring through 2026-07-18/19
+  on every other path. Four fixes, all in
+  `crates/copperclaw-host-delivery/src/service.rs`: (1) the **streaming edit
+  path** (`try_streaming_edit_split`) — `editMessageText` enforces the same
+  4096 limit as `sendMessage`, so a streamed reply that grew past the cap
+  failed on every subsequent edit and froze at whatever prefix had landed;
+  the overflow now spills into follow-up messages and later ticks extend the
+  new TAIL with only the text past an accounted `committed` prefix, so the
+  stream keeps extending coherently instead of re-posting itself (state in
+  the new `edit_splits` map, keyed by anchor id, TTL-pruned; in-memory, so a
+  restart mid-stream degrades to editing the anchor). (2) **`call_adapter` is
+  now the cap-aware send surface** — the split moved below it rather than
+  being patched into eight call sites, so the seven `Unsupported` rich-kind
+  text fallbacks (collapsible / card / breadcrumb / todo list / error /
+  thinking / diff) and the delivery-action output path all inherit it at once;
+  rows already split by `dispatch_chat` pass through unchanged, so there is no
+  double split. (3) **Render headroom** — adapters render markdown to their
+  own flavor AFTER the split and HTML escaping expands the string, so a chunk
+  cut at exactly the declared cap could be over-length at the API;
+  `split_chat_content_if_needed` now shrinks the cap via
+  `copperclaw_channels_core::markdown::effective_max` in the one place the cap
+  becomes a chunk size. (4) **Empty-payload guard** — a `Chat` row with
+  absent / non-string / whitespace-only `text` passed through the splitter
+  untouched and was rejected by the adapter (`telegram deliver requires text
+  or files`; every `OutboundMessage` this crate builds hardcodes
+  `files: vec![]`, so that branch could never rescue it), burning the whole
+  retry budget and emitting a spurious user-facing `MessageKind::Error`
+  receipt for what is a runner-side condition; it is now recorded as a
+  delivered no-op. Plus a backstop: `is_too_long_bad_request` degrades an
+  over-length rejection into a re-split retry at a halved cap (only when
+  nothing was sent yet, so it cannot duplicate), insurance for adapters that
+  under-declare `max_message_chars` or platforms that tighten a limit. All
+  four defects were invisible to the suite — which is why this surface read as
+  already fixed — and each now has a regression test that was confirmed to
+  fail with its fix reverted.
+
+- **A full disk no longer turns into an unbounded per-session respawn storm.**
+  On 2026-07-18/19 the host's disk filled and the reconcile loop escalated from
+  1 to 56 to 179 `heartbeat stale; running -> stopped (will respawn)` lines a
+  day plus 235 `crash-restart recorded ... cause="generic"`, because the host
+  had no notion of "the environment cannot support a container right now": a
+  whole-box fault presented as N independent per-session bugs, and the remedy
+  applied (per-session backoff) structurally could not help — every session
+  retried forever at the 300s cap against the same full filesystem. Four
+  changes, all in `crates/copperclaw-host/src/container_manager/`:
+  (1) a **spawn preflight** (new `host_resources.rs`) `statvfs`es the data dir
+  and refuses to launch a container below the failure floor, returning the new
+  `ManagerError::HostResourceExhausted` — the session stays `Stopped` with its
+  inbound still pending instead of burning a doomed spawn. The probe is cached
+  per reconcile *tick*, not per session, so a pass over N sessions costs one
+  stat. (2) A **global circuit breaker** keyed on *distinct* sessions: when
+  `ENV_FAULT_SESSION_THRESHOLD` (3) different sessions crash-restart inside
+  `ENV_FAULT_WINDOW` (120s), the manager pauses respawns fleet-wide and fires
+  exactly ONE operator alert (not one per session), self-clearing once the disk
+  recovers and the hold elapses, or via `clear_env_exhausted()`. (3) `classify`
+  no longer swallows inbound-DB read failures: `has_pending_inbound`'s
+  `.unwrap_or(false)` made an unreadable DB indistinguishable from "no pending
+  work", so on a full disk every session silently stopped spawning with **no log
+  line at all**; it now warns. (4) A new `CrashCause::ResourceExhausted` plus
+  `free_disk_bytes` on every crash-restart log line, so an operator reading the
+  crash records has a thread back to the disk. Thresholds are no longer
+  duplicated: the pure classifier and `statvfs` call moved to the new
+  `copperclaw_cclaw::disk` module, shared by `cclaw doctor`'s `disk-space` check
+  and the host's preflight, so the CLI and the runtime cannot disagree about how
+  full is too full.
+
+- **Over-long agent replies are no longer permanently dropped on X, Signal,
+  Mattermost, iMessage and GitHub.** Those adapters declared no
+  `ChannelAdapter::max_message_chars`, so the host's outbound splitter never
+  engaged and any reply past the platform ceiling was rejected outright —
+  `text is too long` (X), `MESSAGE_TOO_LONG`, `Bad Request: message is too
+  long` — and recorded as a permanent `dropped_messages` failure, still
+  recurring 2026-07-18/19. Each now declares its real documented limit, with
+  the source cited in the doc comment: x 280 (`POST /2/tweets`,
+  standard-account limit, `x/src/adapter.rs`), signal 2000 (the composer limit
+  every official client enforces — over-long bodies were *silently truncated*,
+  a worse failure than a split), mattermost 4000 (`PostMessageMaxRunesV1`, the
+  default `MaxPostSize`; the 16383 v2 limit needs an opt-in migration),
+  imessage 4000 (self-imposed — Apple documents none, but long AppleScript
+  literals through `osascript` are unreliable), github 65536 (documented
+  comment-body max; the REST API returns a hard 422 above it). `matrix`,
+  `resend` and `deltachat` are now *explicitly* uncapped with a stated reason
+  rather than uncapped by omission — Matrix's 65 536-byte ceiling is on the
+  whole PDU and not on `body`, and Resend/Delta Chat are email, where chopping
+  one message into a numbered burst is worse than sending one long one.
+- **Rendered chunks can no longer overshoot the cap they were split to.** New
+  `markdown::effective_max` in
+  `crates/copperclaw-channels/core/src/markdown/split.rs` shrinks a declared
+  cap by a 10% render-headroom margin (`RENDER_HEADROOM_PERCENT`). The host
+  splits *raw markdown* at exactly `max`, but adapters render **after** the
+  split (telegram runs `render(&text, Flavor::Html)` on the chunk it is
+  handed), and rendering only grows the string — HTML escaping expands single
+  chars (`&` → `&amp;`) and inline markup gains tags (`**b**` → `<b>b</b>`).
+  So a chunk of exactly 4096 markdown chars could arrive at the API well over
+  4096 and take the whole message down. One helper next to `split_into_chunks`
+  means all 21 adapters inherit the margin instead of each guessing its own
+  fudge factor; `None` passes through unchanged (opted-out channels stay
+  opted out) and a degenerate cap floors at `Some(1)` so the greedy splitter
+  cannot spin. Arithmetic is overflow-safe on huge caps.
+- **Route-less sessions no longer lose every `usage_report` (delegate token
+  spend was invisible).** `process_row` in
+  `crates/copperclaw-host-delivery/src/service.rs` resolved a dispatch target as
+  a hard precondition *before* the `row.kind` match, so any session without
+  `session_routing` failed every outbound row. `delegate`-profile children are
+  spawned with no routing **on purpose** (that is their containment property),
+  yet they emit one `MessageKind::System` `usage_report` row per turn — 550 of
+  those were permanently marked failed on 2026-07-19, so delegate token spend
+  never reached `agent_turns` and was invisible to `cclaw usage` and to budget
+  enforcement. System rows are host-local control messages and are now processed
+  route-free; `handle_system` takes an optional target and demands a real one
+  only for the sub-actions that genuinely dispatch to a channel (`save_skill` /
+  `task_grant` approval cards, `update_breadcrumb`, `edit` / `reaction`).
+  Deliberately **no** parent-route fallback — inheriting the parent's chat route
+  would break the containment the profile exists to provide. User-facing kinds
+  are unchanged: they still require a route.
+- **Unroutable rows are now dead-lettered instead of vanishing.** The `NoRoute`
+  arm of the delivery loop wrote nothing central, so `cclaw dropped-messages
+  outbound-list` stayed empty through those 550+ failures. New
+  `Service::record_no_route` mirrors the existing no-adapter dead-letter path:
+  replayable kinds get an `outbound_dropped_messages` row with the new
+  `NO_ROUTE_DROP_REASON` (`no_route`) prefix, ephemeral UI kinds keep the
+  terminal record only, and no `ErrorCard` is emitted (there is nowhere to send
+  one). New `copperclaw_metrics::DEAD_LETTER_REASON_NO_ROUTE` gives the case its
+  own `copperclaw_delivery_dead_letter_total{reason="no_route"}` series, so it is
+  no longer indistinguishable from any other terminal delivery failure.
+- **`todo_watcher` background loop no longer restart-storms when disabled.**
+  The todo-notifications watcher is opt-in (`COPPERCLAW_TODO_NOTIFICATIONS`,
+  default off), but its `run_loop` *returned immediately* when the flag was
+  unset — and the supervisor classifies any return while the host is running
+  as an unexpected exit, so it restarted the loop forever (100+ restarts,
+  surfacing as a `todo_watcher (dead)` FAIL in `cclaw doctor`). It now PARKS on
+  the shutdown token when disabled, exiting only on real shutdown (an expected
+  drain). `crates/copperclaw-host/src/todo_watcher.rs`; regression test
+  `disabled_watcher_parks_until_shutdown_instead_of_returning`.
+- **Host-side self-recovery: no repeated crash can loop a session forever
+  (F2).** A poison inbound (the canonical case: a huge base64 screenshot plus
+  an oversized history) used to crash the runner on startup, get re-claimed on
+  every respawn, and crash-loop indefinitely (the 2026-07-18 incident: the
+  crash streak climbed past 15 on a flat backoff until an operator manually
+  cleared the history). Two host-side backstops close that class of failure:
+  - **Poison-message quarantine.** `emit_crash_restart_apologies`
+    (`crates/copperclaw-host/src/container_manager/classify.rs`) now bumps a
+    per-message `messages_in.crash_attempts` counter (new column, migration
+    `033_messages_in_crash_attempts.sql`) once per in-flight message per
+    crash-restart. After `QUARANTINE_CRASH_ATTEMPTS` (3) crashes it marks that
+    inbound row terminally `status='failed'` — so `get_pending` / `count_due`
+    (both `pending`-scoped) stop returning it, breaking the retry loop at the
+    exact lifecycle point that re-claimed it — and emits a distinct one-time
+    "your message repeatedly crashed the agent; skipping it" apology. Below the
+    threshold the message still retries, so a genuinely transient crash loses
+    nothing. New DB helper `messages_in::increment_crash_attempts`.
+  - **Safe-mode respawn after a crash streak.** When a session's
+    consecutive-crash streak reaches `RECOVERY_MODE_STREAK` (5) — read from the
+    existing per-session `CrashLoopTracker` via new `current_streak`
+    (`crates/copperclaw-host/src/container_manager/crash_loop.rs`) — the host
+    writes `recovery_mode: true` into `runner.json`
+    (`RunnerConfigForFile`, `runner_config.rs`). The runner reads it at startup
+    (`run_loop`, `crates/copperclaw-runner/src/run/mod.rs`) and aggressively
+    truncates its persisted `state.history` to a small recent window
+    (`RECOVERY_KEEP_MESSAGES` = 8, clearing the now-incompatible continuation)
+    via F1's LLM-free `compaction::truncate_to_recent` — self-healing a
+    persistent history/context problem instead of looping. The flag is
+    transient: it clears as soon as the streak resets after a spawn survives.
+  Both defaults are safe: a non-crashing session gets `crash_attempts = 0`,
+  no `recovery_mode` key in its `runner.json`, and byte-identical startup
+  behaviour. Config field carries `#[serde(default)]` for back-compat with
+  runner.json files written before F2.
+- **Preview links can advertise a stable off-LAN host (e.g. Tailscale).** When
+  `preview_bind` is `0.0.0.0`, the shareable `__preview` URL previously always
+  used the auto-detected `192.168.x` LAN IP, which is unreachable when the
+  operator is off their home network. `display_host`
+  (`crates/copperclaw-host/src/preview.rs`) now honors a new
+  `COPPERCLAW_PREVIEW_HOST` env var — set it to a stable name/IP by which the
+  machine is reachable from wherever the link is opened (e.g. a Tailscale
+  `MagicDNS` name `desk-1.tailXXXXXX.ts.net`) and preview URLs render that host
+  instead. The proxy still binds per `preview_bind` (0.0.0.0 already includes
+  the tailscale interface); only the advertised host changes. Bare host only
+  (no scheme/port); empty/unset falls back to LAN detection.
+- **Text-only models no longer wedge on a screenshot in the transcript.** When
+  the active model is text-only and the conversation history carries an image
+  block (a `ui_screenshot` / `view_image` result), an OpenRouter-style gateway
+  rejects the whole turn with `404 "No endpoints found that support image
+  input"` — and because the image stays in the re-sent history, *every*
+  subsequent turn fails too, stranding the agent. `AnthropicProvider::query`
+  (`crates/copperclaw-providers/src/anthropic.rs`) now detects that specific
+  rejection, strips the image blocks to a text placeholder, and retries the
+  request once, so the agent keeps going (blind to the image) instead of
+  dead-ending. Vision-capable models are unaffected — they accept the image on
+  the first try. Covered by a wiremock end-to-end test (image attempt → 404 →
+  stripped retry → 200) plus unit tests for the detector and the stripper.
+
+### Added (M22 SX — Wave-3 skills fixtures: materialized-script + relevance + versioning)
+
+- **The Wave-3 X-rider — deterministic replay/integration coverage for the
+  three skills behaviors, registered where the seam they exercise actually
+  lives.** No production `src/**` change; verification-only.
+- **S1/S1M materialized-script — fixture coherence guard.**
+  `crates/copperclaw-host/tests/replay.rs` gains
+  `sx_runnable_helper_skill_fixture_is_coherent`, a coherence guard (mirroring
+  the CX visual-regression fixture guard) over the committed
+  `fixtures/skills/runnable-helper/`. It pins the properties the in-crate
+  materialize/mount tests depend on: frontmatter `name == dir`, a substantive
+  description (S2 relevance input), and an **executable** `scripts/greet.sh`.
+  The full materialize → read-only-mount → exec path is not replay-harness-
+  drivable (the `materialize_session_skills` / `build_spec` seams are
+  host-crate-internal `pub(super)`, and the harness never spawns a container),
+  so those two halves stay asserted in-crate
+  (`cold_start::tests::materialize_makes_fixture_helper_executable`,
+  `spawn::tests::build_spec_mounts_skills_source_read_only_when_configured`);
+  this guard fails first if the fixture they share drifts or loses its exec bit.
+- **S2 relevance selection — library-seam integration test + fixture set.**
+  New `fixtures/skill_selection/` (four topically-disjoint skills:
+  `bread-baking`, `astronomy-observing`, `tax-filing`, `garden-care`) plus
+  `crates/copperclaw-skills/tests/coverage.rs::relevant_selector_narrows_inlined_skill_set`:
+  scans the set through `SkillRegistry`, and asserts `SkillsSelector::Relevant`
+  with an off-topic (bread-only) query returns a strict, smaller, subset of
+  `SkillsSelector::All`, led by the on-topic skill and costing fewer inlined
+  description bytes — the prompt-shrink decision (e) promises.
+- **S3 versioning — author→list→reload round-trip integration test.**
+  `crates/copperclaw-skills/tests/coverage.rs::author_list_reload_roundtrip_bumps_version_on_resave`
+  ties the S3 public seams together: `save_group_skill` (author) →
+  `list_group_skills` (version 1) → `SkillRegistry::scan` (re-discovery, the
+  scan a container spawn performs) → re-save durably bumps the version to 2 in
+  both the listing and the on-disk frontmatter.
+- **Honest boundary.** Relevance selection and versioning are library-level
+  concerns owned by `copperclaw-skills` (selector resolution + prompt assembly
+  run host-side before any spawn; the harness never spawns), so their
+  integration tests live in the crate that owns the seam rather than in the
+  replay harness — noted inline, mirroring how CX flagged the chromium boundary.
+- **Metric wish (for the M1 rider).** A
+  `copperclaw_skills_relevance_filtered_total` counter (skills dropped by a
+  `Relevant` selection vs `All`) would let operators see the prompt-shrink S2
+  buys per spawn — the companion to S1's `copperclaw_skills_materialized_total`
+  wish already recorded in `cold_start.rs`.
+### Added (M22 M1 — metrics)
+
+One sweep of the metric "wishes" every M22 card recorded, defined + wired in
+`crates/copperclaw-metrics/src/lib.rs` (the serialized hotspot only this card
+touches) and documented in `docs/observability.md`. Each helper is emitted at a
+real call site in the crate that owns the signal — no dangling metrics.
+
+- **Wave 1 (coding).** `copperclaw_post_edit_verify_total{tool,outcome}` +
+  `copperclaw_post_edit_verify_findings` (histogram) in
+  `copperclaw-mcp/src/tools/diagnostics.rs` (`post_edit_verify`, C1);
+  `copperclaw_repo_attach_total` +
+  `copperclaw_repo_attach_verify_stages_inferred` (histogram) in
+  `copperclaw-runner/src/run/project.rs` (`attach_project`) and
+  `copperclaw_repo_attach_detected_total` in
+  `copperclaw-host/.../cold_start.rs` (`note_attachable_repos`, C2);
+  `copperclaw_find_symbol_total{definition_source}` in
+  `copperclaw-mcp/src/tools/find_symbol.rs` plus
+  `copperclaw_symbol_index_builds_total{backend}` +
+  `copperclaw_symbol_index_symbols` (histogram) in `project.rs`
+  (`trigger_symbol_index`, C3);
+  `copperclaw_visual_regression_flags_total{viewport,dimensions_changed}` +
+  `copperclaw_visual_regression_baselines_total` in
+  `copperclaw-mcp/src/tools/ui_screenshot.rs` (`visual::regression_note`, C4);
+  `copperclaw_review_batch_reviewers_total` +
+  `copperclaw_review_merge_gate_total{outcome}` in
+  `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch::handle`, C5);
+  `copperclaw_see_fix_gate_completion_total{outcome}` in
+  `copperclaw-mcp/src/tools/todo.rs` (the C6 see→fix gate, mirroring
+  `inc_review_gate_completion`).
+- **Wave 2 (autonomy).** `copperclaw_task_grants_total{outcome}` in
+  `copperclaw-host/src/handlers/approvals.rs` (`apply_task_grant`, A1);
+  `copperclaw_autonomous_actions_total{outcome}` in
+  `copperclaw-runner/src/run/tool_dispatch.rs` (A2);
+  `copperclaw_grants_snapshotted_total{outcome}` in
+  `copperclaw-host/.../tasks_snapshot.rs` (`write_grant_snapshot`) plus
+  `copperclaw_grant_fires_consumed_total` /
+  `copperclaw_grant_tokens_consumed_total` in
+  `copperclaw-host-delivery/src/service.rs` (`apply_grant_consume`, A2 host
+  half); `copperclaw_goal_checkins_fired_total` /
+  `copperclaw_goals_budget_paused_total` (sweep run loop),
+  `copperclaw_goal_status_total{status}` /
+  `copperclaw_goal_progress_recorded_total` (`apply_goal`), and the
+  `copperclaw_active_goals` gauge (`checks/goals.rs`) (A3);
+  `copperclaw_condition_checkins_fired_total{kind}` in
+  `copperclaw-host-sweep/src/checks/condition_checkin.rs` (A4);
+  `copperclaw_recurrence_consolidated_total{outcome}` in
+  `checks/recurrence.rs` (A5).
+- **Wave 3 (skills).** `copperclaw_skills_materialized_total{agent_group}` in
+  `copperclaw-host/.../cold_start.rs` (`materialize_session_skills`, S1);
+  `copperclaw_skills_relevance_filtered_total` in
+  `copperclaw-host/.../prompt.rs` (inline builder, S2);
+  `copperclaw_skills_listed_total{mode}` in
+  `copperclaw-mcp/src/tools/list_skills.rs` +
+  `copperclaw_skill_version_saved` (histogram) in `approvals.rs` (after
+  `save_group_skill`, S3);
+  `copperclaw_load_skill_inline_scoped_total{skill,scope}` in
+  `copperclaw-mcp/src/tools/load_skill.rs` (S4).
+
+### Added (M22 S4 — activate `tools:` frontmatter + inline-mode active-skill narrowing)
+
+- **`tools:` frontmatter is now a working tool allowlist.**
+  `crates/copperclaw-skills/src/frontmatter.rs` gains a `tools: Option<Vec<String>>`
+  field (sibling to S3's `version`) plus a `Frontmatter::declared_tools()`
+  accessor. `tools:` is a companion to `allowed-tools:` — both declare the tool
+  surface a skill needs. `parse` folds any `tools:` entries into `allowed_tools`
+  (union, order-preserving, de-duplicated), so the whole existing enforcement
+  pipeline (`Skill::allowed_tool_names` → skills catalogue → `load_skill` → the
+  runner's `ToolPolicy::with_active_skill` dispatch gate) scopes on `tools:` with
+  no change to `registry.rs`/`prompt.rs`. Was reserved-but-unused before this
+  card. A skill declaring neither key keeps `allowed_tools == None` and narrows
+  nothing — unchanged for all 41 shipped skills.
+- **Active-skill tool narrowing now works under inline (default) skills mode.**
+  Previously `load_skill` was inert in inline mode: with no `/data/skills.json`
+  catalogue it errored, so a skill could never scope the tool surface unless the
+  operator opted into callable mode. `crates/copperclaw-mcp/src/tools/load_skill.rs`
+  now, on catalogue-miss, reads the skill's materialized `SKILL.md`
+  (`/data/skills/<name>/`, staged by S1) and narrows dispatch to the skill's
+  declared tools (`allowed-tools:` ∪ `tools:`, normalized to copperclaw MCP
+  names) via the same `set_active_skill_allowed_tools` hook the callable path
+  uses. A skill with no declared scope clears any prior narrowing. Why: skills
+  should be able to scope the tool surface without forcing every operator off the
+  lowest-risk default mode (decision **e**).
+
+### Changed (M22 S4)
+
+- `crates/copperclaw-runner/src/run/tool_dispatch.rs`: the active-skill scope
+  read at the dispatch gate is now named and documented as skills-mode-agnostic
+  — the same `ToolContext::active_skill_allowed_tools()` narrowing applies in
+  inline mode (scope set from the materialized `SKILL.md`) exactly as in callable
+  mode (scope set from `skills.json`). No behavioural change to callable mode; a
+  regression test pins that an inline-activated `tools:` scope blocks
+  out-of-scope tools and admits in-scope ones at dispatch.
+
+### Added (M22 S1 — Wave-3 MARQUEE: skills materialize into the container)
+
+- **Skills are now runnable, not just prose.** `copperclaw_skills::materialize`
+  was complete + tested but **orphaned** (zero call sites), so a skill's
+  `scripts/`/`data/` never crossed the sandbox boundary — only its `SKILL.md`
+  body reached the agent (system prompt / `skills.json`). S1 gives it its first
+  call site: `ContainerManager::materialize_session_skills`
+  (`crates/copperclaw-host/src/container_manager/cold_start.rs`, in a clearly
+  separated "skills-materialize half" beside C2's repo-attach half) runs at cold
+  start from `begin_spawn_attempt` and symlinks each **selected** skill's source
+  dir into `<session_root>/skills/<skill_id>`. `<session_root>` is the
+  container's `/data` bind mount, so a skill's helper is reachable in-container
+  at `/data/skills/<skill_id>/scripts/…`.
+- **Selector + coding-cap parity with the prompt.** The materialized set is
+  resolved through the same `SkillsSelector` (default `All`, else the group's
+  stored selector) and the same `coding_enabled` / `CODING_SKILL_NAMES` cap that
+  `runner_config_for` applies, so materialize never stages a skill the group
+  didn't select. Best-effort + idempotent: a missing skills dir, scan failure,
+  or per-skill link error is logged and swallowed — it never fails the spawn.
+- **Escape guard activated at the call site.** `materialize_session_skills`
+  passes a non-empty `allowed_roots` (`[skills_dir, <groups_dir>/<ag>/skills]`)
+  so the `materialize.rs` guard rejects any skill dir that canonicalizes outside
+  the configured skill roots — defense-in-depth against a per-group override
+  pointing at an arbitrary host path. Security verdict recorded in
+  `docs/plans/m22-security-reviews.md` (S1 — PASS).
+- **Fixture skill (`fixtures/skills/runnable-helper/`)** shipping an executable
+  `scripts/greet.sh`, plus unit/integration tests in `cold_start.rs` proving
+  materialize is invoked with the resolved skill set, the symlink farm lands
+  under `/data/skills`, and the helper is executable through the farm (the
+  container's view). NOTE: a read-only bind mount of the skills source into the
+  container (so the farm's host-path symlinks resolve in-container) lives in
+  `container_manager/spawn.rs`, outside S1's file scope — it is the one
+  remaining wire for full in-container execution and is called out in the S1
+  security review; host-side resolution + executability are tested here.
+
+### Added (M22 S1M — read-only skills-source bind mount: helpers resolve in-container)
+
+- **The S1 marquee is now truly live: a materialized skill's helper script is
+  executable *inside* a spawned container.** S1 stages selected skills as a
+  symlink farm at `<session_root>/skills/<id>` (the container's `/data/skills`)
+  whose links target the **canonical host** skill dirs (`copperclaw_skills::
+  materialize` links to `skill.dir.canonicalize()`). Those host paths don't
+  exist inside the sandbox, so the farm's links dangled in-container and a
+  skill's `scripts/` helper was not runnable there. `build_spec`
+  (`crates/copperclaw-host/src/container_manager/spawn.rs`,
+  `ContainerManager::apply_skills_source_mounts`) now binds the skills source
+  dir(s) **read-only at their own canonical host-absolute path** (source ==
+  target), so every farm link resolves in-container without rewriting.
+- **Both skill sources, resolved exactly as S1 resolves them.** The global
+  `skills_dir` and the per-group override `<groups_dir>/<ag>/skills` (only when
+  it exists on disk) are each mounted; both existing → two read-only mounts.
+  The mount lives at the *canonical* path because a configured `skills_dir` is
+  commonly a symlink (e.g. `<install>/data/skills` → the repo `skills/`), which
+  is what the farm links actually point at.
+- **Secure-by-default: read-only, escape-guarded, deduped, fail-safe.** Each
+  raw source is validated with `mount_guard::validate_source` before mounting
+  (global root = the configured dir itself; the per-group override's root is
+  `groups_dir`, mirroring how the memory mount validates
+  `<groups_dir>/<ag>/memory`); a source that fails validation, isn't a
+  directory, or can't canonicalize drops *that* mount and never fails the
+  spawn. No global `skills_dir` → no mount. Paths already bound (and the two
+  skills roots against each other) are deduped, so the mount is idempotent
+  across spawns. No egress or write widening — the content is the already-
+  trusted skill files S1 stages. Security note appended under the S1 verdict in
+  `docs/plans/m22-security-reviews.md`.
+- **Tests** (`spawn.rs`): `build_spec_mounts_skills_source_read_only_when_configured`
+  asserts the read-only source==target mount is present at the canonical
+  skills path; `build_spec_no_skills_mount_without_skills_dir` proves the
+  conditional no-op; `build_spec_mounts_per_group_skills_override_read_only`
+  covers the two-source case.
+
+### Added (M22 AX — Wave-2 autonomy fixtures: grant wakes + goal progress)
+
+- **Grant-wake replay fixtures (`fixtures/cli/grant-wake-granted`,
+  `fixtures/cli/grant-wake-ungranted`)** now run deterministically, registered in
+  `crates/copperclaw-host/tests/replay.rs`. Both seed the scheduled `kind:task`
+  wake via `inbound.sql` + a central `tasks` row and fire it through the M21
+  sweep wake path. **granted-act** additionally seeds an *approved* `task_grants`
+  row (`central.sql`); the real A2H writer (`write_tasks_snapshot`, now invoked at
+  the harness's spawn-mirror) renders the live `grant.json` the runner's A2 gate
+  reads, so the fixture drives the OPEN gate end-to-end: the granted `web_fetch`
+  is admitted (no `autonomous (heartbeat/scheduled) turn` deny), exactly one fire
+  is charged as a `grant_consume` System row, and the delivery loop applies it
+  back to central (`task_grants.fires_consumed == 1`). **ungranted-propose** seeds
+  no grant, so the action stays blocked, no fire is charged, and the read-then-
+  propose reply still reaches the user. The granted URL is a loopback literal so
+  the tool's own SSRF net-guard rejects it offline/instantly — the autonomy gate
+  (the behaviour under test) opens and charges the fire *before* that guard runs,
+  so `grant_consume` is the deterministic proof, not the fetch body.
+- **Goal-progress replay fixture (`fixtures/cli/goal-progress`)**: an A3
+  long-running goal, due a check-in and re-arming every 5 minutes, is driven
+  across two controlled `SweepService::run_once` passes (the sweep `MockClock`
+  seam) that straddle the croner-re-armed `next_checkin`. Each pass fires a
+  `kind:task` check-in wake; the woken agent records progress via `update_goal`,
+  so the goal accrues two check-ins and two progress-log rows across the wakes
+  (`goals.checkin_count == 2`, `list_progress().len() == 2`, `tokens_consumed ==
+  100`).
+- **Replay harness (`crates/copperclaw-host/tests/replay/harness.rs`, test-only,
+  additive):** `run_one_turn` now mirrors the container manager's spawn-time
+  `write_tasks_snapshot` so the runner's A2 gate reads the same host-produced
+  `grant.json` production writes (byte-neutral for every fixture without a seeded
+  grant — no `task_grants` row means no `grant.json`, so the brake stays closed);
+  a new `run_goal_sweep_at(now)` runs one goal sweep pass on a `MockClock` and
+  drives a turn per goal check-in fired; `apply_inbound_sql` /
+  `snapshot_messages_out` / `snapshot_messages_in` are widened to `pub` for
+  bespoke autonomy assertions.
+
+### Changed (M22 A5 — consolidate recurrence into the central tasks scheduler)
+
+- **One recurrence mechanism, not two.** The per-session `messages_in.recurrence`
+  self-replication engine
+  (`crates/copperclaw-host-sweep/src/checks/recurrence.rs`) duplicated the
+  central `tasks` scheduler (`checks/scheduling.rs`, migration 028) but — unlike
+  it — had no lifecycle surface (no `list` / `pause` / `resume` / `cancel`).
+  A5 turns `recurrence.rs` into a **deprecation shim**: instead of inserting a
+  fresh `messages_in` row at each next fire, it now forwards each legacy
+  recurring series into a central `tasks` row and clears the `recurrence` column
+  on the source rows so the old path never fires that series again. Recurrence
+  therefore gains the full task lifecycle (`list_tasks` / `pause_task` /
+  `resume_task` / `cancel_task`) for free — the whole point of the
+  consolidation.
+- **Idempotent, operator-safe forward.** The synthesised task id is derived
+  deterministically from the series
+  (`recurring:<session>:<series_key>`), so a series migrates exactly once; the
+  `recurring:` prefix cannot collide with an agent-authored `task_<uuid>` id;
+  and the presence check means a task an operator later cancelled or paused is
+  never resurrected by the shim. Because the migration clears the source rows'
+  `recurrence`, an already-migrated series no longer appears in the per-session
+  scan on the next pass.
+- **No migration added.** Legacy per-session recurrence lives in each session's
+  `inbound.db`, which a central-DB SQL migration cannot reach, so the data-path
+  conversion happens at runtime in the sweep the first time it observes an
+  existing recurring series (033 was the next free migration number but is left
+  unused by A5). Wiring: `crates/copperclaw-host-sweep/src/service.rs`'s
+  `run_once` now passes the central DB handle into `recurrence::check` (kept
+  alongside the A3 goal + A4 condition blocks). Behaviour note: a forwarded
+  series fires through the central scheduler with `platform_id` / `channel_type`
+  / `thread_id` unset, exactly as agent-scheduled tasks already do — recurring
+  self-wakes never carried a user venue in practice.
+### Added (M22 A2H — flip the autonomy grant gate LIVE)
+
+- **grant.json snapshot writer (`crates/copperclaw-host/src/container_manager/tasks_snapshot.rs`)**:
+  the host-side companion A2 was waiting on. `write_grant_snapshot` resolves the
+  firing task from the session's pending `kind:task` inbound
+  (`firing_task_id_from_inbound`, mirroring the runner's `firing_task_id`), reads
+  its live `copperclaw_db::tables::task_grants::effective_grant`, and writes
+  `<session_data_root>/grant.json` in the exact
+  `copperclaw_runner::run::tool_dispatch::TurnGrant` serde shape (new
+  `GrantSnapshotRow`, `GRANT_SNAPSHOT_FILENAME`). It is folded into
+  `write_tasks_snapshot`, so it fires at BOTH the container spawn (via
+  `runner_config_for`) and the manager-tick refresh — the first scheduled fire
+  therefore sees its grant at spawn time. **Secure-by-default:** a `grant.json` is
+  written ONLY when `effective_grant` returns `Some`; no firing task, an inert
+  grant (none / revoked / expired / exhausted), or a DB read error all REMOVE any
+  stale snapshot and write nothing, so `load_turn_grant` returns `None` and the
+  runner's autonomy gate stays CLOSED. **This flips A2's gate from closed to
+  live**: before this writer existed, `grant.json` was always absent and every
+  autonomous credentialed-external action was blocked regardless of a stored,
+  human-approved grant.
+- **`grant_consume` delivery handler (`crates/copperclaw-host-delivery/src/service.rs`)**:
+  new inline System-row arm + `apply_grant_consume`, alongside the existing
+  `task_grant` / `goal` / `condition` handlers. The runner emits a
+  `{"grant_consume": {"grant_id","task_id","fires"}}` row (its
+  `charge_grant_fire_once`) when a granted autonomous action actually fires; the
+  handler debits the central `task_grants` row via
+  `task_grants::consume_fire` (once per `fires`, default 1, clamped non-negative)
+  and `consume_tokens` when the payload carries a `tokens` count. This is what
+  makes `max_fires` / token budgets enforceable ACROSS fires: without it the
+  runner's per-turn + in-snapshot bounds held, but the central grant never
+  depleted, so `effective_grant` (hence the next spawn's grant.json) would never
+  read the grant exhausted. Internal accounting — applied immediately, NOT
+  approval-gated (it can only reduce an existing authorization). Registered in
+  `crates/copperclaw-host/tests/action_handler_coverage.rs` (added to both
+  `runner_emit_set()` and `inline_handler_set()`; `runner_emit_set_matches_source`
+  now also scans `run/tool_dispatch.rs::charge_grant_fire_once`).
+
+### Added (M22 A4 — revive condition/event check-ins)
+
+- **Conditions schema (`conditions` + `condition_flags` tables, migration
+  032)**: durable, event-driven wakes that revive the previously-dormant
+  `checks::condition_checkin` sweep. Before this the sweep's `ConditionStore`
+  was in-memory/default-empty with no registration surface, so
+  `IdleForAtLeastSecs` / `FlagSet` conditions could never be created and never
+  fired. `crates/copperclaw-db/migrations/032_conditions.sql` (032 was the next
+  free number after A3's 031), registered in
+  `crates/copperclaw-db/src/migrate.rs`. Conditions persist (a dormant in-memory
+  store that empties on restart is a weak revival); the rising-edge latch stays
+  in-memory (re-arming from "never seen" after a restart is correct).
+- **Conditions model (`crates/copperclaw-db/src/tables/conditions.rs`)**:
+  `upsert` (register/replace by agent-chosen id), `list_active`, `get`,
+  `soft_remove` (deregister via `removed_at`, retaining an audit trail), plus
+  the settable per-session flag latches (`set_flag` / `clear_flag` /
+  `list_flags_for_session`) the `flag` condition kind reads. Registered in
+  `crates/copperclaw-db/src/tables/mod.rs`.
+- **Revived condition sweep (`crates/copperclaw-host-sweep`)**: `service.rs`
+  `run_once` now reloads the `conditions` table into the shared in-memory
+  `ConditionStore` each pass (new `ConditionStore::reconcile`, which preserves an
+  unchanged condition's rising-edge latch so a still-true condition doesn't
+  re-fire every pass) and the condition sampler
+  (`sample_condition_context`) now populates ALL THREE observable signals — the
+  pending-inbound count (as before) plus `idle_secs` (from the session's
+  `last_active`) and `flags_set` (from `condition_flags`) — so idle/flag
+  conditions actually fire. `checks/condition_checkin.rs` gains
+  `Condition::from_stored` (DB row → in-memory condition) and the kind wire
+  tags. A fired condition reuses the SAME `kind:task` fan-out scheduled tasks /
+  goals use; the wake therefore flows through the autonomous path and stays
+  subject to A2's grant gate at fire time.
+- **Condition MCP tools (`crates/copperclaw-mcp/src/tools/conditions.rs`)**:
+  `register_condition` (declare/deregister a durable idle / pending-inbound /
+  flag condition) and `set_condition_flag` (raise/lower the latch a `flag`
+  condition watches), registered in `tools/mod.rs` alongside the scheduling /
+  goal tools. New `RegisterConditionSpec` / `SetConditionFlagSpec` +
+  `OutboundToolEffect::RegisterCondition`/`SetConditionFlag` in
+  `crates/copperclaw-mcp/src/context.rs` (additive, alongside A1's grant effect
+  + A3's goal effects). Both verbs classified as autonomy-affecting mutations in
+  `crates/copperclaw-runner/src/policy.rs` (denied to a guest sender). The runner
+  writes them as `{"condition": {...}}` system rows
+  (`crates/copperclaw-runner/src/tools.rs` `apply_register_condition` /
+  `apply_set_condition_flag`); the host's delivery `condition` inline handler
+  (`crates/copperclaw-host-delivery/src/service.rs` `apply_condition`) persists
+  them immediately into the central `conditions` / `condition_flags` tables — a
+  condition is internal state and authorizes nothing on its own (registered in
+  `crates/copperclaw-host/tests/action_handler_coverage.rs`).
+
+### Added (M22 A3 — first-class long-running goal object)
+
+- **Goals schema (`goals` + `goal_progress` tables, migration 031)**: a durable
+  long-running objective the sweep can drive against — status, an append-only
+  progress log, cumulative token spend, and a link to the driving task/grant.
+  `crates/copperclaw-db/migrations/031_goals.sql` (031 was the next free number;
+  030 is A1's), registered in `crates/copperclaw-db/src/migrate.rs`. Decision
+  (d): a goal INDEXES OVER `agent_todos.json` (the in-session plan) and the
+  memory store (the fact store), it does not replace them.
+- **Goals model (`crates/copperclaw-db/src/tables/goals.rs`)**: CRUD +
+  explicit, validated state transitions (`transition`/`set_status`:
+  `active`⇄`paused`, `active`/`paused`→`completed`/`abandoned`, terminal states
+  frozen), the append-only progress log (`record_progress`/`list_progress`) with
+  cumulative token accrual, check-in bookkeeping (`list_due_checkin`,
+  `mark_checkin`, `set_next_checkin`), and `budget_remaining` — which draws on
+  the linked A1 grant (`task_grants::effective_grant`/`tokens_remaining`) as the
+  budget AUTHORITY when a `grant_id` is set (decision (d)), falling back to the
+  goal's own `token_budget` otherwise.
+- **Goal check-in sweep (`crates/copperclaw-host-sweep/src/checks/goals.rs`)**:
+  a new sweep module that, each pass, fans out a `kind:task` wake into the
+  session of every active goal whose `next_checkin` elapsed — reusing the SAME
+  scheduler fan-out scheduled tasks use, not a parallel wake mechanism — then
+  re-arms `next_checkin` from `checkin_recurrence`. A goal whose grant-backed
+  budget is exhausted is PAUSED instead of woken. Registered in
+  `crates/copperclaw-host-sweep/src/service.rs` (new `goal_checkins_fired` /
+  `goals_budget_paused` report fields) and `checks/mod.rs`.
+- **Goal MCP tools (`crates/copperclaw-mcp/src/tools/goals.rs`)**:
+  `create_goal` / `list_goals` / `update_goal`, registered in `tools/mod.rs`
+  alongside the scheduling tools. New `CreateGoalSpec` / `UpdateGoalSpec` /
+  `GoalSummary` + `OutboundToolEffect::CreateGoal`/`UpdateGoal` +
+  `ToolContext::list_goals` in `crates/copperclaw-mcp/src/context.rs` (additive,
+  alongside A1's grant effect). The runner writes them as `{"goal": {...}}`
+  system rows (`crates/copperclaw-runner/src/tools.rs` `apply_goal_create` /
+  `apply_goal_update`); the host's delivery `goal` action handler
+  (`crates/copperclaw-host-delivery/src/service.rs` `apply_goal`) persists them
+  immediately into the central `goals` table — a goal is internal state and
+  authorizes nothing on its own, so it is not approval-gated (any action a
+  check-in wake later takes stays gated by A2's grant machinery).
+### Added (M22 A2 — enforce capability grants at the autonomy gate, Wave 2 marquee)
+- The autonomy gate: a scheduled / heartbeat (autonomous) turn may now take a
+  credentialed external action, but **only** when the firing task carries a
+  live, human-approved capability grant (M22 A1) whose scope permits that
+  specific action. The brake stays closed by default (decision (b)); the grant
+  opens it per-task, bounded, and pre-authorized — never blanket. Anything
+  outside the grant stays blocked → read-then-propose (an approval / wall card).
+  - `crates/copperclaw-runner/src/run/tool_dispatch.rs`: new `TurnGrant` /
+    `GrantGateState` types (the runner-side view of A1's `effective_grant`),
+    `required_capability()` (the tool-call → required-capability-token mapping),
+    and `autonomy_verdict()` (the per-call grant consult). `invoke_tool` now
+    consults the firing task's grant before the policy layers: an in-scope
+    action drops the autonomous block for that call only (the taint gate still
+    applies independently) and charges **one fire** per turn via a
+    `grant_consume` outbound System row; an out-of-scope action returns a
+    clear, classifiable deny; an ungranted action falls through to the existing
+    blanket autonomous deny. Why: self-generated wakes bypass the router, so the
+    gate has to live where every autonomous dispatch funnels through.
+  - `crates/copperclaw-runner/src/run/mod.rs`: at turn start `run_loop` resolves
+    the firing task id from the `kind: task` wake row (`content.task_id`, then
+    `series_id`) and loads the host-written grant snapshot
+    (`<data_root>/grant.json`, the firing task's `effective_grant`) into the new
+    `RunnerDeps::active_grant`, verifying the snapshot's `task_id` matches the
+    firing task and re-checking liveness (fail-closed). `set_turn_provenance`'s
+    blanket `approved` stays `false` — scoping is per-call.
+  - `crates/copperclaw-runner/src/run/blocker.rs`: the out-of-scope-grant deny
+    classifies to `BlockerCategory::Autonomous`, and its wall card now points the
+    user at pre-authorizing the task with a bounded, expiring grant.
+- `fixtures/cli/grant-wake-granted/` + `fixtures/cli/grant-wake-ungranted/`:
+  scaffold wake transcripts (granted-act vs ungranted-propose) with the grant
+  snapshot + READMEs specifying the task-fire / grant plumbing and `replay.rs`
+  registration the AX X-rider consolidates.
+- **Companion plumbing required for the live path** (documented in
+  `docs/plans/m22-security-reviews.md` §A2, out of A2's runner scope): a host
+  writer that snapshots `task_grants::effective_grant` to
+  `<session>/grant.json` at fire/spawn time, and a delivery handler that applies
+  the runner's `grant_consume` System rows back to central via
+  `task_grants::consume_fire`. Until those land the gate stays closed
+  (secure-by-default).
+
+### Added (M22 CX — Wave-1 coding replay fixtures)
+- `fixtures/cli/post-edit-digest/` + `tests/replay.rs::cli_post_edit_digest_feeds_diagnostics_back`:
+  deterministic replay coverage for the C1 post-edit verify hook. A `write_file`
+  mutation of a `.ts` file fires the automatic post-edit typecheck; the fixture
+  ships a fake `tsc` shim (`bin/tsc`) placed on `PATH` via the same subprocess
+  re-exec seam the verify-gate fixtures use (forbid(unsafe_code) blocks
+  `std::env::set_var`), so the hook fires with no real toolchain present. The
+  test byte-diffs the four expected streams and asserts the fed-back
+  `post_edit_diagnostics` digest — including the `note` string byte-identical to
+  `fixtures/diagnostics/post-edit-digest/recorded-digest.json` — reached the
+  model in the captured provider request bodies.
+- `tests/replay.rs::visual_regression_fixtures_are_coherent`: a coherence guard
+  over the C4 `fixtures/visual_regression/` PNGs the in-crate screenshot-diff
+  tests depend on — pins their 8-bit depth, supported color types (0/2/6),
+  baseline/regressed same-dimensions-different-bytes invariant, and the RGB
+  no-alpha path. C4's `ui_screenshot` cannot be driven end-to-end through the
+  replay harness (it hard-requires a real in-container CDP chromium with no
+  byte-injection seam), so this guards the fixtures that back its deterministic
+  in-crate diff coverage instead.
+### Added (M22 A1 — task capability grants: schema + approval-gated authoring)
+
+- **Task capability grants (`task_grants` table, migration 030)**: the durable,
+  human-approved, bounded authorization that lets an AUTONOMOUS (scheduled /
+  heartbeat) fire of a task take a real external action instead of only
+  drafting one. `crates/copperclaw-db/migrations/030_task_grants.sql` adds a
+  child of `tasks` (010/028 lineage) with `capability_scope`, `token_budget` +
+  `tokens_consumed`, `max_fires` + `fires_consumed`, `expires_at`, `granted_by`,
+  `status`, `approved_at`, `revoked_at`. Registered in
+  `crates/copperclaw-db/src/migrate.rs` (030 was the next free number; last
+  released was 029). Why a separate table: a grant has its own lifecycle
+  (approve → consume → revoke / expire) and bounds, distinct from the schedule.
+- **`effective_grant` read API (the A2 contract)**: new
+  `crates/copperclaw-db/src/tables/task_grants.rs` is the single source of
+  truth for "is there a live grant for this task and what's left." It returns
+  `Some(EffectiveGrant)` only when the newest grant is approved, not revoked,
+  not past `expires_at`, and has token/fire budget remaining; every other state
+  (no grant, revoked, expired, exhausted) reads inert (`None`). Includes
+  `insert_approved` / `get` / `list_for_task` / `revoke` / `consume_fire` /
+  `consume_tokens`, and a documented `capability_scope` grammar +
+  `scope_permits` matcher (`class` / `class:resource` tokens, class-level
+  wildcard, no cross-class widening, case-sensitive).
+- **Approval-gated authoring (decision (c), reuses the `save_skill` round-trip)**:
+  `schedule_task` (`crates/copperclaw-mcp/src/tools/scheduling.rs`) gains an
+  optional `grant` arg (`capability_scope`, `token_budget`, `max_fires`,
+  required `expires_at`, `reason`). The tool validates it synchronously
+  (bounded — must expire within `MAX_GRANT_HORIZON_DAYS` = 365 and set at least
+  one spend bound; well-formed scope tokens) then emits a new
+  `OutboundToolEffect::AuthorTaskGrant` alongside the task-create effect. The
+  runner (`crates/copperclaw-runner/src/tools.rs`) writes a `task_grant` system
+  row; the delivery service
+  (`crates/copperclaw-host-delivery/src/service.rs`, `raise_task_grant_approval`)
+  resolves the concrete task id and raises an approval card; and only the
+  approval APPLY arm (`crates/copperclaw-host/src/handlers/approvals.rs`,
+  `apply_task_grant`) inserts the grant — so a grant persists ONLY after a
+  human approves the specific scope + budget + expiry. Grants are revocable
+  (`task_grants::revoke`) and expiring (decision (b): no standing grants).
+
+### Added (M22 C6 — promote the see→fix loop to a runtime gate)
+
+- **See→fix (screenshot) gate**: the screenshot → critique → fix →
+  re-screenshot loop (M20 D4) was a prompt-level habit with "no runtime
+  marker", so completion gates and the HUD could neither require nor observe
+  it. C6 gives it a runtime gate state modelled on the existing verify +
+  `self_review` gates, so a UI task's final/delivery todo can't complete
+  without a fresh post-fix screenshot. New machinery in
+  `crates/copperclaw-mcp/src/tools/self_review.rs`: `SeeFixState`
+  (`NotUiTask` / `NeedsScreenshot` / `Satisfied`), a `.copperclaw/needs_screenshot`
+  presence marker + `.copperclaw/screenshot_cycles` counter, `SEE_FIX_CYCLE_CAP`
+  (mirrors `REVIEW_CYCLE_CAP`), and `is_ui_task` / `mark_needs_screenshot` /
+  `clear_needs_screenshot` / `see_fix_state` / `screenshot_cycles` /
+  `record_screenshot_refusal` / `scan_projects_needing_screenshot`.
+- **"Is this a UI task" reuses an existing signal, not a new heuristic**: a
+  project is a UI task iff it has ≥1 `ui_screenshot` capture under
+  `.copperclaw/screenshots/` (the directory M20 D1's `ui_screenshot` already
+  creates). A project that never screenshotted is never gated (fails open,
+  exactly like `ReviewState::NotApplicable`).
+- **Marker SET on a UI edit**: after a successful `write_file` in
+  `crates/copperclaw-mcp/src/tools/computer_use.rs` (the card's "no runtime
+  marker" anchor), a UI-task project is marked as needing a post-fix
+  screenshot. The other edit-family tools (`edit_file` / `multi_edit` /
+  `apply_patch` / `copy_file`) set it via the runner's dispatch hook (below),
+  so the whole edit surface re-opens the loop without touching those tools.
+- **Marker CLEARED on a fresh screenshot**: the runner's
+  `crates/copperclaw-runner/src/run/tool_dispatch.rs` gains a see→fix dispatch
+  hook (`see_fix_action` / `apply_see_fix_hooks`) that, after a successful
+  `ui_screenshot`, clears every pending marker in the session; after a
+  successful edit-family tool it re-opens the loop. The dispatch layer is the
+  one place that observes every tool call, so the clear (whose tool is out of
+  C6's file scope) lives there.
+- **Completion gate**: `crates/copperclaw-mcp/src/tools/todo.rs`'s
+  `todo_update` completion gate now refuses to complete the final/delivery
+  todo while any UI project needs a post-fix screenshot — up to
+  `SEE_FIX_CYCLE_CAP` refusals, then auto-transitions the todo to `blocked`
+  with a reason attached, the same refuse-then-block shape as the verify and
+  review gates. Shares the verify gate's `verify_gate_enabled()` off-switch
+  (one switch for the whole gate family, per decision (d)).
+
+### Added (M22 C1 — post-edit verify hook)
+
+- **Post-edit verify hook**: after a successful `edit_file` / `multi_edit` /
+  `apply_patch` / `write_file` mutation, the tool now auto-runs the applicable
+  format/typecheck checker (`eslint` for `.js/.jsx/.mjs/.cjs`, `tsc` for
+  `.ts/.tsx/.mts/.cts`, `ruff` for `.py/.pyi`) scoped to just the touched file
+  and appends a concise digest under `post_edit_diagnostics` in the tool
+  result, so a type/lint break feeds back to the model on its next turn
+  instead of leaking to the user. Clean edits and non-source file types add
+  nothing (no spam); an absent toolchain (minimal image) degrades silently.
+  The check reuses the existing `diagnostics.rs` parsers and is strictly
+  best-effort — it can never turn a successful edit into a failure. Default
+  ON; opt out per session with `COPPERCLAW_POST_EDIT_VERIFY=0`. New logic in
+  `crates/copperclaw-mcp/src/tools/diagnostics.rs` (the `post_edit_verify` /
+  `append_post_edit_digest` hook), wired at the four mutation sites in
+  `edit_file.rs`, `multi_edit.rs`, `apply_patch.rs`, and
+  `computer_use.rs` (`write_file`). Recorded-digest fixture under
+  `fixtures/diagnostics/post-edit-digest/`. Security review recorded in
+  `docs/plans/m22-security-reviews.md` (C1): no trust-boundary expansion —
+  runs already-available toolchain commands inside the existing sandbox.
+### Added (M22 C2 — open/attach an existing repository, Wave 1 marquee)
+
+- New `crates/copperclaw-runner/src/run/project.rs`: a first-class flow to
+  establish an *existing* repository as the working project, closing the
+  "coding is build-from-scratch only" ceiling. Given a repo path already in the
+  sandbox (the agent `git clone`s it with `shell` — decision (a), no
+  `git_clone`/`git_commit` tool), the flow **infers `.copperclaw/verify`
+  stages** from the repo's own toolchain manifests (`Cargo.toml` →
+  `cargo fmt --check`/`check`/`clippy`/`test`; `package.json` scripts →
+  `npm run lint`/`typecheck`/`test`/`build`; `Makefile` → `make check`/`test`;
+  `pyproject.toml` → `ruff`/`mypy`/`pytest`), writing them in the **exact**
+  format the M20 multi-stage verify gate parses (round-trip asserted against
+  `copperclaw_mcp::tools::verify_gate::recorded_stages`); **seeds
+  `.copperclaw/DECISIONS.md`** from the repo's README + top-level structure
+  (verbatim, byte-capped, no hallucination); triggers the C3 symbol-index seam;
+  and drops a `.copperclaw/attached` marker so the verify + self-review gates
+  apply to the existing code. The marker also makes attach idempotent, and it
+  never overwrites an agent-authored `.copperclaw/verify`.
+- `crates/copperclaw-runner/src/run/mod.rs`: the runner poll loop now
+  auto-attaches. It calls `project::auto_attach_pending()` at startup (handed /
+  persisted repos) and after each turn (a repo the just-finished turn cloned),
+  attaching any not-yet-attached directory under `/data` that carries an
+  `origin` remote — the discriminator that distinguishes a *cloned existing
+  repo* from a blank `git init` prototype, so prototypes are never touched and
+  no new MCP tool is needed.
+- `crates/copperclaw-host/src/container_manager/cold_start.rs`: host-side
+  repo-attach observability. At cold start `begin_spawn_attempt` logs when a
+  session's `/data` already holds an attachable existing repo the runner will
+  open (clearly separated as the "repo-attach half" from the skills-materialize
+  half card S1 adds later).
+- `skills/coding-task/SKILL.md`: documents the clone-and-auto-attach flow — how
+  to change an existing repo, that attach infers the verify stages the gate then
+  enforces, and that the agent owns `.copperclaw/verify` after attach.
+- Fixture `fixtures/repos/todo-tracker/`: a small multi-file Node repo standing
+  in for an existing project (real `package.json` scripts, `src/` tree, README),
+  used by the C2 unit + acceptance-integration tests.
+- Security review recorded in `docs/plans/m22-security-reviews.md` (C2, PASS):
+  the attach flow is read-only-plus-`.copperclaw/`-writes, executes no repo
+  code, adds no network capability (clone egress stays behind the existing
+  modules guard), and maps only an allowlist of `package.json` script names to
+  fixed stage commands so a hostile manifest can't inject a verify line.
+
+### Added (M22 C4 — screenshot-diff visual regression)
+
+- **Screenshot-diff visual regression** in
+  `crates/copperclaw-mcp/src/tools/ui_screenshot.rs`: every `ui_screenshot`
+  capture is now diffed against the previous screenshot of the same view (keyed
+  by `url` + viewport + `full_page`), so editing an existing UI that silently
+  shifts or breaks its layout is caught and fed back to the model in the same
+  turn — the visual counterpart to C1's post-edit diagnostics. The first
+  capture of a view establishes a PNG **baseline** under the project's
+  `.copperclaw/baselines/`; the next capture computes a perceptual **block
+  diff** and, when a region changed (or the viewport dimensions changed),
+  appends a concise regression note to the tool result (changed-region count,
+  % of the view, mean/peak pixel delta, and a bounding box of the change);
+  each capture then becomes the new baseline. Clean re-captures stay silent —
+  no token spam. Default ON; opt out per session with
+  `COPPERCLAW_UI_SCREENSHOT_DIFF=0`. Loopback-only, reuses the existing
+  screenshot path — no new capability, no security review.
+- Because chromium emits PNG and the workspace carries no image-decoding crate,
+  the diff ships a small, self-contained, `unsafe`-free **PNG decoder** (zlib
+  inflate + per-scanline unfilter, the non-interlaced 8-bit grayscale/GA/RGB/
+  RGBA subset chromium and the fixtures use) plus the threshold-based block
+  comparison — no new dependency. The whole path is best-effort: any
+  decode/IO hiccup skips the diff silently and never turns a good screenshot
+  into an error (a jpeg-downgraded capture re-baselines but is not diffed).
+- Fixtures under `fixtures/visual_regression/`: `decoder_probe.png` (a 4x4
+  known-pixel RGBA oracle for the decoder), `baseline.png` /
+  `baseline_reencoded.png` (identical pixels, different encoding → must diff to
+  zero regions), `regressed.png` (a moved card → a localized flagged region),
+  and `baseline_rgb.png` (color type 2, exercises the no-alpha decode path).
+### Added (M22 C5 — reviewer role in `delegate_batch`)
+
+- **Reviewer role for `delegate_batch`**: a batch worker may now be marked
+  `role: "review"` (optionally handed the `diff` to review) to make it a
+  first-class REVIEWER instead of a build worker, so diff review is no longer
+  ad hoc. A review worker is dispatched with the diff embedded in its
+  instructions and directed to drive the **existing `code-review` skill** (the
+  same skill `self_review.rs` points at) and end its report with a
+  machine-readable `REVIEW-VERDICT: pass|block` line. Its findings **gate the
+  merge**: if any reviewer blocks (or, fail-closed, produces no explicit
+  verdict / never reports), the aggregated result carries `merge_blocked: true`
+  plus a `review` section with each reviewer's verdict and findings, and the
+  build workers' reports are still delivered so the parent turn sees both. A
+  batch with no reviewer returns the pre-C5 aggregate shape unchanged (full
+  back-compat). Tool-surface half (role/diff params, reviewer-instruction
+  construction, verdict parsing, and the result-JSON gate) in
+  `crates/copperclaw-mcp/src/tools/agents.rs`; the runner-side join
+  (`crates/copperclaw-runner/src/run/delegate_batch.rs`) recognizes a reviewer
+  by a shared sentinel and annotates a blocking reviewer's `error` so the gate
+  is explicit in the joined outcome for any consumer (defense in depth). No
+  migration, no new approval machinery. Unit + integration coverage in both
+  files (reviewer dispatched with diff payload; blocking findings gate the
+  merge; passing clears it; back-compat preserved).
+### Added (M22 C3 — `find_symbol` + LSP/ctags navigation, Wave 1)
+
+- New read-only `find_symbol` MCP tool
+  (`crates/copperclaw-mcp/src/tools/find_symbol.rs`): resolve a symbol to its
+  definition(s) (`file:line` + kind + a hover signature) and its references,
+  so the agent stops grepping the whole tree for a declaration. Mirrors the
+  `grep.rs`/`glob.rs` shape (same `ignore`-crate walker, `.gitignore` honoured,
+  `target/`/`node_modules/`/`.git/` skipped). Backends degrade cleanly:
+  (1) parse a bridge-built ctags index at `<root>/.copperclaw/tags`;
+  (2) run `universal-ctags` on demand to stdout (never writing into the repo)
+  when there's no index; (3) fall back to a scoped definition-line scan on a
+  minimal image with no ctags at all. References are always a whole-word scan
+  (ctags does not emit call sites reliably). Registered in
+  `crates/copperclaw-mcp/src/tools/mod.rs` (tool inventory) and added to
+  `READONLY_TOOLS` in `crates/copperclaw-runner/src/policy.rs` (read-only:
+  reachable under the messaging profile and by guest senders, gated by no
+  taint/autonomy layer).
+- New container-local symbol-index bridge
+  (`crates/copperclaw-runner/src/run/lsp.rs`, decision (f)): builds the ctags
+  index the tool consumes, entirely inside the sandbox — no host-side language
+  server, no writes outside `<repo>/.copperclaw/`, no egress. Picks the richest
+  available backend (probes for a fitting language server — rust-analyzer for a
+  `Cargo.toml` repo, typescript-language-server/`tsserver` for a
+  `package.json`/`tsconfig.json` repo — and records it for a future live
+  go-to-def path) and degrades to `universal-ctags` (baked into the baseline
+  image), then to no index (grep fallback at query time) on a minimal image. A
+  full live LSP JSON-RPC client is intentionally deferred per decision (f)'s
+  pragmatism note. Registered as `run/lsp.rs` in
+  `crates/copperclaw-runner/src/run/mod.rs`.
+- `crates/copperclaw-runner/src/run/project.rs`: filled in C2's
+  `trigger_symbol_index` seam (body only, signature unchanged) to call the new
+  bridge, so opening/attaching an existing repository now indexes its symbols
+  for the next turn instead of hitting a documented no-op.
+- Tests: ctags `tags`-file parsing (extended + numeric ex-command + `kind:`
+  forms), go-to-def via a bridge-built index returning `file:line`, and
+  definition + reference resolution on the `fixtures/repos/todo-tracker/` repo
+  without any index (the grep tier — the hermetic-CI path). The on-demand-ctags
+  and language-server-assisted paths self-skip when the binaries are absent so
+  the suite stays hermetic while still exercising the real path on a dev box.
+### Added (M22 S2 — relevance scorer for skill selection)
+
+- `SkillsSelector::Relevant { query, limit }` in
+  `crates/copperclaw-skills/src/registry.rs` — a third skills selector
+  alongside `All`/`Explicit`. It inlines only the up-to-`limit` skills whose
+  frontmatter `description` is most relevant to the current task `query`,
+  cutting the all-skills prompt bloat noted in `copperclaw-runner`'s
+  `compaction.rs` (all ~41 skills previously spliced whole into the system
+  prompt regardless of the task). Inline-`All` stays the default (M22 decision
+  **e**: relevance narrows what inlines, it does not replace the default);
+  `All`/`Explicit` behavior is byte-identical. Serializes as
+  `{"relevant": {"query": "...", "limit": N}}`.
+- `crates/copperclaw-skills/src/relevance.rs` (new module) — the scoring pass.
+  It **reuses the memory store's full-text path** rather than inventing a
+  ranking: an in-memory `SQLite` FTS5 index over the descriptions, matched with
+  the same tokenized `MATCH` expression and ranked by `bm25`, then normalized
+  to `[0, 1]` (best match = 1.0) exactly as `copperclaw_db::memory::search`
+  does (migration 021 `memory_store`/`memory_fts`). The tokenizer + normalizer
+  are reproduced to the same contract because the two crates deliberately don't
+  depend on each other and the memory helpers are private to `copperclaw-db`.
+  Exposed as `rank_descriptions()` + `SkillRegistry::select_relevant()`; the
+  latter fails open to the full set on an empty/tokenless query or an FTS error
+  so a scoring hiccup never strips every skill. Adds `rusqlite` (workspace,
+  bundled — same dep the memory store uses) to `copperclaw-skills`.
+- Unit tests cover the ranking (on-topic skill ranks first, off-topic query
+  selects fewer skills than `All`, `limit` cap, tie-break by name, FTS-operator
+  safety) and the `Relevant` selector serde round-trip.
+### Added (M22 S3 — skill versioning + `list_skills`)
+
+- **Skill frontmatter `version`** — `crates/copperclaw-skills/src/frontmatter.rs`
+  gains an optional integer `version` field (`#[serde(default)]`) plus a
+  `Frontmatter::version()` accessor. The field is absent in all 41 shipped
+  skills, so they keep parsing unchanged and default to version 1. Why: skills
+  had no revision marker, so a re-saved agent-authored skill silently
+  overwrote its predecessor with no way to tell them apart. (Kept localized so
+  card S4's `tools:` frontmatter addition rebases cleanly on top.)
+- **Version-aware `save_skill`** — `crates/copperclaw-skills/src/save.rs`
+  `save_group_skill` now writes a monotonic version into the persisted
+  frontmatter: a first save keeps the declared version (or 1), and a re-save of
+  an existing skill reads the on-disk version and writes `on_disk + 1`, so
+  re-saving durably bumps rather than blindly overwriting. The on-disk skill is
+  the source of truth (a new `set_frontmatter_version` helper rewrites the
+  `version:` line, preserving BOM/CRLF and the body verbatim). The approval
+  round-trip is unchanged — `save_group_skill` still returns `PathBuf`, so the
+  host `apply_save_skill` caller is untouched. The `save_skill` MCP tool
+  (`crates/copperclaw-mcp/src/tools/save_skill.rs`) now documents the
+  auto-bump behaviour in its description and success message.
+- **`list_group_skills` (crate) + `SkillListing`** — a host-side list surface
+  in `save.rs` that scans a group's skills override directory and returns each
+  saved skill's name + effective version + description (sorted, malformed
+  entries skipped). Exported from `copperclaw-skills`.
+- **`list_skills` MCP tool** — new read-only, no-argument tool
+  (`crates/copperclaw-mcp/src/tools/list_skills.rs`, registered in
+  `tools/mod.rs`) enumerating the session's selected skills (name, version,
+  description) from the per-session skills catalogue `load_skill` reads; in
+  inline-skills mode it returns an empty list with an explanatory note instead
+  of an error. Classified read-only in `crates/copperclaw-runner/src/policy.rs`
+  (`READONLY_TOOLS`), so it is available under the messaging profile and to
+  guest senders. Why: agents could author and load skills but never enumerate
+  them, so re-saving meant guessing at existing names.
+### Changed (F3: coding-task skill — avoid SQLite WAL on bind-mounted `/data`, 2026-07-18)
+
+- `skills/coding-task/SKILL.md` now tells the agent NOT to enable
+  `journal_mode = WAL` on a `/data`-backed SQLite DB (better-sqlite3,
+  Prisma, rusqlite, python sqlite3, etc.) and to keep the default
+  rollback journal (`journal_mode = DELETE`). A hard container kill
+  (crash-restart) truncates a bind-mounted WAL into an unrecoverable
+  `SQLITE_IOERR_SHORT_READ`; the DELETE journal commits atomically via
+  the main file and recovers cleanly. Real incident 2026-07-18: a
+  vite+API app's WAL DB on `/data` was destroyed by a crash-restart.
+  Existing prose in the skill was tightened to keep the body under its
+  ~8192-byte cap (no tool-name mentions or section meaning lost).
+### Fixed (F1: compaction never crash-loops on an empty summary, 2026-07-18)
+
+- **Safety-critical self-recovery fix.** A large-enough session history
+  triggers compaction, which asks the model to summarise the oldest half.
+  When the model returned an **empty** summary, `compact()` in
+  `crates/copperclaw-runner/src/compaction.rs` did
+  `bail!("provider returned an empty summary")`, which propagated through the
+  `run_loop` call site in `crates/copperclaw-runner/src/run/mod.rs` as a fatal
+  `?` and **crashed the runner process**. The host respawned it into the same
+  oversized history → the same empty summary → an **infinite crash-loop that
+  bricked the session** until an operator manually cleared the history. A
+  session must NEVER brick this way.
+- **`compaction.rs`: retry then truncate, never bail.** `summarise` no longer
+  treats an empty response as an error (it returns the possibly-empty text). A
+  new `summarise_with_retry` asks the provider once more on an empty/errored
+  summary; if the retry also yields nothing, `compact()` falls back to
+  **deterministic, LLM-free truncation** — it keeps the recent split it already
+  computes (`history[pivot..]`) plus the verbatim pinned project-facts header
+  (todos / verify stages / DECISIONS / file inventory), drops the oldest
+  messages, and emits an honest `compact_boundary` marker noting the summary
+  was unavailable and history was truncated. Losing old context is vastly
+  better than bricking. Archive-write failure is likewise now non-fatal
+  (logged, compaction continues) for the same reason.
+- **`run/mod.rs`: the auto-compaction call site can no longer exit `run_loop`.**
+  The `.context("compaction failed")?` is replaced with a match that degrades
+  an (now unreachable) unexpected error to a truncated tail instead of
+  propagating. The call is wrapped in a `HeartbeatTicker` so the container's
+  heartbeat is refreshed every 5s across the possibly-slow summary provider
+  call — the host supervisor no longer misreads a healthy compaction as a
+  stale/crashed container and SIGKILLs it.
+- Regression tests in `compaction.rs`: empty summary → truncation (no error,
+  run continues); provider error → truncation; retry path uses the second
+  summary; truncation keeps recent + pins, drops oldest, and fits back under
+  the threshold. The happy-path summary is unchanged.
+### Added (multi-workspace UX — `/projects` + `/switch <name>`)
+
+- Two operator slash commands for managing the many working directories a
+  single session's `/data` dir can hold side by side ("workspaces" — a git
+  repo OR just a folder of files), both delivered in-chat and HOST-ANSWERED
+  (no container spawn), mirroring `/status`:
+  - **`/projects`** lists the session's workspaces — one line each, the
+    active one marked with `→`, a `(git)` tag when the dir holds a `.git`
+    entry — or a friendly "No workspaces yet …" line when empty. System dirs
+    (`skills`, `memory`, `inbox`, `outbox`, `node_modules`) and dot-entries
+    are excluded. The active workspace is resolved from the session's
+    `.shell_state` cwd (first path segment under `/data`).
+  - **`/switch <name>`** makes `/data/<name>` the active workspace (creating
+    it when missing — works for any dir, not just repos), realized by
+    overwriting `<session_root>/.shell_state` with a single
+    `cd '/data/<name>'` line (the container `shell` tool sources that file
+    before every command, so the agent's next command runs there). It then
+    resets the conversation by enqueuing the existing `/clear` passthrough
+    row for the runner, and replies confirming `(new)` vs `(existing)`.
+    `name` is validated to `^[A-Za-z0-9._-]+$` (rejecting `.`, `..`, and any
+    path separator) so it can never escape the session dir; an invalid name
+    mutates nothing and returns the naming rule.
+- New `crates/copperclaw-host-router/src/workspaces.rs` (workspace discovery
+  + active-dir resolution + reply rendering); `Projects` variant +
+  `ParsedCommand`/`SwitchTarget` argument-bearing detection in
+  `crates/copperclaw-host-router/src/commands.rs`; `answer_projects` /
+  `answer_switch` / `write_host_reply` / `write_clear_row` handlers wired
+  into the host-answer early-return in
+  `crates/copperclaw-host-router/src/route.rs`. Replay fixture
+  `fixtures/cli/slash-workspaces/` (registered as
+  `cli_slash_workspaces_switch_then_projects`) pins the
+  `/switch` → `.shell_state` write + context-reset row and the following
+  `/projects` active-marked listing byte-for-byte. Slash-command metrics are
+  counted under the existing `inc_slash_command` helper with the new
+  `projects` / `switch` op labels.
+### Changed (smart auto-continue at the tool-turn cap — progress-gated budget with a hard-ceiling backstop)
+
+- The runner's per-inbound tool loop
+  (`crates/copperclaw-runner/src/run/drive_turn.rs`) no longer bails the moment
+  it hits the flat `COPPERCLAW_MAX_TOOL_TURNS` cap. That cap is now a **soft**
+  per-block budget: when a full block of soft-cap tool turns completes and the
+  agent **made real progress** in it (a successful non-read-only tool call —
+  `edit_file` / `write_file` / `shell` / `todo_update` / …, classified via the
+  new `copperclaw_runner::is_readonly_tool` reusing `policy::READONLY_TOOLS`),
+  the budget **extends by another block silently**, with no operator
+  interruption. A big legitimate build no longer forces the operator to type
+  "continue" repeatedly. Progress is computed per block: a block of only
+  reads/greps/globs or only errored calls counts as no progress.
+- Added a **hard ceiling** (`COPPERCLAW_MAX_TOOL_TURNS_HARD`, resolved by the
+  new `resolve_max_tool_turns_hard` in `crates/copperclaw-runner/src/run/mod.rs`)
+  — the runaway backstop bounding the **worst-case total tool turns for a single
+  inbound to exactly this value**. Default `soft * 6` (so a fresh install: soft
+  150 → hard 900), clamped to `MAX_MAX_TOOL_TURNS_HARD` (1200) and to `>= soft`.
+  Threaded onto `RunnerDeps::max_tool_turns_hard`. Setting it **equal to the soft
+  cap disables extension** → the historical flat-cap behaviour (back-compat).
+- The single "ran out of turns" apology is replaced by three honest,
+  reason-specific messages chosen by *why* the run stopped: hitting the hard
+  ceiling ("stopped after N tool turns (hit the H hard ceiling) — send 'continue'
+  to keep going", logged ERROR), a no-progress block ("stopped after N tool turns
+  with no visible progress — send 'continue' or a smaller step", logged WARN), or
+  extending on progress (debug log, no user interruption).
+- **Unchanged and byte-identical:** the content-loop breaker, the per-task token
+  ceiling (`COPPERCLAW_MAX_TASK_TOKENS`), the parse-error cap, provider-failure
+  and empty-reply bails all still fire EARLY, mid-block, before the budget logic
+  is consulted — this change only governs what happens when a full block
+  completes without any of those firing. Default is safe: a productive agent runs
+  up to 900 turns then checkpoints; a stuck/looping one still bails early via the
+  unchanged breakers.
+
 ### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
 
 - One card, absolute last in the M21 program, sweeps every metric "wish" the

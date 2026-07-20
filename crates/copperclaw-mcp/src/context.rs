@@ -186,6 +186,38 @@ pub struct ScheduleSpec {
     pub recurrence: Option<String>,
 }
 
+/// Spec for a task capability grant authored alongside `schedule_task`
+/// (M22 A1). The agent proposes a bounded authorization for the task it is
+/// scheduling; the runner records it and the host raises an approval card
+/// (reusing the `save_skill` round-trip, decision (c)). ONLY on operator
+/// approval does a `task_grants` row persist — so a pending grant never
+/// authorizes anything.
+///
+/// The grant references the task by `task_name` because the concrete task id is
+/// assigned host-side and is not known when the tool runs; the host resolves
+/// the id when it raises the approval. Grants are bounded (decision (b)):
+/// `expires_at` is required (no standing grants) and at least one of a token or
+/// fire bound should be set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorTaskGrantSpec {
+    /// Name of the task being scheduled in the same call; the host binds the
+    /// grant to that task's id.
+    pub task_name: String,
+    /// Space-separated set of capability-scope tokens (`class` or
+    /// `class:resource`) the grant authorizes. See
+    /// `copperclaw_db::tables::task_grants` for the matching grammar.
+    pub capability_scope: String,
+    /// Max tokens the grant may spend across its fires; `None` = no token bound.
+    pub token_budget: Option<i64>,
+    /// Max autonomous fires the grant authorizes; `None` = no fire bound.
+    pub max_fires: Option<i64>,
+    /// Absolute expiry instant (required by the tool — decision (b): no
+    /// non-expiring grants).
+    pub expires_at: DateTime<Utc>,
+    /// Human-readable reason shown on the approval card.
+    pub reason: String,
+}
+
 /// Spec for `update_task`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateTaskSpec {
@@ -197,6 +229,101 @@ pub struct UpdateTaskSpec {
     pub when: Option<Option<DateTime<Utc>>>,
     /// New recurrence, if changing. Pass `Some(None)` to clear.
     pub recurrence: Option<Option<String>>,
+}
+
+/// Spec for `create_goal` (M22 A3). The agent declares a durable long-running
+/// objective the sweep will drive check-ins against. Persisted host-side into
+/// the central `goals` table (decision (d): the goal INDEXES over the todo /
+/// memory stores, it does not replace them). Not approval-gated — a goal is
+/// internal state, it authorizes nothing on its own (any autonomous ACTION a
+/// check-in wake takes is still gated by A2's grant machinery).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGoalSpec {
+    /// The durable objective text (what the goal is for).
+    pub objective: String,
+    /// Optional cron (croner) the sweep re-arms the next check-in from.
+    pub checkin_recurrence: Option<String>,
+    /// Optional first check-in instant. When omitted and `checkin_recurrence`
+    /// is set, the host computes the first fire from the recurrence.
+    pub first_checkin: Option<DateTime<Utc>>,
+    /// Optional prompt injected on a check-in wake; `None` = the sweep
+    /// synthesises one from the objective.
+    pub checkin_prompt: Option<String>,
+    /// The goal's own cumulative token cap (used only when no grant is linked).
+    pub token_budget: Option<i64>,
+}
+
+/// Spec for `update_goal` (M22 A3). Records progress and/or moves the goal's
+/// lifecycle state. At least one of `status` / `progress` / `objective` is set
+/// (validated by the tool). `status` is one of `active`/`paused`/`completed`/
+/// `abandoned`; illegal transitions are rejected host-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateGoalSpec {
+    /// Goal id (assigned host-side; the agent learns it from a check-in wake).
+    pub id: String,
+    /// New lifecycle status, if transitioning.
+    pub status: Option<String>,
+    /// A progress note to append to the goal's log, if reporting progress.
+    pub progress: Option<String>,
+    /// Tokens attributed to this progress report (accrued cumulatively), if any.
+    pub progress_tokens: Option<i64>,
+    /// A revised objective, if refining the goal.
+    pub objective: Option<String>,
+}
+
+/// A description of one goal as surfaced by `list_goals` (M22 A3). Runner-facing
+/// view; the host owns the full row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSummary {
+    /// Goal id.
+    pub id: String,
+    /// Objective text.
+    pub objective: String,
+    /// Lifecycle status (`active`/`paused`/`completed`/`abandoned`).
+    pub status: String,
+    /// Next scheduled check-in, if any.
+    pub next_checkin: Option<DateTime<Utc>>,
+    /// Count of check-in fires so far.
+    pub checkin_count: i64,
+    /// Cumulative tokens accrued against the goal.
+    pub tokens_consumed: i64,
+}
+
+/// Spec for `register_condition` (M22 A4). Registers — or, when `remove` is
+/// set, deregisters — a durable HEARTBEAT-style condition the sweep fires a
+/// `kind:task` check-in wake for on the RISING edge of its predicate. Persisted
+/// host-side into the central `conditions` table (mirroring the `create_goal`
+/// path). A condition is internal tracking state — it authorizes nothing on its
+/// own; any autonomous ACTION the woken turn takes stays gated by A2's grant
+/// machinery at fire time (`grant_id` records the optional linkage).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterConditionSpec {
+    /// Agent-chosen stable key. Re-registering the same id replaces it.
+    pub id: String,
+    /// `pending_inbound` | `idle` | `flag` — the observable tested.
+    pub kind: String,
+    /// `min` pending count (`pending_inbound`) or idle-seconds floor (`idle`);
+    /// `None` for `flag`.
+    pub threshold: Option<i64>,
+    /// Watched flag name for `flag`; `None` otherwise.
+    pub flag: Option<String>,
+    /// Prompt delivered to the woken agent on a fire (required for register).
+    pub prompt: Option<String>,
+    /// Optional A2 fire-time grant linkage.
+    pub grant_id: Option<String>,
+    /// When true, deregister the condition `id` instead of registering.
+    pub remove: bool,
+}
+
+/// Spec for `set_condition_flag` (M22 A4). Sets or clears a named per-session
+/// latch the `flag` condition kind watches — the settable signal that lets a
+/// `flag` condition fire. Persisted host-side into `condition_flags`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetConditionFlagSpec {
+    /// The flag name to set or clear.
+    pub flag: String,
+    /// `true` = raise the flag (set), `false` = lower it (clear).
+    pub value: bool,
 }
 
 /// One memory hit surfaced to the `memory_search` / `memory_get` tools.
@@ -408,6 +535,10 @@ pub enum OutboundToolEffect {
     SaveSkill(SaveSkillSpec),
     /// `schedule_task`.
     ScheduleTask(ScheduleSpec),
+    /// Grant authoring emitted alongside `schedule_task` when the caller
+    /// supplies a `grant` (M22 A1). Approval-gated host-side: raises a card and
+    /// persists a `task_grants` row only on operator approval.
+    AuthorTaskGrant(AuthorTaskGrantSpec),
     /// `list_tasks`.
     ListTasks,
     /// `cancel_task`.
@@ -427,6 +558,18 @@ pub enum OutboundToolEffect {
     },
     /// `update_task`.
     UpdateTask(UpdateTaskSpec),
+    /// `create_goal` (M22 A3) — persist a durable long-running goal into the
+    /// central `goals` table host-side.
+    CreateGoal(CreateGoalSpec),
+    /// `update_goal` (M22 A3) — record progress and/or transition a goal's
+    /// lifecycle state host-side.
+    UpdateGoal(UpdateGoalSpec),
+    /// `register_condition` (M22 A4) — persist / deregister a durable
+    /// HEARTBEAT-style condition in the central `conditions` table.
+    RegisterCondition(RegisterConditionSpec),
+    /// `set_condition_flag` (M22 A4) — set / clear a per-session flag latch the
+    /// `flag` condition kind watches.
+    SetConditionFlag(SetConditionFlagSpec),
 }
 
 impl OutboundToolEffect {
@@ -446,11 +589,16 @@ impl OutboundToolEffect {
             Self::AddMcpServer(_) => "add_mcp_server",
             Self::SaveSkill(_) => "save_skill",
             Self::ScheduleTask(_) => "schedule_task",
+            Self::AuthorTaskGrant(_) => "author_task_grant",
             Self::ListTasks => "list_tasks",
             Self::CancelTask { .. } => "cancel_task",
             Self::PauseTask { .. } => "pause_task",
             Self::ResumeTask { .. } => "resume_task",
             Self::UpdateTask(_) => "update_task",
+            Self::CreateGoal(_) => "create_goal",
+            Self::UpdateGoal(_) => "update_goal",
+            Self::RegisterCondition(_) => "register_condition",
+            Self::SetConditionFlag(_) => "set_condition_flag",
         }
     }
 }
@@ -678,6 +826,15 @@ pub trait ToolContext: Send + Sync {
     /// pathway. Implementors may delegate to whatever scheduler state they
     /// own; the mock keeps a synthetic table.
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError>;
+
+    /// Read hook for the `list_goals` MCP tool (M22 A3). Goal state lives on the
+    /// host (central `goals` table), not the container, so the runner's context
+    /// returns an empty `Vec` (exactly like `list_tasks`); the mock returns
+    /// whatever `set_goals` seeded. Default `Ok(Vec::new())` so contexts that
+    /// don't track goals (subagent adapters) compile unchanged.
+    async fn list_goals(&self) -> Result<Vec<GoalSummary>, ToolError> {
+        Ok(Vec::new())
+    }
 
     /// Open an in-process LLM subagent loop. Default impl returns
     /// `ToolError::Context("subagent not supported in this context")` so
@@ -1031,6 +1188,8 @@ struct MockInner {
     next_list_err: Option<ToolError>,
     /// Pre-seeded list of tasks.
     task_summaries: Vec<TaskSummary>,
+    /// Pre-seeded list of goals returned by `list_goals` (M22 A3).
+    goal_summaries: Vec<GoalSummary>,
     /// Override ack returned by the next `emit_outbound`.
     next_ack: Option<ToolEffectAck>,
     /// Subagent requests recorded in order.
@@ -1127,6 +1286,14 @@ impl MockToolContext {
             .lock()
             .expect("MockToolContext mutex poisoned")
             .task_summaries = tasks;
+    }
+
+    /// Seed the goal list returned by `list_goals` (M22 A3).
+    pub fn set_goals(&self, goals: Vec<GoalSummary>) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .goal_summaries = goals;
     }
 
     /// Snapshot of subagent requests recorded so far.
@@ -1236,6 +1403,14 @@ impl ToolContext for MockToolContext {
             return Err(err);
         }
         Ok(g.task_summaries.clone())
+    }
+
+    async fn list_goals(&self) -> Result<Vec<GoalSummary>, ToolError> {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        if let Some(err) = g.next_list_err.take() {
+            return Err(err);
+        }
+        Ok(g.goal_summaries.clone())
     }
 
     async fn spawn_subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
@@ -1514,6 +1689,17 @@ mod tests {
                     recurrence: Some("0 * * * *".into()),
                 }),
                 "schedule_task",
+            ),
+            (
+                OutboundToolEffect::AuthorTaskGrant(AuthorTaskGrantSpec {
+                    task_name: "t".into(),
+                    capability_scope: "send_message:telegram".into(),
+                    token_budget: Some(1000),
+                    max_fires: Some(30),
+                    expires_at: chrono::Utc::now(),
+                    reason: "r".into(),
+                }),
+                "author_task_grant",
             ),
             (OutboundToolEffect::ListTasks, "list_tasks"),
             (

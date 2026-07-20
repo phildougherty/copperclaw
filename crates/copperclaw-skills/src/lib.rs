@@ -10,7 +10,8 @@
 //! 2. Parsing and validating the frontmatter (`name`, `description`,
 //!    optional `allowed-tools`).
 //! 3. Selecting which skills are exposed to an agent group based on a
-//!    [`SkillsSelector`] (`All` or `Explicit(Vec<String>)`).
+//!    [`SkillsSelector`] (`All`, `Explicit(Vec<String>)`, or `Relevant` —
+//!    an FTS-scored subset ranked by [`relevance::rank_descriptions`]).
 //! 4. Materializing the chosen skills into a destination directory by
 //!    creating symlinks at `<dest>/<skill_id>` pointing to each skill's
 //!    source directory.
@@ -37,6 +38,7 @@ pub mod frontmatter;
 pub mod materialize;
 pub mod name;
 pub mod registry;
+pub mod relevance;
 pub mod save;
 pub mod tool_names;
 
@@ -44,5 +46,6 @@ pub use error::SkillError;
 pub use frontmatter::{Frontmatter, skip_frontmatter};
 pub use materialize::{MaterializeOutcome, MaterializeReport, materialize};
 pub use registry::{Skill, SkillId, SkillRegistry, SkillSource, SkillsSelector, read_skill_body};
-pub use save::{save_group_skill, validate_skill_content};
+pub use relevance::{ScoredSkill, rank_descriptions};
+pub use save::{SkillListing, list_group_skills, save_group_skill, validate_skill_content};
 pub use tool_names::normalize as normalize_allowed_tools;

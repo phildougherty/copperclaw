@@ -118,6 +118,44 @@ impl Palette {
     pub fn header(self, text: &str) -> String {
         self.paint(Style::new().bold(), text)
     }
+
+    /// Secondary / de-emphasized text — thinking blocks, rail details,
+    /// and the `cclaw chat` status line.
+    #[must_use]
+    pub fn dim(self, text: &str) -> String {
+        self.paint(Style::new().dimmed(), text)
+    }
+
+    /// Completed todo items — strikethrough.
+    #[must_use]
+    pub fn strike(self, text: &str) -> String {
+        self.paint(Style::new().strikethrough(), text)
+    }
+
+    /// Diff added lines — green.
+    #[must_use]
+    pub fn diff_add(self, text: &str) -> String {
+        self.paint(fg(AnsiColor::Green), text)
+    }
+
+    /// Diff removed lines — red.
+    #[must_use]
+    pub fn diff_remove(self, text: &str) -> String {
+        self.paint(fg(AnsiColor::Red), text)
+    }
+
+    /// Status-line repaint prefix for `cclaw chat`: carriage return +
+    /// clear-to-end-of-line, or the empty string when styling is off.
+    ///
+    /// Routing the repaint control bytes through the palette keeps the
+    /// `no_ansi_when_piped` contract in one place: a piped stdout means
+    /// `color == false`, which suppresses the `ESC [K` *and* the bare
+    /// `\r` (a `\r` written into a redirected transcript would corrupt
+    /// it just like a color code would).
+    #[must_use]
+    pub fn repaint_prefix(self) -> &'static str {
+        if self.color { "\r\u{1b}[K" } else { "" }
+    }
 }
 
 /// Foreground-color style helper.
@@ -195,5 +233,42 @@ mod tests {
         assert_ne!(ok, warn);
         assert_ne!(warn, fail);
         assert_ne!(ok, fail);
+    }
+
+    #[test]
+    fn plain_palette_transcript_helpers_are_verbatim() {
+        let p = Palette::plain();
+        assert_eq!(p.dim("thinking"), "thinking");
+        assert_eq!(p.strike("done item"), "done item");
+        assert_eq!(p.diff_add("+line"), "+line");
+        assert_eq!(p.diff_remove("-line"), "-line");
+        assert_eq!(p.repaint_prefix(), "");
+    }
+
+    #[test]
+    fn colored_dim_and_strike_use_effect_sequences() {
+        let p = Palette::new(true);
+        // SGR 2 = dim, SGR 9 = strikethrough; both must reset.
+        assert_eq!(p.dim("x"), "\u{1b}[2mx\u{1b}[0m");
+        assert_eq!(p.strike("x"), "\u{1b}[9mx\u{1b}[0m");
+    }
+
+    #[test]
+    fn colored_diff_helpers_match_semantic_colors() {
+        let p = Palette::new(true);
+        // diff_add is the same green as ok(); diff_remove the same red
+        // as fail() — semantic aliases, distinct from each other.
+        assert_eq!(p.diff_add("x"), p.ok("x"));
+        assert_eq!(p.diff_remove("x"), p.fail("x"));
+        assert_ne!(p.diff_add("x"), p.diff_remove("x"));
+    }
+
+    #[test]
+    fn repaint_prefix_is_cr_clear_when_colored_only() {
+        assert_eq!(Palette::new(true).repaint_prefix(), "\r\u{1b}[K");
+        // The "off" side matters most: a piped transcript must see
+        // neither the ESC nor the bare carriage return.
+        assert!(!Palette::plain().repaint_prefix().contains('\r'));
+        assert!(!Palette::plain().repaint_prefix().contains('\u{1b}'));
     }
 }

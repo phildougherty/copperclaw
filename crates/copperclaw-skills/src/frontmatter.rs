@@ -27,6 +27,69 @@ pub struct Frontmatter {
     pub description: String,
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<Vec<String>>,
+    // M22 S4: optional `tools:` allowlist — a companion to `allowed-tools:`.
+    // Both declare the tool surface a skill needs, so an active skill can scope
+    // dispatch to just those tools. Reserved-but-unused before S4; now parsed
+    // and, in [`parse`], folded into `allowed_tools` (union, order-preserving,
+    // de-duplicated) so the whole existing enforcement pipeline — registry
+    // `Skill::allowed_tool_names` → skills catalogue → `load_skill` → the
+    // runner's `ToolPolicy::with_active_skill` dispatch gate — scopes on
+    // `tools:` with no downstream change. Absent in every one of the 41 shipped
+    // skills, so `#[serde(default)]` (parses to `None`); a skill declaring
+    // neither key keeps `allowed_tools == None` and narrows nothing.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    // M22 S3: optional monotonic skill version. Absent in every one of the 41
+    // shipped skills, so it is `#[serde(default)]` (parses to `None`) and the
+    // effective value defaults to 1 via [`Frontmatter::version`] — existing
+    // skills keep parsing unchanged. `save_skill` bumps this on every re-save
+    // so an agent-authored skill carries a monotonic revision. Kept localized
+    // (this field + the `version()` accessor below) so card S4's `tools:`
+    // addition rebases cleanly on top.
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
+impl Frontmatter {
+    /// M22 S3: the effective skill version. The `version` frontmatter field is
+    /// optional; a skill without it (every one of the 41 shipped skills, and
+    /// any first-time agent-authored skill that omits it) defaults to version
+    /// 1. `save_skill` writes an explicit bumped version on re-save.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version.unwrap_or(1)
+    }
+
+    /// M22 S4: the skill's declared tool allowlist for active-skill
+    /// narrowing — the union of the `allowed-tools:` and `tools:` frontmatter
+    /// keys, in declaration order (`allowed-tools:` first) with duplicates
+    /// removed. Returns `None` when the skill declares neither key (it imposes
+    /// no tool scope — the group profile alone bounds it), which is the case
+    /// for all 41 shipped skills.
+    ///
+    /// [`parse`] already folds `tools:` into `allowed_tools`, so for a parsed
+    /// frontmatter this equals `allowed_tools`; the accessor recomputes the
+    /// union so a directly-constructed `Frontmatter` (e.g. in a test) is
+    /// handled the same way. The names are raw frontmatter names — callers that
+    /// gate dispatch normalize them via [`crate::tool_names::normalize`].
+    #[must_use]
+    pub fn declared_tools(&self) -> Option<Vec<String>> {
+        if self.allowed_tools.is_none() && self.tools.is_none() {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::new();
+        for name in self
+            .allowed_tools
+            .iter()
+            .flatten()
+            .chain(self.tools.iter().flatten())
+        {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Parse the YAML frontmatter from a `SKILL.md` body.
@@ -47,8 +110,24 @@ pub fn parse(input: &str) -> Result<Frontmatter, SkillError> {
         .ok_or_else(|| SkillError::Frontmatter("missing closing `---` delimiter".to_string()))?;
 
     let yaml = &rest[..end];
-    let fm: Frontmatter = serde_yaml::from_str(yaml)
+    let mut fm: Frontmatter = serde_yaml::from_str(yaml)
         .map_err(|e| SkillError::Frontmatter(format!("invalid YAML: {e}")))?;
+
+    // M22 S4: fold the `tools:` allowlist into `allowed_tools` so downstream
+    // consumers that read the `allowed_tools` field verbatim (registry
+    // `Skill::allowed_tools` → `Skill::allowed_tool_names` → skills catalogue →
+    // dispatch) enforce a `tools:`-declared scope without any change of their
+    // own. Union, order-preserving (`allowed-tools:` entries first), de-duped.
+    // A skill declaring neither key leaves `allowed_tools == None` (narrows
+    // nothing) — preserving today's behaviour for the 41 shipped skills.
+    if let Some(tools) = fm.tools.clone() {
+        let merged = fm.allowed_tools.get_or_insert_with(Vec::new);
+        for t in tools {
+            if !merged.contains(&t) {
+                merged.push(t);
+            }
+        }
+    }
 
     if fm.name.trim().is_empty() {
         return Err(SkillError::Frontmatter("`name` is required".to_string()));
@@ -232,8 +311,113 @@ mod tests {
             name: "n".into(),
             description: "d".into(),
             allowed_tools: None,
+            tools: None,
+            version: None,
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // ── M22 S3: version field ────────────────────────────────────────────
+
+    #[test]
+    fn version_defaults_to_one_when_absent() {
+        // Every one of the 41 shipped skills omits `version`; they must keep
+        // parsing and default to version 1.
+        let input = "---\nname: x\ndescription: y\n---\n# body\n";
+        let fm = parse(input).unwrap();
+        assert!(fm.version.is_none());
+        assert_eq!(fm.version(), 1);
+    }
+
+    #[test]
+    fn version_is_parsed_when_present() {
+        let input = "---\nname: x\ndescription: y\nversion: 7\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.version, Some(7));
+        assert_eq!(fm.version(), 7);
+    }
+
+    #[test]
+    fn version_coexists_with_allowed_tools() {
+        let input = "---\nname: x\ndescription: y\nallowed-tools: [Read]\nversion: 3\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.allowed_tools, Some(vec!["Read".to_string()]));
+        assert_eq!(fm.version(), 3);
+    }
+
+    // ── M22 S4: `tools:` frontmatter ─────────────────────────────────────
+
+    #[test]
+    fn tools_absent_narrows_nothing() {
+        // The fail-open case that keeps every shipped skill unchanged: no
+        // `tools:` and no `allowed-tools:` means no tool scope at all.
+        let input = "---\nname: x\ndescription: y\n---\n# body\n";
+        let fm = parse(input).unwrap();
+        assert!(fm.tools.is_none());
+        assert!(fm.allowed_tools.is_none());
+        assert!(fm.declared_tools().is_none());
+    }
+
+    #[test]
+    fn tools_is_parsed_and_folded_into_allowed_tools() {
+        // A skill declaring only `tools:` must scope dispatch: the fold puts
+        // its entries into `allowed_tools`, which is the field the registry
+        // (and thence the catalogue + dispatch gate) reads verbatim.
+        let input = "---\nname: x\ndescription: y\ntools: [Read, Bash]\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.tools, Some(vec!["Read".to_string(), "Bash".to_string()]));
+        assert_eq!(
+            fm.allowed_tools,
+            Some(vec!["Read".to_string(), "Bash".to_string()]),
+            "`tools:` must fold into `allowed_tools` so downstream enforces it"
+        );
+        assert_eq!(
+            fm.declared_tools(),
+            Some(vec!["Read".to_string(), "Bash".to_string()])
+        );
+    }
+
+    #[test]
+    fn tools_and_allowed_tools_union_without_duplicates() {
+        // Both keys present: the effective scope is their union, `allowed-tools`
+        // first, de-duplicated.
+        let input =
+            "---\nname: x\ndescription: y\nallowed-tools: [Read]\ntools: [Read, Grep]\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(
+            fm.allowed_tools,
+            Some(vec!["Read".to_string(), "Grep".to_string()])
+        );
+        assert_eq!(
+            fm.declared_tools(),
+            Some(vec!["Read".to_string(), "Grep".to_string()])
+        );
+    }
+
+    #[test]
+    fn tools_coexists_with_version() {
+        let input = "---\nname: x\ndescription: y\ntools: [Read]\nversion: 4\n---\n";
+        let fm = parse(input).unwrap();
+        assert_eq!(fm.tools, Some(vec!["Read".to_string()]));
+        assert_eq!(fm.allowed_tools, Some(vec!["Read".to_string()]));
+        assert_eq!(fm.version(), 4);
+    }
+
+    #[test]
+    fn declared_tools_unions_directly_constructed_frontmatter() {
+        // The accessor recomputes the union for a Frontmatter built directly
+        // (not via `parse`, which would have folded already).
+        let fm = Frontmatter {
+            name: "x".into(),
+            description: "y".into(),
+            allowed_tools: Some(vec!["read_file".into()]),
+            tools: Some(vec!["shell".into(), "read_file".into()]),
+            version: None,
+        };
+        assert_eq!(
+            fm.declared_tools(),
+            Some(vec!["read_file".to_string(), "shell".to_string()])
+        );
     }
 }

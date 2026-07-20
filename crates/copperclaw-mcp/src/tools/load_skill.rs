@@ -80,6 +80,93 @@ fn catalogue_path() -> PathBuf {
     PathBuf::from(SKILLS_CATALOGUE_DEFAULT_PATH)
 }
 
+/// M22 S4: directory holding the materialized skill symlink farm. In inline
+/// (default) skills mode the host writes no `skills.json` catalogue, but S1
+/// stages each selected skill at `<data_root>/skills/<name>/` (a symlink to the
+/// skill's source dir, so `SKILL.md` is reachable). Derived from
+/// [`catalogue_path`]'s parent so the in-process test override points both at
+/// the same tempdir: production resolves `/data/skills.json` → `/data/skills`.
+fn materialized_skills_dir() -> PathBuf {
+    catalogue_path()
+        .parent()
+        .map_or_else(|| PathBuf::from("/data/skills"), |p| p.join("skills"))
+}
+
+/// M22 S4: activate a skill's tool scope under **inline** skills mode.
+///
+/// Inline mode inlines every selected skill's body into the system prompt and
+/// writes no `skills.json`, so the callable catalogue read above misses. But a
+/// skill can still scope the tool surface: read its materialized `SKILL.md`
+/// (staged by S1 at `<data_root>/skills/<name>/`), parse the frontmatter, and
+/// narrow the live dispatch policy to the skill's declared tools
+/// (`allowed-tools:` ∪ `tools:`, normalized to copperclaw MCP names) — the same
+/// [`ToolContext::set_active_skill_allowed_tools`] hook the callable path uses,
+/// so `tool_dispatch` enforces it identically. A skill that declares no tool
+/// scope clears any prior scope (loading an unscoped skill must not leave an
+/// earlier skill's narrowing in force).
+async fn activate_inline_skill_scope(
+    name: &str,
+    ctx: &dyn ToolContext,
+) -> Result<CallToolResult, ToolError> {
+    // Every inline-mode `load_skill` call counts once, whether or not a
+    // materialized skill is found (both are inline-mode invocations).
+    copperclaw_metrics::inc_load_skill(name, "inline");
+
+    let dir = materialized_skills_dir();
+    let skill_md = dir.join(name).join("SKILL.md");
+    let content = match tokio::fs::read_to_string(&skill_md).await {
+        Ok(c) => c,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolError::Internal(format!(
+                "no skills catalogue and no materialized skill `{name}` under {} — this host is running in inline-skills mode, so skill bodies are already in your system prompt; load_skill activates a skill's tool scope only for a skill staged into the container",
+                dir.display()
+            )));
+        }
+        Err(err) => {
+            return Err(ToolError::Internal(format!(
+                "could not read materialized skill `{name}` at {}: {err}",
+                skill_md.display()
+            )));
+        }
+    };
+
+    let fm = copperclaw_skills::frontmatter::parse(&content).map_err(|err| {
+        ToolError::Internal(format!(
+            "materialized skill `{name}` at {} has invalid frontmatter: {err}",
+            skill_md.display()
+        ))
+    })?;
+
+    // Narrow dispatch to the skill's declared tools, normalized to the
+    // snake_case MCP names the runner dispatches against. `None` (no declared
+    // scope) clears any prior narrowing — symmetric with the callable path.
+    let allowed_tools = fm
+        .declared_tools()
+        .map(|raw| copperclaw_skills::normalize_allowed_tools(&raw));
+    // M22 S4 metric: a sibling of the existing inline/callable `inc_load_skill`
+    // count — this one records whether the loaded skill actually NARROWED the
+    // tool surface (declared a scope) or CLEARED any prior narrowing.
+    let scope = if allowed_tools.is_some() {
+        "narrowed"
+    } else {
+        "cleared"
+    };
+    copperclaw_metrics::inc_load_skill_inline_scoped(name, scope);
+    ctx.set_active_skill_allowed_tools(allowed_tools);
+
+    // The body is already inlined into the system prompt; echo it back (matching
+    // the callable render) so the tool result is self-consistent and confirms
+    // the scope is now active.
+    let body = copperclaw_skills::skip_frontmatter(&content);
+    let rendered = format!(
+        "<skill name=\"{}\" description=\"{}\">\n{}\n</skill>",
+        escape_attr(name),
+        escape_attr(&fm.description),
+        body.trim_end()
+    );
+    Ok(CallToolResult::success(vec![Content::text(rendered)]))
+}
+
 /// Entity-encode `&` and `"` for safe inclusion in an XML-style attribute.
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
@@ -125,13 +212,11 @@ pub async fn handle(
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // P1: the host is in inline-skills mode — the body is already in
-            // the system prompt, so this call is redundant.
-            copperclaw_metrics::inc_load_skill(name, "inline");
-            return Err(ToolError::Internal(format!(
-                "skills catalogue not found at {} — this host is running in inline-skills mode, so skill bodies are already in your system prompt and load_skill is not needed",
-                path.display()
-            )));
+            // M22 S4: inline-skills mode — no `skills.json` catalogue. The body
+            // is already in the system prompt, but a skill can still SCOPE the
+            // tool surface: activate the skill's declared tools from its
+            // materialized `SKILL.md` so dispatch narrows under inline mode too.
+            return activate_inline_skill_scope(name, ctx).await;
         }
         Err(err) => {
             return Err(ToolError::Internal(format!(
@@ -243,7 +328,7 @@ mod tests {
     /// RAII guard that points `catalogue_path()` at a tempfile for the
     /// guard's lifetime and clears the override on drop.
     struct CatalogueGuard {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -256,14 +341,13 @@ mod tests {
             let path = dir.path().join("skills.json");
             std::fs::write(&path, json_body).unwrap();
             skills_catalogue_test_override_set(path);
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
+            Self { dir, _lock: lock }
         }
 
         /// Point the override at a deliberately-missing path. Used for
-        /// the "no catalogue" error-message test.
+        /// the "no catalogue" error-message test and (via [`Self::root`]) the
+        /// M22 S4 inline-mode materialized-skill tests, where the catalogue is
+        /// absent but a `<root>/skills/<name>/SKILL.md` is staged.
         fn missing() -> Self {
             let lock = catalogue_env_lock()
                 .lock()
@@ -271,10 +355,23 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("missing.json");
             skills_catalogue_test_override_set(path);
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
+            Self { dir, _lock: lock }
+        }
+
+        /// The tempdir root. `materialized_skills_dir()` resolves to
+        /// `<root>/skills` because the catalogue override lives at `<root>/…`.
+        fn root(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+
+        /// Stage a materialized skill at `<root>/skills/<name>/SKILL.md` (the
+        /// inline-mode symlink-farm layout S1 produces), returning `self` for
+        /// chaining after [`Self::missing`].
+        fn with_materialized_skill(self, name: &str, skill_md: &str) -> Self {
+            let dir = self.root().join("skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), skill_md).unwrap();
+            self
         }
     }
 
@@ -339,14 +436,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errors_when_catalogue_missing_with_explanatory_message() {
+    async fn errors_when_catalogue_and_materialized_skill_both_missing() {
+        // M22 S4: inline mode with no catalogue AND no materialized skill dir.
+        // The message explains inline mode and that only a staged skill can be
+        // activated — it does not claim the whole call was pointless.
         let _g = CatalogueGuard::missing();
         let ctx = MockToolContext::new();
         let err = handle(arg("alpha"), &ctx).await.unwrap_err();
         match err {
             ToolError::Internal(msg) => {
-                assert!(msg.contains("inline-skills mode"));
-                assert!(msg.contains("not needed"));
+                assert!(msg.contains("inline-skills mode"), "got: {msg}");
+                assert!(msg.contains("alpha"), "got: {msg}");
             }
             other => panic!("expected Internal, got {other:?}"),
         }
@@ -448,6 +548,66 @@ mod tests {
             ctx.active_skill_allowed_recorded(),
             Some(None),
             "loading an unscoped skill must clear the active-skill scope"
+        );
+    }
+
+    // ── M22 S4: inline-mode narrowing from a materialized SKILL.md ─────────
+
+    #[tokio::test]
+    async fn inline_mode_activates_tools_scope_from_materialized_skill() {
+        // Headline S4 integration: no catalogue (inline mode), but the skill is
+        // materialized at <root>/skills/<name>/SKILL.md with a `tools:` list.
+        // load_skill must read it, normalize the names, and narrow dispatch —
+        // exactly the callable path's effect, under inline mode.
+        let _g = CatalogueGuard::missing().with_materialized_skill(
+            "reader",
+            "---\nname: reader\ndescription: read-only helper\ntools: [Read]\n---\n# Reader\nInstructions.\n",
+        );
+        let ctx = MockToolContext::new();
+        let result = handle(arg("reader"), &ctx).await.unwrap();
+        // `tools: [Read]` normalizes to `read_file` — the narrowed scope.
+        assert_eq!(
+            ctx.active_skill_allowed_recorded(),
+            Some(Some(vec!["read_file".to_string()])),
+            "inline load_skill must narrow dispatch to the skill's `tools:`"
+        );
+        // The result echoes the (already-inlined) body for consistency.
+        let text = extract_text(&result);
+        assert!(text.contains("<skill name=\"reader\""), "got: {text}");
+        assert!(text.contains("Instructions."), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn inline_mode_folds_allowed_tools_and_tools_union() {
+        // A materialized skill declaring BOTH keys narrows to their union
+        // (frontmatter folds `tools:` into `allowed_tools`; both normalize).
+        let _g = CatalogueGuard::missing().with_materialized_skill(
+            "rw",
+            "---\nname: rw\ndescription: read+shell\nallowed-tools: [Read]\ntools: [Bash]\n---\nbody\n",
+        );
+        let ctx = MockToolContext::new();
+        handle(arg("rw"), &ctx).await.unwrap();
+        assert_eq!(
+            ctx.active_skill_allowed_recorded(),
+            Some(Some(vec!["read_file".to_string(), "shell".to_string()])),
+            "union of allowed-tools and tools, normalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_mode_unscoped_skill_clears_scope() {
+        // A materialized skill that declares neither key clears any prior
+        // scope — symmetric with the callable path.
+        let _g = CatalogueGuard::missing().with_materialized_skill(
+            "open",
+            "---\nname: open\ndescription: no scope\n---\nbody\n",
+        );
+        let ctx = MockToolContext::new();
+        handle(arg("open"), &ctx).await.unwrap();
+        assert_eq!(
+            ctx.active_skill_allowed_recorded(),
+            Some(None),
+            "an unscoped inline skill must clear the active-skill scope"
         );
     }
 }

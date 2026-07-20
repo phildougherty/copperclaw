@@ -22,6 +22,11 @@
 //!   default `true`; Slack overrides it to report the assistant-thread
 //!   rule (`assistant.threads.setStatus` only renders inside a thread
 //!   in the bot's `D…`-prefixed DM).
+//! - [`renders_client_side_transcript`] mirrors "this channel's
+//!   transport is an append-only frame log whose CLIENT collapses
+//!   repeated transcript frames into an in-place repaint" (today: the
+//!   cli channel's JSONL `chat.log`, rendered by `cclaw chat` in
+//!   `copperclaw-cclaw`).
 //!
 //! Keep-in-sync rule: when an adapter gains or loses `edit_message`
 //! (or overrides `typing_indicator_visible`), update the matching
@@ -64,6 +69,30 @@ pub fn supports_message_edit(channel_type: &str) -> bool {
 #[must_use]
 pub fn edit_capable_channels() -> &'static [&'static str] {
     &EDIT_CAPABLE_CHANNELS
+}
+
+/// Channel types whose adapter writes an append-only frame log that a
+/// CLIENT-side renderer collapses into an in-place transcript repaint,
+/// as verified against the in-tree sources. Today that is only the cli
+/// channel: `CliAdapter` emits JSONL frames (`{"kind":"breadcrumb",…}`)
+/// into `chat.log` and `cclaw chat` (the renderer, in
+/// `copperclaw-cclaw`) dedupes repeated frames by rendered-step prefix
+/// and repaints them in place. Deliberately DISJOINT from
+/// [`EDIT_CAPABLE_CHANNELS`]: these adapters have no real
+/// `edit_message` (the F1 drift guard would fail if they were listed
+/// there), so the runner's Task HUD emits transcript frames as fresh
+/// messages (events) and leaves the collapsing to the client.
+const CLIENT_SIDE_TRANSCRIPT_CHANNELS: [&str; 1] = ["cli"];
+
+/// True when the named channel type's CLIENT renders repeated
+/// transcript frames as an in-place repaint (see module docs for the
+/// sync rule), so the Task HUD may emit breadcrumb frames as fresh
+/// append-only messages without producing new-message spam. Unknown
+/// channel types return `false` — the safe degradation is "no
+/// transcript frames, periodic status rows instead".
+#[must_use]
+pub fn renders_client_side_transcript(channel_type: &str) -> bool {
+    CLIENT_SIDE_TRANSCRIPT_CHANNELS.contains(&channel_type)
 }
 
 /// Static mirror of [`crate::ChannelAdapter::typing_indicator_visible`]
@@ -125,6 +154,37 @@ mod tests {
             "unknown-new-channel",
         ] {
             assert!(!supports_message_edit(ct), "{ct} has no edit_message");
+        }
+    }
+
+    #[test]
+    fn client_side_transcript_is_cli_only_and_disjoint_from_edit_capable() {
+        // M22 D5: cli's chat.log is an append-only frame log whose
+        // reader (`cclaw chat`) collapses repeated frames client-side.
+        assert!(renders_client_side_transcript("cli"));
+        // Everything else — edit-capable rich channels, bare channels,
+        // unknown types — is NOT client-side-transcript.
+        for ct in [
+            "telegram",
+            "slack",
+            "webhooks",
+            "github",
+            "email",
+            "whatsapp-cloud",
+            "unknown-new-channel",
+        ] {
+            assert!(
+                !renders_client_side_transcript(ct),
+                "{ct} must not claim a client-side transcript renderer"
+            );
+        }
+        // The two lists must stay disjoint: an edit-capable adapter gets
+        // in-place HUD edits, never append-only transcript frames.
+        for ct in edit_capable_channels() {
+            assert!(
+                !renders_client_side_transcript(ct),
+                "{ct} is edit-capable — it must not also be listed client-side-transcript"
+            );
         }
     }
 

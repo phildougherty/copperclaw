@@ -18,6 +18,15 @@ use tokio::task::JoinHandle;
 /// than a room. The adapter recognises it and uses `toPersonId` on send.
 pub const PERSON_PREFIX: &str = "person:";
 
+/// Webex's documented per-message limit for `text` / `markdown` / `html` on
+/// `POST /messages`: 7 439 UTF-8 **bytes**.
+///
+/// The Webex API reference states the limit in bytes, not characters. It is
+/// declared through BOTH `max_message_chars` (a valid ceiling, since one
+/// char is at least one byte) and `max_message_bytes` (the real constraint)
+/// — see the two methods on the `ChannelAdapter` impl below.
+pub const WEBEX_MAX_MESSAGE_BYTES: usize = 7439;
+
 /// Resolved target of an outbound delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeliverTarget {
@@ -294,9 +303,25 @@ impl ChannelAdapter for WebexAdapter {
         true
     }
 
-    /// Webex `POST /messages` caps `text` at 7 439 chars.
+    /// Webex `POST /messages` caps `text` / `markdown` / `html` at 7 439
+    /// **bytes**, not chars (see [`Self::max_message_bytes`]). 7 439 is
+    /// still a valid CHAR ceiling — every char is at least one UTF-8 byte,
+    /// so a body over 7 439 chars is necessarily over 7 439 bytes — and
+    /// keeping it here is what preserves the natural split boundary for
+    /// ordinary ASCII replies. The byte cap below does the real tightening
+    /// for multi-byte text.
     fn max_message_chars(&self) -> Option<usize> {
-        Some(7439)
+        Some(WEBEX_MAX_MESSAGE_BYTES)
+    }
+
+    /// The Webex limit as documented: 7 439 UTF-8 **bytes**.
+    ///
+    /// Declaring this (in addition to the char cap) is what keeps a CJK or
+    /// emoji-heavy reply inside the API's budget: UTF-8 CJK is 3 bytes per
+    /// char and many emoji are 4, so a 7 439-char chunk can be ~22 KB on
+    /// the wire and the platform rejects the whole message.
+    fn max_message_bytes(&self) -> Option<usize> {
+        Some(WEBEX_MAX_MESSAGE_BYTES)
     }
 
     async fn deliver(
@@ -598,6 +623,45 @@ mod tests {
             ChannelType::new("webex"),
             WebexApi::new(server.uri(), "tok"),
         )
+    }
+
+    /// REGRESSION (fix 2): the Webex API documents 7 439 **bytes** for
+    /// `text` / `markdown` / `html`, not chars. The adapter used to
+    /// declare only `max_message_chars() = 7439` with a doc comment that
+    /// said "chars", so a CJK reply (3 bytes/char) passed the split and
+    /// arrived at ~3x the byte budget — a permanent `BadRequest`. Both
+    /// caps must now be declared.
+    #[tokio::test]
+    async fn max_message_caps_are_byte_denominated() {
+        let server = MockServer::start().await;
+        let a = adapter_for(&server);
+        assert_eq!(a.max_message_bytes(), Some(WEBEX_MAX_MESSAGE_BYTES));
+        // Still a valid CHAR ceiling: one char is at least one UTF-8 byte.
+        assert_eq!(a.max_message_chars(), Some(WEBEX_MAX_MESSAGE_BYTES));
+    }
+
+    /// A CJK payload must be chunked so every part fits the BYTE budget.
+    #[tokio::test]
+    async fn cjk_payload_is_split_within_the_byte_budget() {
+        let server = MockServer::start().await;
+        let a = adapter_for(&server);
+        let cap = a.max_message_bytes().expect("webex declares a byte cap");
+        let eff = copperclaw_channels_core::markdown::effective_max(Some(cap)).unwrap();
+        let text = "这是一个很长的中文回复。".repeat(800);
+        assert!(text.len() > cap, "fixture must exceed the byte budget");
+        let chunks = copperclaw_channels_core::markdown::split_into_chunks_within_bytes(
+            &text,
+            copperclaw_channels_core::markdown::effective_max(a.max_message_chars()).unwrap(),
+            Some(eff),
+            "webex",
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.len() <= eff,
+                "chunk {i} is {} bytes, over the effective byte cap {eff}",
+                c.len()
+            );
+        }
     }
 
     #[tokio::test]

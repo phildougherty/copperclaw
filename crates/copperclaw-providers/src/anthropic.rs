@@ -133,7 +133,64 @@ impl AgentProvider for AnthropicProvider {
 
     async fn query(&self, input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
         let caching = is_anthropic_family_model(&input.model);
-        let body = build_request_body(&input, caching);
+        let resp = self.send_messages(&input, caching).await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(spawn_stream(resp));
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        // Reactive vision fallback. A text-only model behind an
+        // OpenRouter-style gateway rejects a transcript that carries an image
+        // block — typically a 404 "No endpoints found that support image
+        // input". A screenshot the agent took (`ui_screenshot` / `view_image`)
+        // would otherwise wedge EVERY subsequent turn, since the image sits in
+        // the history that is re-sent each turn. Strip the images to a text
+        // placeholder and retry ONCE so the agent keeps going (blind to the
+        // image) instead of dead-ending. Vision-capable models never hit this
+        // path — they accept the image and return success on the first try.
+        if is_image_input_unsupported(status.as_u16(), &body)
+            && input
+                .history
+                .iter()
+                .any(|m| matches!(m, HistoryMessage::Image { .. }))
+        {
+            tracing::warn!(
+                model = %input.model,
+                status = status.as_u16(),
+                "model rejected image input; stripping screenshots to text placeholders and retrying once"
+            );
+            let stripped = strip_images_to_placeholders(input);
+            let resp = self.send_messages(&stripped, caching).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(
+                    status.as_u16(),
+                    resp.text().await.unwrap_or_default(),
+                ));
+            }
+            return Ok(spawn_stream(resp));
+        }
+
+        Err(map_http_error(status.as_u16(), body))
+    }
+
+    fn is_session_invalid(&self, err: &ProviderError) -> bool {
+        matches!(err, ProviderError::SessionInvalid)
+    }
+}
+
+impl AnthropicProvider {
+    /// Serialize `input` and POST it to `/v1/messages`, returning the raw
+    /// response (success or error). Factored out of [`Self::query`] so the
+    /// image-input fallback can re-send a stripped transcript without
+    /// duplicating the header/caching wiring.
+    async fn send_messages(
+        &self,
+        input: &QueryInput,
+        caching: bool,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let body = build_request_body(input, caching);
         let url = format!("{}/v1/messages", self.inner.base_url);
         let mut req = self
             .inner
@@ -151,33 +208,55 @@ impl AgentProvider for AnthropicProvider {
         if caching && self.inner.is_anthropic_host {
             req = req.header("anthropic-beta", PROMPT_CACHING_BETA);
         }
-        let resp = req
-            .json(&body)
+        req.json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(e.to_string()))
+    }
+}
 
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(map_http_error(
-                status.as_u16(),
-                resp.text().await.unwrap_or_default(),
-            ));
+/// Spawn the SSE pump for a successful response and wrap it as an
+/// [`AgentQuery`].
+fn spawn_stream(resp: reqwest::Response) -> Box<dyn AgentQuery> {
+    let (tx, rx) = mpsc::channel(32);
+    let stream = resp.bytes_stream().eventsource();
+    let handle = tokio::spawn(pump_sse(stream, tx));
+    Box::new(AnthropicQuery {
+        rx,
+        handle: Some(handle),
+    })
+}
+
+/// True when a provider rejected the request specifically because the model
+/// cannot accept image input (a text-only model behind a gateway). The exact
+/// wording varies by gateway, so match loosely on the status + error text
+/// rather than a single fixed string. `OpenRouter` returns
+/// `404 {"error":{"message":"No endpoints found that support image input"}}`.
+fn is_image_input_unsupported(status: u16, body: &str) -> bool {
+    if status != 404 && status != 400 {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("support image input")
+        || b.contains("that support image")
+        || (b.contains("image input") && (b.contains("no endpoint") || b.contains("not support")))
+}
+
+/// Replace every image block in the transcript with a short text placeholder so
+/// a text-only model can still process the turn. Order-preserving; only
+/// [`HistoryMessage::Image`] entries change (both they and the placeholder are
+/// user-role, so the message sequence stays valid). The agent loses sight of
+/// the screenshot but is no longer wedged.
+fn strip_images_to_placeholders(mut input: QueryInput) -> QueryInput {
+    for msg in &mut input.history {
+        if matches!(msg, HistoryMessage::Image { .. }) {
+            *msg = HistoryMessage::User {
+                content: "[screenshot omitted — the current model does not support image input]"
+                    .to_string(),
+            };
         }
-
-        let (tx, rx) = mpsc::channel(32);
-        let stream = resp.bytes_stream().eventsource();
-        let handle = tokio::spawn(pump_sse(stream, tx));
-
-        Ok(Box::new(AnthropicQuery {
-            rx,
-            handle: Some(handle),
-        }))
     }
-
-    fn is_session_invalid(&self, err: &ProviderError) -> bool {
-        matches!(err, ProviderError::SessionInvalid)
-    }
+    input
 }
 
 /// Active streaming response from [`AnthropicProvider::query`]. The runner
@@ -1479,6 +1558,62 @@ mod tests {
         assert_eq!(blocks[1]["source"]["type"], "base64");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
         assert_eq!(blocks[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn image_input_unsupported_matches_openrouter_404() {
+        // The live wording that wedged the telegram agent.
+        let body =
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#;
+        assert!(is_image_input_unsupported(404, body));
+        // Case-insensitive + a 400-shaped variant some gateways use.
+        assert!(is_image_input_unsupported(
+            400,
+            "Model does not support image input"
+        ));
+        // Unrelated errors must NOT trigger the vision fallback.
+        assert!(!is_image_input_unsupported(404, "model not found"));
+        assert!(!is_image_input_unsupported(
+            500,
+            "No endpoints found that support image input"
+        ));
+        assert!(!is_image_input_unsupported(429, "rate limited"));
+    }
+
+    #[test]
+    fn strip_images_replaces_only_image_blocks_with_placeholder() {
+        let mut input = QueryInput::new("sys", "text-only-model");
+        input.history = vec![
+            HistoryMessage::User {
+                content: "look at this".into(),
+            },
+            HistoryMessage::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+            HistoryMessage::Assistant {
+                content: "ok".into(),
+            },
+        ];
+        let out = strip_images_to_placeholders(input);
+        assert_eq!(out.history.len(), 3);
+        // No image survives.
+        assert!(
+            !out.history
+                .iter()
+                .any(|m| matches!(m, HistoryMessage::Image { .. }))
+        );
+        // The image became a user-role text placeholder; siblings untouched.
+        match &out.history[1] {
+            HistoryMessage::User { content } => assert!(content.contains("does not support image")),
+            other => panic!("expected placeholder User, got {other:?}"),
+        }
+        assert!(
+            matches!(&out.history[0], HistoryMessage::User { content } if content == "look at this")
+        );
+        assert!(
+            matches!(&out.history[2], HistoryMessage::Assistant { content } if content == "ok")
+        );
     }
 
     #[test]

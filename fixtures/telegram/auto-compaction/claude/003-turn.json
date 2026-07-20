@@ -1,0 +1,33 @@
+{
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "id": "msg_replay_autocompact_003"
+      }
+    },
+    {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "text",
+        "text": ""
+      }
+    },
+    {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "text_delta",
+        "text": "SUMMARY: The user asked for a walkthrough of the deployment design doc. Covered so far: the three-phase rollout plan (traffic mirroring, shadow writes with reconciliation, final flag flip with a two-week warm rollback fleet) and the capacity plan (peak plus forty percent headroom, per-NUMA model server replicas, latency-weighted routing, and the three failure scenarios with their runbooks)."
+      }
+    },
+    {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    {
+      "type": "message_stop"
+    }
+  ]
+}

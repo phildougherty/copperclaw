@@ -1,7 +1,7 @@
 {
   "name": "cli-status-row-heartbeat",
   "channel": "cli",
-  "description": "M21 S6: one inbound, three Claude turns (tool_use, tool_use, final text) with the harness test clock advanced 61s then 90s as the scripted LLM calls are served. Pins the bare-channel Task HUD status-row legs deterministically: the 60s first-fire ('61s in ... I'll keep going.') and the 150s softening ('151s in ... taking longer than usual') — previously unfixturable without a real 60s wall-clock wait (the M18 X2 known gap).",
+  "description": "M21 S6 origin, M22 D5 shape: one inbound, three Claude turns (tool_use, tool_use, final text) with the harness test clock advanced 61s then 90s as the scripted LLM calls are served. Pins the cli Task HUD transcript cadence deterministically: cli takes Behavior::Transcript (renders_client_side_transcript), so the batch boundaries surface as fresh Breadcrumb EVENTS carrying the elapsed clock ('1 tool call | 1:01', '2 tool calls | 2:31') plus cumulative steps, collapsed by 'done in 2:31, 2 tool calls' — never an update_breadcrumb edit. The pre-D5 StatusRows sentences ('Still working on this...') remain pinned for genuinely bare channels by hud.rs unit tests.",
   "schema": 1,
   "replay": {
     "mode": "direct",

@@ -8,7 +8,7 @@ use copperclaw_container_rt::{ContainerSpec, ImageBuildSpec, Mount, ResourceLimi
 use copperclaw_db::session::SessionPaths;
 use copperclaw_db::tables::{container_configs, sessions};
 use copperclaw_types::{AgentGroupId, Session};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default poll cadence. The router debounces inbound, so once a
 /// message has settled in `messages_in` we want to spawn fast — this
@@ -230,6 +230,26 @@ fn set_mode(path: &std::path::Path, mode: u32, what: &str) {
 }
 
 impl ContainerManager {
+    /// Whether the host environment currently forbids launching a
+    /// container, and why. `None` means "go ahead".
+    ///
+    /// Reads the *cached* disk probe (refreshed once per reconcile tick by
+    /// `refresh_host_resources`) rather than calling `statvfs` itself, so
+    /// a pass over N sessions costs one stat, not N. Unknown free space
+    /// (the filesystem could not be stat'd) is deliberately NOT a block:
+    /// a stat error is not evidence of exhaustion, and failing closed on
+    /// it would let one bad path freeze every session on the box.
+    pub(crate) fn spawn_blocked_by_host_resources(&self) -> Option<&'static str> {
+        if self.env_breaker.is_tripped() {
+            return Some("environment fault (multiple sessions crash-restarted)");
+        }
+        let disk = self
+            .disk_probe
+            .get(&self.cfg.data_dir, tokio::time::Instant::now())?;
+        disk.is_exhausted()
+            .then_some("disk below the failure floor")
+    }
+
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
     /// a container was actually spawned (i.e. pending work was found
     /// and the runtime call succeeded), `Ok(false)` when there was
@@ -244,6 +264,23 @@ impl ContainerManager {
     pub async fn maybe_spawn(&self, session: &Session) -> Result<bool, ManagerError> {
         if self.is_degraded() {
             return Err(ManagerError::HostDegraded);
+        }
+        // Host-resource preflight. Ordered BEFORE `ensure_dirs` on purpose:
+        // when the box is out of disk, the very first thing this function
+        // would otherwise do is try to write. Spawning into a full
+        // filesystem does not fail fast — it fails halfway, after Docker
+        // has written image layers and the runner has half-created a
+        // session DB, and then presents as a stale heartbeat that the
+        // reconcile loop reads as a per-session crash. Refusing here keeps
+        // the session `Stopped` with its inbound still pending, which is
+        // the outcome we actually want: nothing lost, nothing burned.
+        if let Some(reason) = self.spawn_blocked_by_host_resources() {
+            debug!(
+                session = %session.id.as_uuid(),
+                reason,
+                "spawn preflight refused: host cannot support a container right now"
+            );
+            return Err(ManagerError::HostResourceExhausted);
         }
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         paths.ensure_dirs().map_err(ManagerError::Io)?;
@@ -840,6 +877,18 @@ impl ContainerManager {
         // failing the sibling spawn (it can still run with an empty `/data`).
         spec = apply_parent_workspace(spec, session, paths, sessions_root);
 
+        // M22 S1M: bind the skills SOURCE dir(s) read-only at their own
+        // host-absolute path so the materialized symlink farm under
+        // `/data/skills/<id>` resolves INSIDE the container. S1
+        // (`cold_start::materialize_session_skills`) stages each selected skill
+        // as a symlink whose target is the *canonical host* skill dir (see
+        // `copperclaw_skills::materialize`, which links to
+        // `skill.dir.canonicalize()`). Those host paths don't exist inside the
+        // container, so without this mount the farm's links dangle and a skill's
+        // `scripts/` helper is not executable in-container — the S1 marquee.
+        // Read-only + escape-guarded + fail-safe; see the method doc.
+        spec = self.apply_skills_source_mounts(spec, session);
+
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
         // doesn't have a dedicated args field, so we encode the flag
@@ -1011,6 +1060,120 @@ impl ContainerManager {
         }
 
         Ok(spec)
+    }
+
+    /// M22 S1M: mount the skills SOURCE dir(s) read-only at their own
+    /// host-absolute path so the materialized symlink farm resolves
+    /// in-container — completing the S1 marquee (helper scripts now *run* in
+    /// the sandbox, not just instruct).
+    ///
+    /// S1's `materialize_session_skills` builds a symlink farm at
+    /// `<session_root>/skills/<id>` (the container's `/data/skills/<id>`)
+    /// whose links point at the *canonicalized host* skill dir
+    /// (`copperclaw_skills::materialize` links to `skill.dir.canonicalize()`).
+    /// Inside the container those host paths do not exist, so the links dangle.
+    /// Binding the canonical skills root at its identical host-absolute path
+    /// makes every farm link resolve without rewriting.
+    ///
+    /// Two possible sources, resolved exactly as `materialize_session_skills`
+    /// resolves them: the global `skills_dir` and the per-group override
+    /// `<groups_dir>/<ag>/skills` (only when it exists on disk). Whichever
+    /// exist are mounted; both existing → two mounts.
+    ///
+    /// Security posture (read-only, already-trusted content, escape-guarded,
+    /// fail-safe — see `docs/plans/m22-security-reviews.md`, S1):
+    /// - **Read-only.** The container must never write back into the host
+    ///   skills source, so both mounts are `read_only: true`.
+    /// - **Escape-guarded.** Each raw source is validated with
+    ///   [`super::mount_guard::validate_source`] against its trusted root
+    ///   before mounting (the global root is the configured dir itself; the
+    ///   per-group override's root is `groups_dir`, exactly as the memory
+    ///   mount validates `<groups_dir>/<ag>/memory` against `groups_dir`). A
+    ///   swapped-symlink component that escapes the root drops *that* mount
+    ///   rather than failing the spawn. The farm itself is separately
+    ///   escape-guarded in `materialize.rs`.
+    /// - **Conditional + idempotent.** No global `skills_dir` configured, or a
+    ///   source that isn't a directory on disk, is a clean no-op (no mount, no
+    ///   error). Deduped against paths already bound (and against each other),
+    ///   so re-running across spawns can't double-mount.
+    /// - **Already-trusted content.** These are the same operator/agent-
+    ///   authored skill files S1 already stages; the mount introduces no new
+    ///   external input and no egress/write widening.
+    fn apply_skills_source_mounts(
+        &self,
+        mut spec: ContainerSpec,
+        session: &Session,
+    ) -> ContainerSpec {
+        let Some(global) = self.cfg.skills_dir.as_deref() else {
+            return spec; // no global skills dir configured -> nothing to mount
+        };
+
+        // (raw source, trusted validation root) pairs. The global source is
+        // operator config validated against itself (a canonicalization /
+        // absolute / no-`..` sanity check); the per-group override is a
+        // host-computed path validated against `groups_dir`, mirroring the
+        // memory mount.
+        let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+            vec![(global.to_path_buf(), global.to_path_buf())];
+        if let Some(groups) = self.cfg.groups_dir.as_deref() {
+            let override_dir = groups
+                .join(session.agent_group_id.as_uuid().to_string())
+                .join("skills");
+            if override_dir.is_dir() {
+                candidates.push((override_dir, groups.to_path_buf()));
+            }
+        }
+
+        for (source, root) in candidates {
+            // A missing skills dir → no mount, no error (mirrors
+            // materialize's own best-effort no-op).
+            if !source.is_dir() {
+                continue;
+            }
+            // Escape guard: refuse a source that escapes its trusted root
+            // (skip the mount, never fail the spawn).
+            if let Err(err) = super::mount_guard::validate_source(&source, &root) {
+                warn!(
+                    %err,
+                    path = %source.display(),
+                    "skills source failed mount validation; skipping read-only skills mount"
+                );
+                continue;
+            }
+            // The farm's links target the CANONICAL skill dir, so the mount
+            // must live at the canonical source path for them to resolve
+            // in-container. (A configured `skills_dir` is commonly a symlink —
+            // e.g. `<install>/data/skills` → the repo `skills/` — so the
+            // canonical path is what the farm links actually point at.)
+            let canon = match source.canonicalize() {
+                Ok(c) => c,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        path = %source.display(),
+                        "skills source not canonicalizable; skipping read-only skills mount"
+                    );
+                    continue;
+                }
+            };
+            let target = canon.to_string_lossy().into_owned();
+            // Dedupe: never double-bind a path already mounted (the other
+            // skills root canonicalized equal, or any prior mount at this
+            // exact host path).
+            if spec
+                .mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { target: t, .. } if *t == target))
+            {
+                continue;
+            }
+            spec = spec.with_mount(Mount::Bind {
+                source: target.clone(),
+                target,
+                read_only: true,
+            });
+        }
+        spec
     }
 }
 
@@ -2941,6 +3104,132 @@ mod tests {
         assert!(
             !has_memory,
             "memory mount must not appear without groups_dir"
+        );
+    }
+
+    // ── M22 S1M: read-only skills-source bind mount ──────────────────────
+
+    /// The read-only skills-source mount is present in the built spec when a
+    /// global `skills_dir` is configured, bound at its own canonical
+    /// host-absolute path (source == target) so the materialized farm's
+    /// canonical-target symlinks resolve in-container. This is the mount that
+    /// makes a skill's helper script executable inside the sandbox — the S1
+    /// marquee.
+    #[test]
+    fn build_spec_mounts_skills_source_read_only_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(skills.join("demo-skill")).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.skills_dir = Some(skills.clone());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+
+        // The farm links target the CANONICAL skill dir, so the mount lives at
+        // the canonical skills-dir path.
+        let canon = skills
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let skills_mount = spec.mounts.iter().find_map(|m| match m {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } if *target == canon => Some((source.clone(), *read_only)),
+            _ => None,
+        });
+        let (src, ro) = skills_mount.expect("read-only skills-source mount present");
+        assert_eq!(
+            src, canon,
+            "skills source must bind at its own host-absolute path (source == target)"
+        );
+        assert!(ro, "skills source must be mounted read-only");
+    }
+
+    /// No configured global `skills_dir` → no skills-source mount at all (the
+    /// mount is conditional on there being a source to bind).
+    #[test]
+    fn build_spec_no_skills_mount_without_skills_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Default manager_cfg leaves skills_dir = None.
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        // The only host-absolute source==target bind in a plain spec would be
+        // a skills (or sibling git) mount; a root session with no skills_dir
+        // has none.
+        assert!(
+            !spec.mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { source, target, .. } if source == target
+            )),
+            "no skills_dir configured -> no read-only skills-source mount"
+        );
+    }
+
+    /// The per-group override `<groups_dir>/<ag>/skills`, when it exists on
+    /// disk, is mounted read-only at its own canonical host path alongside the
+    /// global skills mount — so a group-shadowed skill's helper also resolves
+    /// in-container.
+    #[test]
+    fn build_spec_mounts_per_group_skills_override_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let groups = tmp.path().join("groups");
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = fixture_session(&db);
+        let override_dir = groups
+            .join(session.agent_group_id.as_uuid().to_string())
+            .join("skills");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.skills_dir = Some(skills.clone());
+        cfg.groups_dir = Some(groups);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+
+        let override_canon = override_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            spec.mounts.iter().any(|m| matches!(m,
+                Mount::Bind { source, target, read_only }
+                    if *source == override_canon && *target == override_canon && *read_only)),
+            "per-group skills override must be bound read-only at its host path"
+        );
+        // The global skills root is still mounted too (two distinct sources).
+        let global_canon = skills
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            spec.mounts.iter().any(|m| matches!(m,
+                Mount::Bind { target, read_only, .. } if *target == global_canon && *read_only)),
+            "global skills root must be bound read-only alongside the override"
         );
     }
 

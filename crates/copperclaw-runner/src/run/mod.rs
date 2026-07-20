@@ -16,12 +16,21 @@ pub mod external_mcp;
 pub(super) mod failover_health;
 pub(super) mod formatting;
 pub mod hud;
+// M22 C3: container-local symbol-index bridge (ctags/LSP) feeding find_symbol.
+pub(super) mod lsp;
 pub mod preview;
 pub(super) mod progressive;
+// M22 C2: open/attach an existing repository as the working project.
+pub mod project;
 pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod reaction;
 pub(super) mod tool_dispatch;
+
+// M22 A2: the autonomy-gate types appear in [`RunnerDeps`]'s public
+// `active_grant` field, so re-export them at the (public) `run` module path to
+// keep the type publicly reachable (the runner binary constructs the field).
+pub use tool_dispatch::{GrantGateState, TurnGrant};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -211,6 +220,109 @@ pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
     parsed
 }
 
+/// Env var operators use to override the HARD tool-turn ceiling — the
+/// absolute maximum number of tool-use cycles a single inbound may run
+/// across ALL smart auto-continue blocks before the runner stops and asks
+/// the operator to send `continue`. This is the runaway backstop for the
+/// progress-gated budget (see [`drive_turn`]): the soft cap
+/// ([`MAX_TOOL_TURNS_ENV`]) is one "block", and a block that made real
+/// progress extends the budget by another block WITHOUT interrupting the
+/// operator — but the total is always bounded by this hard ceiling so a
+/// productive-looking loop can never run unbounded.
+///
+/// Resolved next to [`resolve_max_tool_turns`] via
+/// [`resolve_max_tool_turns_hard`]. Set it EQUAL to the soft cap to disable
+/// extension entirely (the historical flat-cap behaviour). The default is
+/// `soft * 6` (so a fresh install extends generously), clamped to
+/// [`MAX_MAX_TOOL_TURNS_HARD`] and to `>= soft`.
+///
+/// [`drive_turn`]: crate::run::drive_turn
+pub const MAX_TOOL_TURNS_HARD_ENV: &str = "COPPERCLAW_MAX_TOOL_TURNS_HARD";
+
+/// Absolute ceiling for the hard tool-turn bound. Even an operator who
+/// cranks [`MAX_TOOL_TURNS_HARD_ENV`] up cannot push a single inbound past
+/// this many tool turns — beyond it a "productive" loop is a runaway by any
+/// measure, so we refuse to honour a higher configured value and clamp to
+/// this (with a WARN). At the default soft cap of 150 the default hard
+/// ceiling is 900, comfortably under this clamp; the clamp only bites for an
+/// operator who sets both the soft cap and the hard ceiling very high.
+pub const MAX_MAX_TOOL_TURNS_HARD: usize = 1200;
+
+/// The default hard ceiling derived from a resolved `soft` cap: `soft * 6`,
+/// clamped to [`MAX_MAX_TOOL_TURNS_HARD`] and floored at `soft` (so the hard
+/// ceiling can never sit below the soft cap even for a pathological `soft`).
+/// A fresh install (soft = [`DEFAULT_MAX_TOOL_TURNS`] = 150) gets a hard
+/// ceiling of 900.
+#[must_use]
+fn default_max_tool_turns_hard(soft: usize) -> usize {
+    soft.saturating_mul(6)
+        .min(MAX_MAX_TOOL_TURNS_HARD)
+        .max(soft)
+}
+
+/// Resolve the HARD tool-turn ceiling from the env, given the already-resolved
+/// `soft` cap. Mirrors [`resolve_max_tool_turns`]'s shape: unset returns the
+/// derived default (`soft * 6`, clamped — see [`default_max_tool_turns_hard`]);
+/// an unparseable value warns once and returns that default; an in-range value
+/// is honoured; an out-of-range value is CLAMPED into `[soft,
+/// MAX_MAX_TOOL_TURNS_HARD]` (with a one-shot WARN) rather than reset to the
+/// default, so an operator who asks for "as high as possible" gets the max
+/// rather than a surprise drop back to `soft * 6`.
+///
+/// Setting the env EQUAL to `soft` is a legitimate configuration (extension
+/// disabled → flat-cap behaviour), not a misconfig, so it never warns. The
+/// misconfig warn fires exactly once per process via a `OnceLock<()>` guard,
+/// same as its sibling.
+#[must_use]
+pub fn resolve_max_tool_turns_hard(env: &dyn crate::config::EnvLookup, soft: usize) -> usize {
+    static MISCONFIG_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let default = default_max_tool_turns_hard(soft);
+    let warn_once = |line: &str, raw: &str| {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TOOL_TURNS_HARD_ENV,
+                value = %raw,
+                "{line} (clamped; suppressing further warnings this process)",
+            );
+        });
+    };
+    let Some(raw) = env.get(MAX_TOOL_TURNS_HARD_ENV) else {
+        return default;
+    };
+    let Ok(parsed) = raw.parse::<usize>() else {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TOOL_TURNS_HARD_ENV,
+                value = %raw,
+                "hard tool-turn ceiling is not a valid integer (using default {default}; suppressing further warnings this process)",
+            );
+        });
+        return default;
+    };
+    // Clamp into [soft, MAX_MAX_TOOL_TURNS_HARD]. A value below the soft cap
+    // would make the run bail before even one soft block completes, so we
+    // floor it at `soft` (which also disables extension) rather than honour it.
+    if parsed < soft {
+        warn_once(
+            &format!(
+                "hard tool-turn ceiling {parsed} is below the soft cap {soft}; clamping up to {soft} (extension disabled)"
+            ),
+            &raw,
+        );
+        return soft;
+    }
+    if parsed > MAX_MAX_TOOL_TURNS_HARD {
+        warn_once(
+            &format!(
+                "hard tool-turn ceiling {parsed} exceeds the absolute max {MAX_MAX_TOOL_TURNS_HARD}; clamping down"
+            ),
+            &raw,
+        );
+        return MAX_MAX_TOOL_TURNS_HARD;
+    }
+    parsed
+}
+
 /// Env var operators use to override the per-TASK token ceiling — the
 /// total input+output tokens a single inbound's tool-loop may spend
 /// before the runner hard-aborts. Distinct from the per-DAY group cap
@@ -313,6 +425,44 @@ pub fn resolve_tool_deadline_secs(env: &dyn crate::config::EnvLookup) -> u64 {
     parsed
 }
 
+/// M22 B1: one-shot user-facing notices queued by loop-level events that
+/// fire OUTSIDE a turn — before any [`hud::TaskHud`] exists to carry them.
+/// Today's single producer is the automatic compaction pass in [`run_loop`]
+/// (it runs before `drive_turn`; the `/compact` slash path already confirms
+/// to the user directly, and this closes the asymmetry for the silent
+/// automatic path). The next constructed [`hud::TaskHud`] drains ONE note
+/// into its existing one-shot note machinery, so the note rides the next
+/// HUD frame (rich channels) or the next periodic status row (bare
+/// channels) and renders exactly once; a note the turn never got to render
+/// (a fast pure-text turn posts no frame) is re-queued at finalize so a
+/// later turn surfaces it instead of dropping it. FIFO: notes surface in
+/// the order pushed, at most one per turn. Best-effort by design — a
+/// poisoned lock holds or drops notes rather than panicking, because a
+/// status annotation must never take down the runner.
+#[derive(Debug, Default)]
+pub struct Notices(std::sync::Mutex<Vec<String>>);
+
+impl Notices {
+    /// Queue a note for the next turn's HUD frame / status row.
+    pub fn push(&self, text: impl Into<String>) {
+        if let Ok(mut notes) = self.0.lock() {
+            notes.push(text.into());
+        }
+    }
+
+    /// Take the oldest queued note (FIFO), one at a time. `None` when the
+    /// queue is empty (or the lock is poisoned).
+    #[must_use]
+    pub fn drain_one(&self) -> Option<String> {
+        let mut notes = self.0.lock().ok()?;
+        if notes.is_empty() {
+            None
+        } else {
+            Some(notes.remove(0))
+        }
+    }
+}
+
 /// Dependencies injected into [`run_loop`]. Holding all of these in a struct
 /// keeps the signature small and makes it easy to fan out variations from
 /// tests.
@@ -378,9 +528,31 @@ pub struct RunnerDeps {
     /// ([`external_mcp::dispatch_external`]) instead of the in-container
     /// `tool_map`. Empty when the group configures no external MCP servers.
     pub external_tools: Arc<HashMap<String, external_mcp::ExternalToolRoute>>,
-    /// Hard cap on consecutive tool-use turns per inbound. Stops a
-    /// confused model from looping forever. Default 20.
+    /// SOFT cap on consecutive tool-use turns per inbound — one smart
+    /// auto-continue "block". When a full block completes without an earlier
+    /// bail (loop-breaker / token ceiling / parse-error), [`drive_turn`]
+    /// consults [`Self::max_tool_turns_hard`]: if the block made real progress
+    /// (a successful non-read-only tool call) it EXTENDS by another block
+    /// without interrupting the operator; otherwise it stops and asks. Resolved
+    /// from [`MAX_TOOL_TURNS_ENV`]; the `minimal` default is
+    /// [`DEFAULT_MAX_TOOL_TURNS`].
+    ///
+    /// [`drive_turn`]: crate::run::drive_turn
     pub max_tool_turns: usize,
+    /// HARD ceiling on the TOTAL tool-use turns per inbound across ALL smart
+    /// auto-continue blocks — the runaway backstop. Once the cumulative turn
+    /// count reaches this, [`drive_turn`] stops and surfaces a "hit the hard
+    /// ceiling — send 'continue'" message EVEN IF the agent is still making
+    /// progress, so a productive-looking loop can never run unbounded: the
+    /// worst-case total tool turns for a single inbound is exactly this value.
+    /// Must be `>= max_tool_turns`; set EQUAL to it to disable extension (the
+    /// historical flat-cap behaviour). The runner binary resolves it from
+    /// [`MAX_TOOL_TURNS_HARD_ENV`] via [`resolve_max_tool_turns_hard`]; the
+    /// `minimal` default is `soft * 6` ([`default_max_tool_turns_hard`], = 900
+    /// at the default soft cap of 150).
+    ///
+    /// [`drive_turn`]: crate::run::drive_turn
+    pub max_tool_turns_hard: usize,
     /// Per-TASK token ceiling: the cumulative input+output tokens a
     /// single inbound's tool-loop may spend before [`drive_turn`]
     /// hard-aborts with a surfaced "task budget reached" message and a
@@ -494,6 +666,40 @@ pub struct RunnerDeps {
     /// inject a [`crate::clock::TestClock`] and advance it by hand so
     /// timed legs no longer need real waits.
     pub clock: Arc<dyn crate::clock::Clock>,
+    /// M22 A2 autonomy gate: the capability grant governing the current
+    /// autonomous (scheduled / heartbeat) turn, plus its per-turn
+    /// fire-consumed latch. [`run_loop`] rewrites it at the top of every turn
+    /// from the host-written `<data_root>/grant.json` snapshot (the firing
+    /// task's `effective_grant` — see [`tool_dispatch::TurnGrant`]); the
+    /// dispatch gate ([`tool_dispatch::invoke_tool`]) reads it per call to
+    /// decide whether a credentialed external action is pre-authorized. Shared
+    /// behind an `Arc<Mutex>` because `invoke_tool` only holds `&RunnerDeps`
+    /// yet must latch the fire. Default (`minimal`, and every human turn) is an
+    /// empty state that authorizes nothing — the brake stays closed.
+    pub active_grant: Arc<std::sync::Mutex<tool_dispatch::GrantGateState>>,
+    /// M22 B1: one-shot user-facing notices queued outside a turn (see
+    /// [`Notices`]). [`run_loop`] pushes here when the automatic compaction
+    /// pass fires; [`hud::TaskHud::new`] drains one note per turn into the
+    /// HUD's one-shot note slot. Default empty — no producer, no behaviour
+    /// change.
+    pub notices: Arc<Notices>,
+    /// M22 B4: live per-inbound spend counters ([`hud::TurnSpend`]) —
+    /// bumped by the provider-call layer with each completed call's
+    /// billed tokens (priced via `copperclaw_types::pricing` when the
+    /// model is known), reset by `drive_turn` at inbound entry, read by
+    /// the Task HUD for the status line's token/cost fields and the
+    /// final collapse. Default empty counters — with no provider usage
+    /// recorded, every HUD frame stays byte-identical to pre-B4.
+    pub spend: Arc<hud::TurnSpend>,
+    /// F2 safe-mode respawn: when `true`, [`run_loop`] truncates the loaded
+    /// `state.history` to a small recent window ([`RECOVERY_KEEP_MESSAGES`])
+    /// at startup — bypassing normal compaction — so a persistent
+    /// history/context problem self-heals instead of crash-looping. The host
+    /// sets it (via `runner.json`'s `recovery_mode`) once a session's
+    /// crash streak reaches its threshold; it clears as soon as a spawn
+    /// survives. Default `false` (healthy path): startup is byte-identical to
+    /// pre-F2 behaviour.
+    pub recovery_mode: bool,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -533,6 +739,10 @@ impl RunnerDeps {
             // the host's `mcp_tools.json` manifest, tests opt in explicitly.
             external_tools: Arc::new(HashMap::new()),
             max_tool_turns: DEFAULT_MAX_TOOL_TURNS,
+            // Smart auto-continue backstop: soft * 6 = 900 at the default soft
+            // cap. Extension is ON by default (hard > soft); tests that want
+            // the old flat-cap behaviour set this equal to `max_tool_turns`.
+            max_tool_turns_hard: default_max_tool_turns_hard(DEFAULT_MAX_TOOL_TURNS),
             max_task_tokens: DEFAULT_MAX_TASK_TOKENS,
             compaction: CompactionCfg {
                 model_input_window: 200_000,
@@ -587,6 +797,20 @@ impl RunnerDeps {
             // Real time by default — the S6 seam only changes behaviour
             // when a test injects a TestClock explicitly.
             clock: Arc::new(crate::clock::SystemClock),
+            // A2: the brake starts closed — no grant authorizes anything until
+            // `run_loop` loads a live grant snapshot for an autonomous fire.
+            active_grant: Arc::new(std::sync::Mutex::new(
+                tool_dispatch::GrantGateState::default(),
+            )),
+            // B1: empty notice queue — nothing rides the next HUD frame
+            // until a loop-level event (auto-compaction) pushes a note.
+            notices: Arc::new(Notices::default()),
+            // B4: empty spend counters — nothing renders until the
+            // provider-call layer records billed tokens.
+            spend: Arc::new(hud::TurnSpend::default()),
+            // F2: recovery mode off by default — the host only turns it on
+            // for a session that has crashed N times in a row.
+            recovery_mode: false,
         }
     }
 }
@@ -600,6 +824,14 @@ impl RunnerDeps {
 /// turns (`User, Assistant, ToolUse, Tool, ToolUse, Tool, ...`)
 /// without paying for a full-history walk on every poll.
 const RESUME_DEDUP_LOOKBACK: usize = 10;
+
+/// F2 safe-mode respawn: how many of the most-recent `state.history` entries
+/// the runner keeps when the host has flipped `recovery_mode` on. Deliberately
+/// small — the whole point is to shed an oversized / poison history that was
+/// crash-looping the session, keeping only enough recent context (roughly the
+/// last couple of turns) for the resumed session to stay coherent. Reused by
+/// [`crate::compaction::truncate_to_recent`] at startup; see `run_loop`.
+const RECOVERY_KEEP_MESSAGES: usize = 8;
 
 /// Returns true iff the most-recent `User` entry within the last
 /// [`RESUME_DEDUP_LOOKBACK`] history entries has the same content as
@@ -659,6 +891,46 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         let g = deps.outbound.lock().await;
         load_state(&g).context("load runner state")?
     };
+
+    // F2 safe-mode respawn: when the host has flipped `recovery_mode` on
+    // (this session's container crashed N times in a row), aggressively
+    // truncate the loaded history to a small recent window BEFORE the poll
+    // loop — bypassing the provider-driven compaction below — so a persistent
+    // oversized-history / poison-context problem self-heals instead of
+    // crash-looping forever. Reuses F1's deterministic, LLM-free
+    // `truncate_to_recent` (never a provider call — the summariser might be
+    // the very thing that was crashing). The truncated history is persisted
+    // immediately, with the continuation cleared: a shrunk transcript is
+    // incompatible with a continuation handle anchored to the pre-truncation
+    // prefix, and persisting now means a re-crash before the first turn saves
+    // still leaves the poison history off disk. A no-op when `recovery_mode`
+    // is off (the healthy path) or the history is already within the window.
+    if deps.recovery_mode {
+        let before = state.history.len();
+        state.history = crate::compaction::truncate_to_recent(
+            std::mem::take(&mut state.history),
+            RECOVERY_KEEP_MESSAGES,
+        );
+        let after = state.history.len();
+        if after != before {
+            state.continuation = None;
+            let g = deps.outbound.lock().await;
+            if let Err(err) = save_state(&g, &state.history, state.continuation.as_deref()) {
+                // Best-effort: even if the persist fails, the in-memory
+                // history is already truncated for this run, so the recovery
+                // still takes effect this spawn. Log and continue rather than
+                // bail — bailing here would itself crash-loop the runner.
+                tracing::warn!(error = %err, "recovery mode: failed to persist truncated history; continuing with in-memory truncation");
+            }
+        }
+        tracing::warn!(
+            history_before = before,
+            history_after = after,
+            keep = RECOVERY_KEEP_MESSAGES,
+            "F2 recovery mode: truncated persisted history to a recent window at startup (safe-mode respawn)"
+        );
+    }
+
     let mut turns_run: usize = 0;
     let mut first_poll = true;
 
@@ -669,6 +941,13 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     // container respawn. Byte-identical for the common single-provider case
     // (`select_start` always returns 0, no transitions).
     let failover_health = FailoverHealth::from_deps(&deps);
+
+    // M22 C2 attach seam: at startup, attach any *existing* repository
+    // already sitting under the data root — a repo handed to / persisted
+    // for this session (a clone from a prior turn, an operator-seeded
+    // checkout). Best-effort and idempotent; a repo the agent clones
+    // mid-session is caught by the matching post-turn call below.
+    project::auto_attach_pending().await;
 
     loop {
         if let Some(limit) = deps.max_turns {
@@ -767,18 +1046,39 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
 
-        // PROVENANCE / autonomy gate (Phase 3): classify this turn as
-        // autonomous when nothing in the batch is a human channel message
-        // (Chat) — i.e. it was driven by a scheduled `Task` fire or a wake.
-        // Autonomous turns may search memory and propose but may NOT take a
-        // credentialed external action (read-then-propose). `approved` is
-        // wired `false` here: the live fresh-approval grant is a host
-        // follow-up (see the policy / memory module docs) — until then a
-        // tainted turn stays blocked, which is the safe default.
+        // PROVENANCE / autonomy gate: classify this turn as autonomous when
+        // nothing in the batch is a human channel message (Chat) — i.e. it was
+        // driven by a scheduled `Task` fire or a wake. Autonomous turns may
+        // search memory and propose but may NOT take a credentialed external
+        // action UNLESS a live, human-approved capability grant (M22 A1) for the
+        // firing task permits that specific action (M22 A2, decision (b)).
+        //
+        // `set_turn_provenance`'s `approved` stays wired `false`: it is the
+        // *blanket* taint-clearing bool and must never be flipped on for an
+        // autonomous turn. The grant is capability-scoped, never blanket — the
+        // per-call decision (which action is pre-authorized, and consuming its
+        // fire) lives in `tool_dispatch::invoke_tool`, which reads
+        // `deps.active_grant`. Here we resolve the firing task's grant snapshot
+        // and stash it (or clear it for a human turn).
         let autonomous = !formatted
             .rows
             .iter()
             .any(|r| r.kind == copperclaw_types::MessageKind::Chat);
+        {
+            let grant = if autonomous {
+                let task_id = firing_task_id(&formatted.rows);
+                load_turn_grant(&deps.compaction.data_root, task_id.as_deref(), Utc::now())
+            } else {
+                None
+            };
+            let mut gate = match deps.active_grant.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Reset the per-turn fire latch, then install this turn's grant.
+            gate.fire_consumed = false;
+            gate.grant = grant;
+        }
         deps.tool_ctx.set_turn_provenance(autonomous, false);
 
         // Surface child-agent failure notices to the user channel
@@ -840,9 +1140,44 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             // token count at the trigger point.
             copperclaw_metrics::inc_compaction_triggered(deps.policy.profile().as_str());
             copperclaw_metrics::observe_compaction_estimated_tokens(est_tokens as u64);
-            state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
-                .await
-                .context("compaction failed")?;
+            // F1 (2026-07-18 incident): compaction must NEVER crash the
+            // runner. An empty/failed summary used to `bail!`, which
+            // propagated here as a fatal `?` and exited `run_loop`; the host
+            // respawned into the same oversized history and the same empty
+            // summary — an infinite crash-loop that bricked the session until
+            // an operator cleared history. `compact()` now degrades every
+            // failure (empty summary, provider error, archive write) to
+            // deterministic truncation and returns Ok. The `HeartbeatTicker`
+            // keeps the container marked alive across the (possibly slow)
+            // summary provider call so the host supervisor doesn't SIGKILL a
+            // healthy compaction as "stale". The Err arm is defense-in-depth:
+            // if some future internal error ever escaped `compact()`, continue
+            // with a truncated tail rather than exiting the loop.
+            let before_len = state.history.len();
+            state.history = {
+                let _hb = provider_call::HeartbeatTicker::start(deps.heartbeat_path.clone());
+                match compact(state.history, deps.provider.as_ref(), &deps.compaction).await {
+                    Ok(compacted) => compacted,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "compaction returned an unexpected error; continuing with truncated history"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+            // B1: the automatic path used to be silent (only the /compact
+            // slash path confirmed to the user). No TaskHud exists yet —
+            // this runs before drive_turn — so queue a one-shot note the
+            // next turn's HUD drains onto its first frame (rich channels)
+            // or periodic status row (bare channels). Kept short: it rides
+            // a HUD summary capped at MAX_SUMMARY_CHARS (200).
+            deps.notices.push(format!(
+                "history auto-compacted ({before_len} msgs -> {}, ~{}k tokens)",
+                state.history.len(),
+                est_tokens.div_ceil(1000),
+            ));
         }
 
         // Resume-after-crash guard — see `is_prompt_already_in_history`.
@@ -890,6 +1225,12 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             save_state(&g, &state.history, state.continuation.as_deref())
                 .context("save runner state")?;
         }
+        // M22 C2 attach seam: a turn just completed and may have `git
+        // clone`d an existing repository via `shell` (decision (a) — no
+        // git MCP tool). Attach any newly-cloned, not-yet-attached repo
+        // now, before the next turn reasons about it. Idempotent + gated
+        // on an `origin` remote, so blank prototypes are never touched.
+        project::auto_attach_pending().await;
         turns_run += 1;
         // Active path: poll faster when traffic is flowing.
         sleep(Duration::from_millis(ACTIVE_POLL_INTERVAL_MS)).await;
@@ -924,6 +1265,57 @@ fn build_inbound_context_block(
         history.len()
     };
     self::prompt::render_conversation_context(rows, depth)
+}
+
+/// M22 A2: filename of the host-written capability-grant snapshot, sitting
+/// alongside `tasks.json` under the session data root (`/data` in-container).
+/// The host writes the firing task's `effective_grant` here at fire/spawn time
+/// (companion plumbing — see the A2 security review); the runner reads it at
+/// turn start. Absent file ⇒ no grant ⇒ the autonomy brake stays closed.
+pub(super) const GRANT_SNAPSHOT_FILENAME: &str = "grant.json";
+
+/// The task id that fired this autonomous turn, if any. A scheduled fire is a
+/// `kind: Task` inbound row carrying `content.task_id` (and `series_id = task
+/// id`) — see the sweep's `checks/scheduling.rs`. We read `content.task_id`
+/// first and fall back to `series_id` so either encoding resolves.
+fn firing_task_id(rows: &[MessageInRow]) -> Option<String> {
+    rows.iter()
+        .find(|r| r.kind == copperclaw_types::MessageKind::Task)
+        .and_then(|r| {
+            r.content
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| r.series_id.clone())
+        })
+}
+
+/// Load the live capability grant for `task_id` from the host-written snapshot
+/// under `data_root`, or `None` when there is no usable grant. Returns `Some`
+/// only when the snapshot exists, parses, its `task_id` matches the firing task
+/// (a stale snapshot for a *different* task can never authorize this fire), and
+/// it is still live at `now` ([`tool_dispatch::TurnGrant::is_live`] — a
+/// defence-in-depth re-check on top of the host's `effective_grant`). Every
+/// failure path returns `None` — the brake fails closed.
+fn load_turn_grant(
+    data_root: &std::path::Path,
+    task_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<tool_dispatch::TurnGrant> {
+    let path = data_root.join(GRANT_SNAPSHOT_FILENAME);
+    let bytes = std::fs::read(&path).ok()?;
+    let grant: tool_dispatch::TurnGrant = serde_json::from_slice(&bytes).ok()?;
+    if let Some(tid) = task_id {
+        if grant.task_id != tid {
+            tracing::warn!(
+                snapshot_task = %grant.task_id,
+                firing_task = %tid,
+                "grant snapshot task id does not match the firing task; ignoring"
+            );
+            return None;
+        }
+    }
+    grant.is_live(now).then_some(grant)
 }
 
 /// Inputs for one end-of-turn `usage_report` system row.
@@ -1352,9 +1744,9 @@ async fn finalize_messages(
 /// channel the inbound came in on. Idempotent at the per-row level
 /// because each inbound has a stable id that flows into `in_reply_to`.
 ///
-/// `reason` is a short phrase from `TurnOutcome::Failed` ("the agent
-/// ran out of turns after 60 tool calls without finishing the task",
-/// "the model's provider call did not return a complete response",
+/// `reason` is a short phrase from `TurnOutcome::Failed` ("stopped after
+/// 900 tool turns (hit the 900 hard ceiling) — send 'continue' to keep
+/// going", "the model's provider call did not return a complete response",
 /// etc.) which we splice into the apology so the user knows
 /// *which* snag instead of being told to "see runner stderr".
 fn apology_text(reason: &str) -> String {
@@ -1734,6 +2126,77 @@ mod tests {
         };
         insert_in(inbound, &msg).unwrap();
         id
+    }
+
+    // ── M22 B1: the loop-level notice queue ─────────────────────────────
+
+    #[test]
+    fn notices_drain_one_is_fifo_one_at_a_time() {
+        let notices = Notices::default();
+        assert!(notices.drain_one().is_none(), "empty queue drains nothing");
+        notices.push("first");
+        notices.push("second");
+        assert_eq!(
+            notices.drain_one().as_deref(),
+            Some("first"),
+            "notes drain oldest-first"
+        );
+        assert_eq!(notices.drain_one().as_deref(), Some("second"));
+        assert!(notices.drain_one().is_none(), "drained queue is empty");
+    }
+
+    /// B1 producer pin: when the automatic compaction pass fires inside
+    /// `run_loop` (before `drive_turn` — no TaskHud exists yet), it queues
+    /// the one-shot "history auto-compacted" note. This turn's HUD drains
+    /// it, but a fast pure-text turn on a bare channel renders no frame
+    /// and no status row, so finalize requeues it — after the loop exits
+    /// the note is waiting for the next turn's HUD.
+    #[tokio::test]
+    async fn run_loop_auto_compaction_queues_a_notice() {
+        let mut setup = build_setup(vec![
+            // The compaction pass's summary-model call.
+            vec![ProviderEvent::Result {
+                text: Some("SUMMARY: earlier deployment chatter".into()),
+            }],
+            // The turn's ordinary reply.
+            vec![ProviderEvent::Result {
+                text: Some("still here".into()),
+            }],
+        ]);
+        // Trip the soft trigger well below the pre-saved history's
+        // estimate (6 x ~240 chars ≈ 400+ est tokens).
+        setup.deps.compaction.soft_target_tokens = 50;
+        let history: Vec<HistoryMessage> = (0..6)
+            .map(|i| HistoryMessage::User {
+                content: format!(
+                    "filler message number {i}: {}",
+                    "lorem ipsum dolor sit amet ".repeat(8)
+                ),
+            })
+            .collect();
+        {
+            let g = setup.deps.outbound.lock().await;
+            save_state(&g, &history, None).unwrap();
+        }
+        {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "and what happened next?");
+        }
+        let notices = Arc::clone(&setup.deps.notices);
+        run_loop(setup.deps).await.unwrap();
+
+        let note = notices
+            .drain_one()
+            .expect("auto-compaction must queue a notice (requeued by the unrendering turn)");
+        assert!(
+            note.starts_with("history auto-compacted (6 msgs -> "),
+            "note carries the pre-compaction entry count: {note}"
+        );
+        assert!(
+            note.ends_with("k tokens)"),
+            "note carries the estimated token size: {note}"
+        );
+        assert!(notices.drain_one().is_none(), "exactly one notice queued");
     }
 
     #[tokio::test]
@@ -2833,6 +3296,74 @@ mod tests {
         deps
     }
 
+    /// F2 (B): a runner spawned with `recovery_mode = true` truncates its
+    /// oversized persisted history to the small recent window at startup —
+    /// before any turn — and clears the continuation (a shrunk transcript is
+    /// incompatible with a continuation anchored to the old prefix).
+    /// `max_turns = Some(0)` returns right after the startup truncation, so
+    /// the provider is never queried.
+    #[tokio::test]
+    async fn recovery_mode_truncates_history_at_startup() {
+        let provider = PlanProvider::new(vec![]);
+        let mut deps = deps_with_provider(provider, Duration::from_secs(5));
+        deps.recovery_mode = true;
+        deps.max_turns = Some(0);
+        let outbound = deps.outbound.clone();
+        // Seed a large persisted history + a continuation token.
+        let big: Vec<HistoryMessage> = (0..50)
+            .map(|i| HistoryMessage::User {
+                content: format!("m{i}"),
+            })
+            .collect();
+        {
+            let g = outbound.lock().await;
+            save_state(&g, &big, Some("cont-token")).unwrap();
+        }
+        run_loop(deps).await.unwrap();
+        let g = outbound.lock().await;
+        let st = load_state(&g).unwrap();
+        assert_eq!(
+            st.history.len(),
+            RECOVERY_KEEP_MESSAGES,
+            "recovery mode must truncate to the recent window"
+        );
+        assert!(
+            st.continuation.is_none(),
+            "truncation must clear the continuation handle"
+        );
+        // The tail was kept (most-recent messages survive).
+        assert!(matches!(
+            st.history.last(),
+            Some(HistoryMessage::User { content }) if content == "m49"
+        ));
+    }
+
+    /// F2 (B) default-safe guard: with `recovery_mode` off (the healthy path)
+    /// the persisted history and continuation are byte-identical after
+    /// startup — no truncation happens for a non-crashing session.
+    #[tokio::test]
+    async fn no_recovery_mode_leaves_history_untouched() {
+        let provider = PlanProvider::new(vec![]);
+        let mut deps = deps_with_provider(provider, Duration::from_secs(5));
+        // recovery_mode stays false (RunnerDeps::minimal default).
+        deps.max_turns = Some(0);
+        let outbound = deps.outbound.clone();
+        let big: Vec<HistoryMessage> = (0..50)
+            .map(|i| HistoryMessage::User {
+                content: format!("m{i}"),
+            })
+            .collect();
+        {
+            let g = outbound.lock().await;
+            save_state(&g, &big, Some("cont-token")).unwrap();
+        }
+        run_loop(deps).await.unwrap();
+        let g = outbound.lock().await;
+        let st = load_state(&g).unwrap();
+        assert_eq!(st.history.len(), 50, "healthy path: history untouched");
+        assert_eq!(st.continuation.as_deref(), Some("cont-token"));
+    }
+
     #[tokio::test]
     async fn retry_succeeds_after_one_503() {
         let provider = PlanProvider::new(vec![
@@ -3602,24 +4133,31 @@ mod tests {
             .unwrap();
         match turn.outcome {
             TurnOutcome::Failed(reason) => {
+                // `noop_loop` isn't in the tool_map, so every call errors → the
+                // block scores no progress and the smart auto-continue budget
+                // stops the run at the soft cap. The point still stands: the
+                // (disabled) per-task token budget is NOT what ended the run.
                 assert!(
-                    reason.contains("ran out of turns"),
-                    "with the budget disabled the turn cap must be what stops it: {reason:?}"
+                    reason.contains("no visible progress"),
+                    "with the budget disabled the soft-cap stop must be what ends it: {reason:?}"
                 );
                 assert!(
                     !reason.contains("task budget"),
                     "budget abort must not fire when disabled: {reason:?}"
                 );
             }
-            TurnOutcome::Done => panic!("expected the turn-cap breaker to stop the loop"),
+            TurnOutcome::Done => panic!("expected the soft-cap stop to end the loop"),
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn task_budget_independent_of_max_turns_breaker() {
-        // Per-task budget set high enough that it never trips; the loop
-        // must still bail on `max_tool_turns` exactly as before. Proves
-        // adding the budget check didn't disturb the existing breaker.
+        // Per-task budget set high enough that it never trips; the loop must
+        // still bail on the tool-turn cap. `looping_turn_with_usage` calls
+        // `noop_loop` (absent from the tool_map → every call errors), so the
+        // block makes no progress and the smart auto-continue budget stops it
+        // at the soft cap of 3. Proves the token budget check didn't disturb
+        // the turn-cap stop.
         let scripts: Vec<Vec<ProviderEvent>> = (0..10)
             .map(|_| looping_turn_with_usage(1_000, 1_000))
             .collect();
@@ -3633,10 +4171,10 @@ mod tests {
             .unwrap();
         match turn.outcome {
             TurnOutcome::Failed(reason) => assert!(
-                reason.contains("ran out of turns after 3"),
-                "max-turns breaker must still fire independently: {reason:?}"
+                reason.contains("no visible progress") && reason.contains("3 tool turns"),
+                "the soft-cap stop must still fire independently of the token budget: {reason:?}"
             ),
-            TurnOutcome::Done => panic!("expected the max-turns breaker to stop the loop"),
+            TurnOutcome::Done => panic!("expected the soft-cap stop to end the loop"),
         }
     }
 
@@ -3777,6 +4315,72 @@ mod tests {
     fn resolve_max_task_tokens_rejects_garbage() {
         let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "lots")]);
         assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    // ── smart auto-continue: resolve_max_tool_turns_hard (test (f)) ──────
+
+    #[test]
+    fn resolve_hard_defaults_to_soft_times_six_when_unset() {
+        // Fresh install: no env → soft * 6. At the default soft cap of 150
+        // that's 900 — the SAFE default the design calls out.
+        let env = crate::config::MapEnv::default();
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 900);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 10), 60);
+    }
+
+    #[test]
+    fn resolve_hard_default_is_clamped_to_absolute_max() {
+        // soft * 6 would be 3000 for soft = 500; the default is clamped to the
+        // absolute ceiling so even a maxed-out soft cap can't push it past it.
+        let env = crate::config::MapEnv::default();
+        assert_eq!(
+            resolve_max_tool_turns_hard(&env, 500),
+            MAX_MAX_TOOL_TURNS_HARD
+        );
+    }
+
+    #[test]
+    fn resolve_hard_uses_env_when_in_range() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "600")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 600);
+    }
+
+    #[test]
+    fn resolve_hard_equal_to_soft_is_honoured_and_disables_extension() {
+        // Setting the ceiling EQUAL to the soft cap is a legitimate config
+        // (extension off / flat cap), so it is returned verbatim.
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "150")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 150);
+    }
+
+    #[test]
+    fn resolve_hard_below_soft_clamps_up_to_soft() {
+        // A ceiling below the soft cap would bail before a block completes —
+        // clamp it up to soft (which disables extension) rather than honour it.
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "40")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 150);
+    }
+
+    #[test]
+    fn resolve_hard_above_absolute_max_clamps_down() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "99999")]);
+        assert_eq!(
+            resolve_max_tool_turns_hard(&env, 150),
+            MAX_MAX_TOOL_TURNS_HARD
+        );
+    }
+
+    #[test]
+    fn resolve_hard_rejects_garbage_and_uses_default() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TOOL_TURNS_HARD_ENV, "soon")]);
+        assert_eq!(resolve_max_tool_turns_hard(&env, 150), 900);
+    }
+
+    #[test]
+    fn default_hard_never_below_soft() {
+        // Even a pathological tiny soft cap keeps hard >= soft.
+        assert!(default_max_tool_turns_hard(1) >= 1);
+        assert_eq!(default_max_tool_turns_hard(1), 6);
     }
 
     // ── F2: actionable "I'm blocked" wall cards ─────────────────────────
@@ -3984,5 +4588,107 @@ mod tests {
         // The generic terminal-failure card, unchanged by F2.
         assert_eq!(card.title, "I couldn't finish that reply");
         assert!(!card.title.starts_with("Blocked:"));
+    }
+
+    // ── M22 A2: firing-task resolution + grant snapshot load ──────────────
+
+    fn task_row(task_id: Option<&str>, series: Option<&str>) -> MessageInRow {
+        MessageInRow {
+            id: MessageId::new(),
+            seq: 1,
+            kind: MessageKind::Task,
+            timestamp: Utc::now(),
+            status: "pending".into(),
+            process_after: None,
+            recurrence: None,
+            series_id: series.map(str::to_string),
+            tries: 0,
+            trigger: true,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            content: match task_id {
+                Some(t) => serde_json::json!({"text": "do it", "task_id": t}),
+                None => serde_json::json!({"text": "do it"}),
+            },
+            source_session_id: None,
+            on_wake: true,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    #[test]
+    fn firing_task_id_reads_content_then_series() {
+        // The sweep writes both `content.task_id` and `series_id`; content wins.
+        assert_eq!(
+            firing_task_id(&[task_row(Some("t-42"), Some("t-99"))]),
+            Some("t-42".to_string())
+        );
+        // Falls back to series_id when content lacks task_id.
+        assert_eq!(
+            firing_task_id(&[task_row(None, Some("t-99"))]),
+            Some("t-99".to_string())
+        );
+        // No Task row → no firing task.
+        assert_eq!(firing_task_id(&[]), None);
+    }
+
+    /// Write a grant snapshot into `dir` and return it.
+    fn write_grant_snapshot(dir: &std::path::Path, grant: &tool_dispatch::TurnGrant) {
+        let bytes = serde_json::to_vec_pretty(grant).unwrap();
+        std::fs::write(dir.join(GRANT_SNAPSHOT_FILENAME), bytes).unwrap();
+    }
+
+    fn snapshot_grant(task_id: &str, scope: &str) -> tool_dispatch::TurnGrant {
+        tool_dispatch::TurnGrant {
+            grant_id: "g-1".into(),
+            task_id: task_id.into(),
+            capability_scope: scope.into(),
+            tokens_remaining: Some(1000),
+            fires_remaining: Some(5),
+            expires_at: Some(Utc::now() + chrono::Duration::days(30)),
+        }
+    }
+
+    #[test]
+    fn load_turn_grant_matches_task_and_liveness() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_grant_snapshot(
+            tmp.path(),
+            &snapshot_grant("t-1", "web_fetch send_message:telegram"),
+        );
+        let now = Utc::now();
+        // Matching task id + live → loaded.
+        let g = load_turn_grant(tmp.path(), Some("t-1"), now).unwrap();
+        assert_eq!(g.grant_id, "g-1");
+        assert!(g.permits("web_fetch"));
+        assert!(g.permits("send_message:telegram"));
+        assert!(!g.permits("send_email"));
+    }
+
+    #[test]
+    fn load_turn_grant_rejects_task_id_mismatch() {
+        // A stale snapshot for a DIFFERENT task must never authorize this fire.
+        let tmp = tempfile::tempdir().unwrap();
+        write_grant_snapshot(tmp.path(), &snapshot_grant("t-other", "web_fetch"));
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+    }
+
+    #[test]
+    fn load_turn_grant_absent_or_inert_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No file → None (brake stays closed).
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+        // Expired snapshot → None (defence-in-depth liveness re-check).
+        let mut g = snapshot_grant("t-1", "web_fetch");
+        g.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        write_grant_snapshot(tmp.path(), &g);
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+        // Exhausted fires → None.
+        let mut g = snapshot_grant("t-1", "web_fetch");
+        g.fires_remaining = Some(0);
+        write_grant_snapshot(tmp.path(), &g);
+        assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
     }
 }

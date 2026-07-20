@@ -13,6 +13,7 @@ pub mod approval_intercept;
 pub mod attestation;
 pub mod boot;
 pub mod channels_init;
+pub mod child_reaper;
 pub mod config;
 pub mod container_manager;
 pub mod context;

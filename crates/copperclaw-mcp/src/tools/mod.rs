@@ -26,20 +26,24 @@ pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
 pub mod computer_use;
+pub mod conditions;
 pub mod copy_file;
 pub mod core;
 pub mod diagnostics;
 pub(crate) mod diff_util;
 pub mod edit_file;
 pub mod explore;
+pub mod find_symbol;
 pub mod git_blame;
 pub(crate) mod git_common;
 pub mod git_diff;
 pub mod git_log;
 pub mod git_status;
 pub mod glob;
+pub mod goals;
 pub mod grep;
 pub mod interactive;
+pub mod list_skills;
 pub mod load_skill;
 pub mod memory;
 pub mod multi_edit;
@@ -100,6 +104,19 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         scheduling::pause_task::entry(),
         scheduling::resume_task::entry(),
         scheduling::update_task::entry(),
+        // M22 A3: first-class long-running goals — durable objectives the sweep
+        // drives check-ins against (create/list/update). Registered alongside
+        // the scheduling tools they extend (a goal indexes over the scheduler).
+        goals::create_goal::entry(),
+        goals::list_goals::entry(),
+        goals::update_goal::entry(),
+        // M22 A4: durable event-driven condition wakes (revives the dormant
+        // sweep condition check-in) + the settable flag latch a `flag`
+        // condition watches. Registered alongside the scheduling/goal tools
+        // they sit beside — a condition is an event-triggered sibling of a
+        // scheduled task.
+        conditions::register_condition::entry(),
+        conditions::set_condition_flag::entry(),
         computer_use::shell::entry(),
         edit_file::entry(),
         multi_edit::entry(),
@@ -142,9 +159,17 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         git_status::entry(),
         glob::entry(),
         grep::entry(),
+        // M22 C3: read-only symbol navigation (go-to-def / find-refs / hover)
+        // backed by the container-local ctags/LSP index bridge, degrading to
+        // on-demand ctags then a scoped definition scan.
+        find_symbol::entry(),
         web_search::entry(),
         explore::entry(),
         load_skill::entry(),
+        // M22 S3: read-only enumeration of the session's selected skills
+        // (name + version + description), the list companion to load_skill /
+        // save_skill. Rides the READONLY_TOOLS policy tier.
+        list_skills::entry(),
         memory::memory_search::entry(),
         memory::memory_get::entry(),
         memory::memory_save::entry(),
@@ -250,6 +275,11 @@ mod tests {
             "pause_task",
             "resume_task",
             "update_task",
+            "create_goal",
+            "list_goals",
+            "update_goal",
+            "register_condition",
+            "set_condition_flag",
             "shell",
             "edit_file",
             "multi_edit",
@@ -270,9 +300,11 @@ mod tests {
             "git_status",
             "glob",
             "grep",
+            "find_symbol",
             "web_search",
             "explore",
             "load_skill",
+            "list_skills",
             "memory_search",
             "memory_get",
             "memory_save",

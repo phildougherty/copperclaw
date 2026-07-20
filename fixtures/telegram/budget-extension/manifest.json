@@ -1,0 +1,21 @@
+{
+  "name": "telegram-budget-extension",
+  "channel": "telegram",
+  "description": "M22 Wave 0: the smart auto-continue Continue path, pinned end-to-end. Soft tool-turn budget 2, hard ceiling 8 (the first fixture to split them via max_tool_turns_hard): four scripted shell turns all make real progress, so two full soft-cap blocks complete and the budget is extended silently each time, then the fifth turn returns the final text. The expected streams pin what the user sees TODAY at each extension: nothing beyond the ordinary HUD frames — no Continue note, no checkpoint message. Wave 2's B2 budget-extension HUD note will land as a reviewable diff here. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 10000
+  },
+  "model_rich_breadcrumbs": true,
+  "max_tool_turns": 2,
+  "max_tool_turns_hard": 8,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "\\| [0-9]+:[0-9]{2}": "| <MMSS>",
+    "done in [0-9]+:[0-9]{2}": "done in <MMSS>"
+  }
+}

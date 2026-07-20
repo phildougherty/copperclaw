@@ -141,11 +141,14 @@ pub async fn handle(
     }
     crate::tools::verify_gate::mark_dirty_for_write(ctx, &result.path).await;
 
-    Ok(success_json(&json!({
+    // M22 C1: append the post-edit verify digest (see `edit_file`).
+    let mut out = json!({
         "path": result.path,
         "edits_applied": result.edits_applied,
         "total_replacements": result.total_replacements,
-    })))
+    });
+    crate::tools::diagnostics::append_post_edit_digest(&mut out, &result.path).await;
+    Ok(success_json(&out))
 }
 
 struct MultiEditOutcome {

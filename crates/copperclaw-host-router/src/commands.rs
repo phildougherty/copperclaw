@@ -76,6 +76,9 @@ pub enum SlashCommand {
     /// `/clear`, `/reset`, or `/new` — pass through to the runner's
     /// clear-history sentinel.
     Clear,
+    /// `/projects` — host-side synthesized reply listing the session's
+    /// workspaces (like `/status`, the runner is never woken).
+    Projects,
 }
 
 impl SlashCommand {
@@ -106,6 +109,7 @@ impl SlashCommand {
             "/status" => Some(Self::Status),
             "/compact" => Some(Self::Compact),
             "/clear" | "/reset" | "/new" => Some(Self::Clear),
+            "/projects" => Some(Self::Projects),
             _ => None,
         }
     }
@@ -135,6 +139,7 @@ impl SlashCommand {
             Self::Status => "/status",
             Self::Compact => "/compact",
             Self::Clear => "/clear",
+            Self::Projects => "/projects",
         }
     }
 
@@ -146,8 +151,124 @@ impl SlashCommand {
             Self::Status => "status",
             Self::Compact => "compact",
             Self::Clear => "clear",
+            Self::Projects => "projects",
         }
     }
+}
+
+/// The one end-user command that carries an argument: `/switch <name>`,
+/// with its argument already validated (or rejected) at parse time.
+///
+/// `/switch` picks (creating if needed) the active workspace under the
+/// session's `/data` dir. Unlike every [`SlashCommand`], its parse must
+/// accept EXACTLY one trailing token — the workspace name — so it can't
+/// live on the bare-token [`SlashCommand::parse`] path. [`ParsedCommand`]
+/// unifies the two so the router detects both in one pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchTarget {
+    /// `/switch <name>` where `<name>` passed [`validate_workspace_name`].
+    Valid(String),
+    /// `/switch` invoked but the argument is missing, extra, or invalid.
+    /// Carries the offending raw argument (empty when none was supplied)
+    /// so the host reply can explain the naming rule.
+    Invalid(String),
+}
+
+/// A recognised end-user command: a bare [`SlashCommand`] or the
+/// argument-bearing `/switch <name>`. The router detects this once per
+/// inbound event; a `Some(_)` result also bypasses the mention gate,
+/// exactly like a bare command does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedCommand {
+    /// A bare single-token command (`/stop`, `/status`, `/projects`, …).
+    Bare(SlashCommand),
+    /// `/switch <name>` with its argument validated or rejected.
+    Switch(SwitchTarget),
+}
+
+impl ParsedCommand {
+    /// Detect a command on an inbound event. Only plain `Chat` messages
+    /// qualify (mirrors [`SlashCommand::detect`]).
+    #[must_use]
+    pub fn detect(event: &InboundEvent) -> Option<Self> {
+        if event.message.kind != MessageKind::Chat {
+            return None;
+        }
+        let text = event
+            .message
+            .content
+            .get("text")
+            .and_then(serde_json::Value::as_str)?;
+        Self::parse(text)
+    }
+
+    /// Parse `text` as either a bare command or `/switch <name>`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+        // Bare single-token commands take precedence and stay
+        // byte-identical to the legacy parse.
+        if let Some(cmd) = SlashCommand::parse(trimmed) {
+            return Some(Self::Bare(cmd));
+        }
+        parse_switch(trimmed).map(Self::Switch)
+    }
+
+    /// Machine label for `content.command` / metrics (`inc_slash_command`).
+    #[must_use]
+    pub fn op(&self) -> &'static str {
+        match self {
+            Self::Bare(cmd) => cmd.op(),
+            Self::Switch(_) => "switch",
+        }
+    }
+}
+
+/// Parse a `/switch <name>` invocation. Returns `None` when the leading
+/// token isn't `/switch` (possibly `@bot`-suffixed / oddly cased); once
+/// it IS `/switch`, always returns a [`SwitchTarget`] — a missing, extra,
+/// or invalid argument yields [`SwitchTarget::Invalid`] so the operator
+/// gets the naming rule rather than the command falling silently through
+/// to the model.
+fn parse_switch(trimmed: &str) -> Option<SwitchTarget> {
+    let mut tokens = trimmed.split_whitespace();
+    let head = tokens.next()?;
+    let bare = head.split('@').next().unwrap_or(head);
+    if !bare.eq_ignore_ascii_case("/switch") {
+        return None;
+    }
+    let arg = tokens.next();
+    // Any further tokens make this an ambiguous multi-word invocation:
+    // reject rather than guess which token is the workspace name.
+    let has_extra = tokens.next().is_some();
+    match arg {
+        Some(name) if !has_extra && validate_workspace_name(name) => {
+            Some(SwitchTarget::Valid(name.to_owned()))
+        }
+        Some(name) => Some(SwitchTarget::Invalid(name.to_owned())),
+        None => Some(SwitchTarget::Invalid(String::new())),
+    }
+}
+
+/// Validate a `/switch` workspace name. The name becomes a single path
+/// segment directly under the session's `/data` dir, so it MUST NOT let
+/// the caller escape that dir: reject anything but `^[A-Za-z0-9._-]+$`,
+/// and reject the `.`/`..` traversal names and path separators explicitly
+/// (both are also outside the character class, so the checks are belt and
+/// braces).
+#[must_use]
+pub fn validate_workspace_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 /// Build the `messages_in.content` for a `/stop` control row. See the
@@ -268,6 +389,119 @@ mod tests {
         assert_eq!(SlashCommand::parse("/clear"), Some(SlashCommand::Clear));
         assert_eq!(SlashCommand::parse("/reset"), Some(SlashCommand::Clear));
         assert_eq!(SlashCommand::parse("/new"), Some(SlashCommand::Clear));
+        assert_eq!(
+            SlashCommand::parse("/projects"),
+            Some(SlashCommand::Projects)
+        );
+    }
+
+    #[test]
+    fn projects_canonical_and_op() {
+        assert_eq!(SlashCommand::Projects.canonical(), "/projects");
+        assert_eq!(SlashCommand::Projects.op(), "projects");
+    }
+
+    #[test]
+    fn parsed_command_wraps_bare_commands_byte_identically() {
+        // `/switch` must not disturb the existing bare-command parses.
+        for (text, cmd) in [
+            ("/stop", SlashCommand::Stop),
+            ("/status", SlashCommand::Status),
+            ("/compact", SlashCommand::Compact),
+            ("/clear", SlashCommand::Clear),
+            ("/projects", SlashCommand::Projects),
+        ] {
+            assert_eq!(ParsedCommand::parse(text), Some(ParsedCommand::Bare(cmd)));
+        }
+        // A command with trailing words is still prose, not a command
+        // (unchanged behaviour; only `/switch` opts into an argument).
+        assert_eq!(ParsedCommand::parse("/status now"), None);
+        assert_eq!(ParsedCommand::parse("hello there"), None);
+        assert_eq!(ParsedCommand::parse("/frobnicate x"), None);
+    }
+
+    #[test]
+    fn parse_switch_valid_names() {
+        assert_eq!(
+            ParsedCommand::parse("/switch fairway-focus"),
+            Some(ParsedCommand::Switch(SwitchTarget::Valid(
+                "fairway-focus".into()
+            )))
+        );
+        // `@bot` suffix + odd casing on the command token still parse.
+        assert_eq!(
+            ParsedCommand::parse("  /SWITCH@ReplayBot  notes_v2  "),
+            Some(ParsedCommand::Switch(SwitchTarget::Valid(
+                "notes_v2".into()
+            )))
+        );
+        assert_eq!(
+            ParsedCommand::parse("/switch app.py"),
+            Some(ParsedCommand::Switch(SwitchTarget::Valid("app.py".into())))
+        );
+    }
+
+    #[test]
+    fn parse_switch_rejects_traversal_and_separators() {
+        // Each of these IS a `/switch` invocation, so it parses to a
+        // command (bypasses the mention gate + gets a host reply) but the
+        // argument is flagged Invalid so the host explains the rule.
+        for bad in ["..", ".", "../etc", "a/b", "a\\b", "/etc/passwd", "foo bar"] {
+            match ParsedCommand::parse(&format!("/switch {bad}")) {
+                Some(ParsedCommand::Switch(SwitchTarget::Invalid(_))) => {}
+                other => panic!("`/switch {bad}` must reject the name, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_switch_missing_arg_is_invalid_not_none() {
+        assert_eq!(
+            ParsedCommand::parse("/switch"),
+            Some(ParsedCommand::Switch(SwitchTarget::Invalid(String::new())))
+        );
+    }
+
+    #[test]
+    fn parsed_command_op_labels() {
+        assert_eq!(ParsedCommand::Bare(SlashCommand::Projects).op(), "projects");
+        assert_eq!(
+            ParsedCommand::Switch(SwitchTarget::Valid("x".into())).op(),
+            "switch"
+        );
+        assert_eq!(
+            ParsedCommand::Switch(SwitchTarget::Invalid(String::new())).op(),
+            "switch"
+        );
+    }
+
+    #[test]
+    fn validate_workspace_name_rules() {
+        assert!(validate_workspace_name("foo"));
+        assert!(validate_workspace_name("foo-bar_baz.v2"));
+        assert!(validate_workspace_name("A1"));
+        // Escape / traversal attempts.
+        assert!(!validate_workspace_name(""));
+        assert!(!validate_workspace_name("."));
+        assert!(!validate_workspace_name(".."));
+        assert!(!validate_workspace_name("a/b"));
+        assert!(!validate_workspace_name("a\\b"));
+        assert!(!validate_workspace_name("/abs"));
+        assert!(!validate_workspace_name("../up"));
+        assert!(!validate_workspace_name("has space"));
+        assert!(!validate_workspace_name("weird*char"));
+        assert!(!validate_workspace_name("emoji😀"));
+    }
+
+    #[test]
+    fn detect_switch_only_matches_chat_kind() {
+        let mut ev = chat_event("/switch notes");
+        assert_eq!(
+            ParsedCommand::detect(&ev),
+            Some(ParsedCommand::Switch(SwitchTarget::Valid("notes".into())))
+        );
+        ev.message.kind = MessageKind::Webhook;
+        assert_eq!(ParsedCommand::detect(&ev), None);
     }
 
     #[test]

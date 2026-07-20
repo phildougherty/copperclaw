@@ -8,6 +8,9 @@
 //!   plaintext. Adapters migrate onto it over time, replacing their
 //!   bespoke formatters (telegram `markdown_to_html`, slack mrkdwn,
 //!   discord escaping).
+//! - [`effective_max`] shrinks a channel's declared cap by a render-
+//!   headroom margin, because adapters render *after* the host splits and
+//!   rendering only grows the string.
 //! - [`split_into_chunks`] / [`is_balanced`] do fence-aware chunking of a
 //!   long reply into cap-sized pieces that each parse with balanced code
 //!   fences. This logic was migrated here from
@@ -20,4 +23,6 @@ mod split;
 
 pub use fence::is_balanced;
 pub use render::{Flavor, render};
-pub use split::split_into_chunks;
+pub use split::{
+    RENDER_HEADROOM_PERCENT, effective_max, split_into_chunks, split_into_chunks_within_bytes,
+};

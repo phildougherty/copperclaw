@@ -458,6 +458,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "copperclaw-channels-cli",
+ "copperclaw-channels-core",
  "copperclaw-db",
  "copperclaw-types",
  "rusqlite",
@@ -1334,6 +1336,7 @@ name = "copperclaw-skills"
 version = "0.1.0"
 dependencies = [
  "copperclaw-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

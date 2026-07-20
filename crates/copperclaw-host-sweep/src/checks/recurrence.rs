@@ -1,47 +1,65 @@
-//! Recurrence fan-out.
+//! Recurrence consolidation (M22 A5).
 //!
-//! For each `messages_in` row with a non-null `recurrence`, find the most
-//! recent member of the series (by `seq`). If that row's
-//! `process_after <= now`, parse the cron string via
-//! `copperclaw_modules::scheduling::parse_when` / `compute_next_fire` and
-//! insert a fresh `messages_in` row with the computed `next_fire`.
+//! Historically this check was a *second, per-session* recurrence engine: for
+//! each `messages_in` row with a non-null `recurrence` it self-replicated a
+//! fresh `messages_in` row at the next computed fire time. That duplicated the
+//! central `tasks` scheduler (`checks/scheduling.rs`, migration 028) and —
+//! unlike it — had no lifecycle surface: an operator could not `list` / `pause`
+//! / `resume` / `cancel` a per-session recurring series.
 //!
-//! The new row's `series_id` matches the parent's `series_id` if present,
-//! otherwise it is set to the parent's `message_id` string so the host can
-//! still correlate fan-outs back to their source row. The new row inherits
-//! the parent's kind, content, trigger / `on_wake` flags, recurrence,
-//! platform metadata, and resets `tries` to 0 (a new fan-out is a fresh
-//! attempt, not a retry of a stuck one).
+//! M22 A5 collapses the two mechanisms onto one. This module is now a
+//! **deprecation shim**: rather than self-replicate, it forwards each legacy
+//! per-session recurring series into the central `tasks` scheduler and then
+//! neutralises the source rows so the old path never fires that series again.
+//! Once forwarded, the series is a first-class `tasks` row and gains
+//! `list_tasks` / `pause_task` / `resume_task` / `cancel_task` for free.
+//!
+//! The forward is idempotent. The synthesised task id is derived
+//! deterministically from the series (`recurring:<session>:<series_key>`), so a
+//! series is migrated exactly once; and because the migration clears the
+//! `recurrence` column on the source rows, an already-migrated series no longer
+//! appears in the per-session scan on the next pass. An operator who later
+//! cancels the migrated task is respected — the deterministic id means the shim
+//! will not resurrect a task that already exists in any state.
+//!
+//! Backward compatibility: existing recurring sessions on disk (rows written
+//! before this change, or by any straggler code path that still sets
+//! `messages_in.recurrence`) are converted automatically the first time the
+//! sweep observes them. That data-path conversion lives here, at runtime,
+//! because per-session recurrence rows live in each session's `inbound.db` — a
+//! central-DB SQL migration cannot reach them, so no numbered migration is
+//! added for A5.
 
 use crate::error::SweepError;
 use crate::service::{SeriesFanout, SessionRoot};
 use chrono::{DateTime, Utc};
-use copperclaw_db::tables::messages_in::{WriteInbound, insert};
+use copperclaw_db::central::CentralDb;
+use copperclaw_db::tables::tasks::{self, NewTask};
 use copperclaw_modules::scheduling::{compute_next_fire, parse_when};
-use copperclaw_types::{AgentGroupId, ChannelType, MessageId, MessageKind, SessionId};
+use copperclaw_types::{AgentGroupId, MessageId, SessionId};
 use rusqlite::Connection;
 
+/// The newest still-recurring member of one legacy per-session series, plus
+/// the fields the shim needs to forward it into the central scheduler.
 #[derive(Debug, Clone)]
 struct RecurrenceParent {
     id: MessageId,
-    kind: MessageKind,
     recurrence: String,
     series_id: Option<String>,
-    trigger: bool,
-    on_wake: bool,
-    platform_id: Option<String>,
-    channel_type: Option<ChannelType>,
-    thread_id: Option<String>,
     content: serde_json::Value,
-    source_session_id: Option<String>,
-    // Carried onto each fan-out so the runner's per-turn context block
-    // sees the same venue shape on every member of a recurring series.
-    reply_to: Option<String>,
-    is_group: Option<bool>,
 }
 
-/// Returns one [`SeriesFanout`] per series that fired during this pass.
+/// Forward every legacy per-session recurring series in this session into the
+/// central `tasks` scheduler, returning one [`SeriesFanout`] per series
+/// consolidated during this pass.
+///
+/// This no longer inserts `messages_in` rows: the central scheduler
+/// (`checks/scheduling.rs`) owns firing from here on. Each returned
+/// [`SeriesFanout`] carries the series id, the source row's id (so operators
+/// can still correlate a consolidation back to its originating message), and
+/// the task's next computed fire time.
 pub fn check(
+    central: &CentralDb,
     root: &dyn SessionRoot,
     agent_group_id: &AgentGroupId,
     session_id: &SessionId,
@@ -53,11 +71,14 @@ pub fn check(
     for parent in parents {
         let next_fire = match compute_next(&parent.recurrence, now) {
             Ok(Some(t)) => t,
+            // A recurrence that yields no future occurrence is inert — leave the
+            // row untouched (do not migrate, do not clear) so behaviour matches
+            // the historical "skip" path exactly.
             Ok(None) => continue,
             Err(_e) => {
-                // Skip rows with unparseable cron. We could push these
-                // into a separate error list, but the host doesn't need
-                // structured visibility on each malformed row.
+                // Skip rows with unparseable cron, exactly as the pre-A5 engine
+                // did. We deliberately do NOT clear these — an operator fixing
+                // the expression out-of-band should still be able to migrate it.
                 tracing::warn!(
                     target: "copperclaw_host_sweep::recurrence",
                     recurrence = %parent.recurrence,
@@ -67,40 +88,82 @@ pub fn check(
             }
         };
 
-        let new_id = MessageId::new();
         let series_id = parent
             .series_id
             .clone()
             .unwrap_or_else(|| parent.id.as_uuid().to_string());
 
-        let write = WriteInbound {
-            id: new_id,
-            kind: parent.kind,
-            timestamp: now,
-            content: parent.content.clone(),
-            trigger: parent.trigger,
-            on_wake: parent.on_wake,
-            process_after: Some(next_fire),
-            recurrence: Some(parent.recurrence.clone()),
-            series_id: Some(series_id.clone()),
-            platform_id: parent.platform_id.clone(),
-            channel_type: parent.channel_type.clone(),
-            thread_id: parent.thread_id.clone(),
-            source_session_id: parent.source_session_id.clone(),
-            // Carry the parent's reply_to/is_group signal onto every
-            // recurrence fan-out so the runner's context-block sees the
-            // same venue shape across a recurring series.
-            reply_to: parent.reply_to.clone(),
-            is_group: parent.is_group,
-        };
-        insert(inbound.conn_mut(), &write)?;
+        // Deprecation shim: forward the series into the central `tasks`
+        // scheduler. Idempotent on the deterministic task id — if a task
+        // already exists for this series (in any status, including one an
+        // operator cancelled), we do not recreate it.
+        let task_id = migrated_task_id(session_id, &series_id);
+        if tasks::get(central, &task_id)?.is_none() {
+            tasks::insert(
+                central,
+                NewTask {
+                    id: task_id,
+                    agent_group_id: *agent_group_id,
+                    session_id: *session_id,
+                    name: Some(format!("recurring-{series_id}")),
+                    prompt: prompt_text(&parent.content),
+                    // `when_spec` is a cron string here (5/6 fields), which
+                    // `parse_when` accepts; `recurrence` re-arms it each fire.
+                    when_spec: parent.recurrence.clone(),
+                    recurrence: Some(parent.recurrence.clone()),
+                    next_fire: Some(next_fire),
+                },
+            )?;
+            // M22 A5 metric: a new central task was created for this series.
+            copperclaw_metrics::inc_recurrence_consolidated("created");
+        } else {
+            // M22 A5 metric: a central task already existed — idempotent no-op.
+            copperclaw_metrics::inc_recurrence_consolidated("already_present");
+        }
+
+        // Neutralise the legacy self-replication path for this series so the
+        // central scheduler is now the single source of truth. Clearing
+        // `recurrence` also makes the migration self-idempotent: the series
+        // stops appearing in `newest_per_series` on subsequent passes.
+        clear_series_recurrence(inbound.conn_mut(), &series_id)?;
+
         out.push(SeriesFanout {
             series_id,
-            new_message_id: new_id,
+            new_message_id: parent.id,
             next_fire,
         });
     }
     Ok(out)
+}
+
+/// Deterministic id for the central task a legacy series is forwarded into.
+/// Keyed on `(session, series)` so a series migrates exactly once, and the
+/// `recurring:` prefix keeps it from ever colliding with an agent-authored
+/// `task_<uuid>` id.
+fn migrated_task_id(session_id: &SessionId, series_id: &str) -> String {
+    format!("recurring:{}:{}", session_id.as_uuid(), series_id)
+}
+
+/// Pull the human-facing prompt out of a recurring row's content, falling back
+/// to the raw JSON when there is no `text` field.
+fn prompt_text(content: &serde_json::Value) -> String {
+    content
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| content.to_string(), str::to_owned)
+}
+
+/// Clear the `recurrence` column on every row of one series (identified by
+/// `COALESCE(series_id, id)`), so the legacy per-session path stops firing it.
+fn clear_series_recurrence(conn: &Connection, series_key: &str) -> Result<(), SweepError> {
+    conn.execute(
+        "UPDATE messages_in
+            SET recurrence = NULL
+          WHERE COALESCE(series_id, id) = ?1
+            AND recurrence IS NOT NULL",
+        rusqlite::params![series_key],
+    )?;
+    Ok(())
 }
 
 fn compute_next(recurrence: &str, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, SweepError> {
@@ -108,9 +171,9 @@ fn compute_next(recurrence: &str, now: DateTime<Utc>) -> Result<Option<DateTime<
     Ok(compute_next_fire(&when, now, Some(recurrence)))
 }
 
-/// Find the newest member of each series whose `process_after` is at or
-/// before `now`. A series is identified by `series_id` when present and by
-/// the row's own `id` otherwise (so the very first member of a series is
+/// Find the newest still-recurring member of each series whose `process_after`
+/// is at or before `now`. A series is identified by `series_id` when present
+/// and by the row's own `id` otherwise (so the very first member of a series is
 /// still correlatable).
 fn newest_per_series(
     conn: &Connection,
@@ -119,9 +182,7 @@ fn newest_per_series(
     let now_str = now.to_rfc3339();
     // Pick the row with the largest `seq` per series_id-or-id key.
     let mut stmt = conn.prepare(
-        "SELECT id, kind, process_after, recurrence, series_id,
-                trigger, on_wake, platform_id, channel_type, thread_id,
-                content, source_session_id, reply_to, is_group, seq,
+        "SELECT id, process_after, recurrence, series_id, content, seq,
                 COALESCE(series_id, id) AS series_key
          FROM messages_in
          WHERE recurrence IS NOT NULL AND TRIM(recurrence) != ''
@@ -145,7 +206,7 @@ fn newest_per_series(
                     .with_timezone(&Utc),
             ),
         };
-        // Only fan out the parent if it is at-or-past its own fire time.
+        // Only forward the parent if it is at-or-past its own fire time.
         if let Some(pa) = process_after {
             if pa.to_rfc3339() > now_str {
                 continue;
@@ -155,47 +216,17 @@ fn newest_per_series(
         let id_str: String = row.get("id")?;
         let id_uuid = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| SweepError::ScheduleParse(format!("bad uuid {id_str}: {e}")))?;
-        let kind_str: String = row.get("kind")?;
-        // Delegate to the canonical `MessageKind::parse_str` so this
-        // call site does NOT need updating every time a new variant
-        // lands (slice-3 added Breadcrumb / Diff / TodoList / Error /
-        // Thinking on top of the original six). A drift here aborts
-        // the whole session's recurrence sweep with an
-        // `unknown kind` error — strictly worse than letting the row
-        // ride for one pass.
-        let kind = MessageKind::parse_str(&kind_str)
-            .ok_or_else(|| SweepError::ScheduleParse(format!("unknown kind `{kind_str}`")))?;
         let recurrence: String = row.get("recurrence")?;
         let series_id: Option<String> = row.get("series_id")?;
-        let trigger_i: i64 = row.get("trigger")?;
-        let on_wake_i: i64 = row.get("on_wake")?;
-        let platform_id: Option<String> = row.get("platform_id")?;
-        let channel_type_str: Option<String> = row.get("channel_type")?;
-        let thread_id: Option<String> = row.get("thread_id")?;
         let content_str: String = row.get("content")?;
         let content: serde_json::Value = serde_json::from_str(&content_str)
             .map_err(|e| SweepError::ScheduleParse(format!("bad content json: {e}")))?;
-        let source_session_id: Option<String> = row.get("source_session_id")?;
-        let reply_to: Option<String> = row.get("reply_to")?;
-        let is_group: Option<bool> = {
-            let v: Option<i64> = row.get("is_group")?;
-            v.map(|n| n != 0)
-        };
 
         parents.push(RecurrenceParent {
             id: MessageId::from(id_uuid),
-            kind,
             recurrence,
             series_id,
-            trigger: trigger_i != 0,
-            on_wake: on_wake_i != 0,
-            platform_id,
-            channel_type: channel_type_str.map(ChannelType::from),
-            thread_id,
             content,
-            source_session_id,
-            reply_to,
-            is_group,
         });
     }
     Ok(parents)
@@ -206,41 +237,81 @@ mod tests {
     use super::*;
     use crate::test_support::{MemSessionRoot, insert_recurring_inbound, seed_running_session};
     use chrono::{Duration as ChDuration, TimeZone};
-    use copperclaw_db::central::CentralDb;
+    use copperclaw_db::tables::messages_in::{WriteInbound, insert};
+    use copperclaw_db::tables::tasks::TaskStatus;
+    use copperclaw_types::MessageKind;
 
-    fn fixture() -> (MemSessionRoot, copperclaw_types::Session, DateTime<Utc>) {
+    fn fixture() -> (
+        CentralDb,
+        MemSessionRoot,
+        copperclaw_types::Session,
+        DateTime<Utc>,
+    ) {
         let central = CentralDb::open_in_memory().unwrap();
         let root = MemSessionRoot::new();
         let sess = seed_running_session(&central);
         let now = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
-        (root, sess, now)
+        (central, root, sess, now)
+    }
+
+    /// Read the `recurrence` column of a `messages_in` row back out.
+    fn row_recurrence(
+        root: &MemSessionRoot,
+        sess: &copperclaw_types::Session,
+        id: MessageId,
+    ) -> Option<String> {
+        let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        pool.conn_mut()
+            .query_row(
+                "SELECT recurrence FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
     fn empty_messages_in_returns_empty() {
-        let (root, sess, now) = fixture();
+        let (central, root, sess, now) = fixture();
         let _ = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(r.is_empty());
+        assert!(
+            tasks::list_for_session(&central, sess.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn parent_in_the_future_does_not_fan_out() {
-        let (root, sess, now) = fixture();
-        insert_recurring_inbound(
+    fn parent_in_the_future_does_not_migrate() {
+        let (central, root, sess, now) = fixture();
+        let parent = insert_recurring_inbound(
             &root,
             &sess,
             "0 */2 * * *",
             Some("series-a".into()),
             Some(now + ChDuration::hours(1)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(r.is_empty());
+        // No task, and the source row keeps its recurrence for a later pass.
+        assert!(
+            tasks::list_for_session(&central, sess.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            row_recurrence(&root, &sess, parent).as_deref(),
+            Some("0 */2 * * *"),
+        );
     }
 
+    /// The A5 acceptance unit: a due per-session recurrence is created as a
+    /// central `tasks` row instead of self-replicating a `messages_in` row.
     #[test]
-    fn parent_at_or_past_fire_time_fans_out() {
-        let (root, sess, now) = fixture();
+    fn due_recurrence_is_created_as_a_task() {
+        let (central, root, sess, now) = fixture();
         let parent = insert_recurring_inbound(
             &root,
             &sess,
@@ -248,17 +319,28 @@ mod tests {
             Some("series-a".into()),
             Some(now - ChDuration::minutes(5)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].series_id, "series-a");
-        assert_ne!(r[0].new_message_id, parent);
-        // Next fire computed from cron should be in the future.
+        assert_eq!(r[0].new_message_id, parent);
         assert!(r[0].next_fire > now);
+
+        // Exactly one task row, active, recurring, next_fire in the future.
+        let tasks_now = tasks::list_for_session(&central, sess.id).unwrap();
+        assert_eq!(tasks_now.len(), 1);
+        let t = &tasks_now[0];
+        assert_eq!(t.status, TaskStatus::Active);
+        assert_eq!(t.recurrence.as_deref(), Some("0 */2 * * *"));
+        assert_eq!(t.prompt, "recurring");
+        assert!(t.next_fire.unwrap() > now);
+
+        // And the legacy path is neutralised: the source row no longer recurs.
+        assert_eq!(row_recurrence(&root, &sess, parent), None);
     }
 
     #[test]
-    fn null_series_id_defaults_to_parent_id() {
-        let (root, sess, now) = fixture();
+    fn null_series_id_keys_task_on_parent_id() {
+        let (central, root, sess, now) = fixture();
         let parent = insert_recurring_inbound(
             &root,
             &sess,
@@ -266,15 +348,16 @@ mod tests {
             None,
             Some(now - ChDuration::minutes(5)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].series_id, parent.as_uuid().to_string());
+        assert_eq!(tasks::list_for_session(&central, sess.id).unwrap().len(), 1);
     }
 
     #[test]
-    fn only_newest_member_of_series_fires() {
-        let (root, sess, now) = fixture();
-        // Two members of the same series; only one fan-out expected.
+    fn only_newest_member_of_series_migrates_once() {
+        let (central, root, sess, now) = fixture();
+        // Two members of the same series; a single task is created.
         insert_recurring_inbound(
             &root,
             &sess,
@@ -289,14 +372,62 @@ mod tests {
             Some("series-b".into()),
             Some(now - ChDuration::minutes(1)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].series_id, "series-b");
+        assert_eq!(tasks::list_for_session(&central, sess.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_passes() {
+        let (central, root, sess, now) = fixture();
+        insert_recurring_inbound(
+            &root,
+            &sess,
+            "0 */2 * * *",
+            Some("series-idem".into()),
+            Some(now - ChDuration::minutes(5)),
+        );
+        // First pass migrates; second pass is a no-op (series already cleared).
+        let r1 = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+        assert_eq!(r1.len(), 1);
+        let r2 = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+        assert!(r2.is_empty());
+        assert_eq!(tasks::list_for_session(&central, sess.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancelled_task_is_not_resurrected() {
+        let (central, root, sess, now) = fixture();
+        insert_recurring_inbound(
+            &root,
+            &sess,
+            "0 */2 * * *",
+            Some("series-cancel".into()),
+            Some(now - ChDuration::minutes(5)),
+        );
+        check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let id = migrated_task_id(&sess.id, "series-cancel");
+        tasks::set_status(&central, &id, TaskStatus::Cancelled).unwrap();
+
+        // A fresh recurring row for the SAME series must not recreate the task
+        // an operator cancelled — the deterministic id + presence check guard it.
+        insert_recurring_inbound(
+            &root,
+            &sess,
+            "0 */2 * * *",
+            Some("series-cancel".into()),
+            Some(now - ChDuration::minutes(1)),
+        );
+        check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let t = tasks::get(&central, &id).unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Cancelled);
+        assert_eq!(tasks::list_for_session(&central, sess.id).unwrap().len(), 1);
     }
 
     #[test]
     fn empty_recurrence_string_is_ignored() {
-        let (root, sess, now) = fixture();
+        let (central, root, sess, now) = fixture();
         insert_recurring_inbound(
             &root,
             &sess,
@@ -304,78 +435,76 @@ mod tests {
             Some("series-empty".into()),
             Some(now - ChDuration::minutes(5)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(r.is_empty());
+        assert!(
+            tasks::list_for_session(&central, sess.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn unparseable_recurrence_is_skipped_without_error() {
-        let (root, sess, now) = fixture();
-        insert_recurring_inbound(
+        let (central, root, sess, now) = fixture();
+        let parent = insert_recurring_inbound(
             &root,
             &sess,
             "not a valid cron",
             Some("series-bad".into()),
             Some(now - ChDuration::minutes(5)),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(r.is_empty());
-    }
-
-    #[test]
-    fn fan_out_row_inherits_kind_and_content() {
-        let (root, sess, now) = fixture();
-        let _parent = insert_recurring_inbound(
-            &root,
-            &sess,
-            "0 */2 * * *",
-            Some("series-c".into()),
-            Some(now - ChDuration::minutes(5)),
+        assert!(
+            tasks::list_for_session(&central, sess.id)
+                .unwrap()
+                .is_empty()
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
-        assert_eq!(r.len(), 1);
-        let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
-        let conn = pool.conn_mut();
-        let (kind_str, content_str, series_str): (String, String, Option<String>) = conn
-            .query_row(
-                "SELECT kind, content, series_id FROM messages_in WHERE id = ?1",
-                rusqlite::params![r[0].new_message_id.as_uuid().to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(kind_str, "task");
-        assert!(content_str.contains("recurring"));
-        assert_eq!(series_str.as_deref(), Some("series-c"));
-    }
-
-    #[test]
-    fn fan_out_row_resets_tries_to_zero() {
-        let (root, sess, now) = fixture();
-        insert_recurring_inbound(
-            &root,
-            &sess,
-            "0 */2 * * *",
-            Some("series-tries".into()),
-            Some(now - ChDuration::minutes(5)),
+        // Unparseable rows are left intact (not cleared) so an out-of-band fix
+        // can still migrate them later.
+        assert_eq!(
+            row_recurrence(&root, &sess, parent).as_deref(),
+            Some("not a valid cron"),
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
-        let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
-        let tries: i64 = pool
-            .conn_mut()
-            .query_row(
-                "SELECT tries FROM messages_in WHERE id = ?1",
-                rusqlite::params![r[0].new_message_id.as_uuid().to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(tries, 0);
     }
 
     #[test]
-    fn fan_out_with_no_process_after_still_fires() {
-        // A recurring row that has never been fired (process_after IS NULL)
-        // should produce a fan-out immediately.
-        let (root, sess, now) = fixture();
+    fn task_prompt_falls_back_to_raw_content_without_text() {
+        let (central, root, sess, now) = fixture();
+        // Hand-rolled insert with a content shape that has no `text` field.
+        let id = MessageId::new();
+        let write = WriteInbound {
+            id,
+            kind: MessageKind::Task,
+            timestamp: now,
+            content: serde_json::json!({"payload": 7}),
+            trigger: true,
+            on_wake: false,
+            process_after: Some(now - ChDuration::minutes(5)),
+            recurrence: Some("0 */2 * * *".into()),
+            series_id: Some("series-raw".into()),
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        };
+        {
+            let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+            insert(pool.conn_mut(), &write).unwrap();
+        }
+        check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let t = &tasks::list_for_session(&central, sess.id).unwrap()[0];
+        assert!(t.prompt.contains("payload"));
+    }
+
+    #[test]
+    fn no_process_after_still_migrates() {
+        // A recurring row that has never fired (process_after IS NULL) should
+        // migrate immediately.
+        let (central, root, sess, now) = fixture();
         insert_recurring_inbound(
             &root,
             &sess,
@@ -383,67 +512,54 @@ mod tests {
             Some("series-null-pa".into()),
             None,
         );
-        let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
+        let r = check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert_eq!(r.len(), 1);
+        assert_eq!(tasks::list_for_session(&central, sess.id).unwrap().len(), 1);
     }
 
-    /// Regression: the original `parse_kind` hand-rolled only six
-    /// variants (chat/task/webhook/system/agent/card) and aborted the
-    /// whole session's recurrence sweep with `unknown kind` whenever a
-    /// recurring row of a newer kind landed (slice-3 added breadcrumb,
-    /// diff, `todo_list`, error, thinking). Now that we delegate to
-    /// `MessageKind::parse_str`, every documented variant must round-
-    /// trip cleanly. We seed one recurring row per variant and assert
-    /// the check completes (no Err) and fans out the expected count.
+    /// A5 acceptance integration (DB/sweep layer): a recurring session, once
+    /// consolidated, is managed through the same central-task lifecycle helpers
+    /// that back the `list_tasks` / `pause_task` MCP tools. Pausing the migrated
+    /// task stops the central scheduler from firing it.
     #[test]
-    fn all_message_kinds_parse_without_error_in_recurrence_sweep() {
-        for kind in [
-            MessageKind::Chat,
-            MessageKind::Task,
-            MessageKind::Webhook,
-            MessageKind::System,
-            MessageKind::Agent,
-            MessageKind::Card,
-            MessageKind::Breadcrumb,
-            MessageKind::Diff,
-            MessageKind::TodoList,
-            MessageKind::Error,
-            MessageKind::Thinking,
-        ] {
-            let (root, sess, now) = fixture();
-            // Hand-rolled insert so we can pick the kind directly —
-            // the shared `insert_recurring_inbound` helper hard-codes
-            // `Task`, which would defeat the test.
-            let id = copperclaw_types::MessageId::new();
-            let write = WriteInbound {
-                id,
-                kind,
-                timestamp: now,
-                content: serde_json::json!({"text": "recurring"}),
-                trigger: true,
-                on_wake: false,
-                process_after: Some(now - ChDuration::minutes(5)),
-                recurrence: Some("0 */2 * * *".into()),
-                series_id: Some(format!("series-kind-{}", kind.as_str())),
-                platform_id: None,
-                channel_type: None,
-                thread_id: None,
-                source_session_id: None,
-                reply_to: None,
-                is_group: None,
-            };
-            {
-                let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
-                insert(pool.conn_mut(), &write).unwrap();
-            }
-            let r = check(&root, &sess.agent_group_id, &sess.id, now)
-                .unwrap_or_else(|e| panic!("kind `{}` aborted sweep: {e}", kind.as_str()));
-            assert_eq!(
-                r.len(),
-                1,
-                "expected exactly one fan-out for kind `{}`",
-                kind.as_str(),
-            );
-        }
+    fn migrated_recurrence_is_managed_via_list_and_pause() {
+        use crate::checks::scheduling;
+        let (central, root, sess, now) = fixture();
+        insert_recurring_inbound(
+            &root,
+            &sess,
+            // Every-2-hours cron whose next occurrence is at/after `now`.
+            "0 */2 * * *",
+            Some("series-managed".into()),
+            Some(now - ChDuration::minutes(5)),
+        );
+        // Consolidate the per-session recurrence into a central task.
+        check(&central, &root, &sess.agent_group_id, &sess.id, now).unwrap();
+
+        // `list_tasks` reads `tasks::list_for_session`: the recurrence now shows
+        // up as a first-class, active, recurring task.
+        let listed = tasks::list_for_session(&central, sess.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        let task_id = listed[0].id.clone();
+        assert_eq!(listed[0].status, TaskStatus::Active);
+        assert!(listed[0].recurrence.is_some());
+
+        // Force the task due, then `pause_task` it (== `tasks::set_status`
+        // Paused). A paused task is excluded from the central scheduler's
+        // due-list, so no wake inbound is fired.
+        tasks::set_next_fire(&central, &task_id, Some(now - ChDuration::seconds(1))).unwrap();
+        tasks::set_status(&central, &task_id, TaskStatus::Paused).unwrap();
+        let fired = scheduling::check(&central, &root, now).unwrap();
+        assert!(
+            fired.is_empty(),
+            "a paused recurring task must not fire via the central scheduler",
+        );
+
+        // Resume it and confirm the central scheduler now drives it.
+        tasks::set_status(&central, &task_id, TaskStatus::Active).unwrap();
+        tasks::set_next_fire(&central, &task_id, Some(now - ChDuration::seconds(1))).unwrap();
+        let fired = scheduling::check(&central, &root, now).unwrap();
+        assert_eq!(fired.len(), 1, "an active recurring task fires centrally");
+        assert_eq!(fired[0].series_id, task_id);
     }
 }

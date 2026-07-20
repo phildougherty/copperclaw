@@ -29,6 +29,26 @@ pub(crate) const CRASH_RESTART_APOLOGY_TEXT: &str = "Hit a snag mid-task and nee
 /// without bloating the session dir on a busy box.
 const CRASH_LOG_TAIL_LINES: u32 = 200;
 
+/// F2 poison-message quarantine threshold: how many times a single inbound
+/// may be in flight during a crash-restart before the host gives up on it,
+/// marks it terminally `failed` (so it is never re-processed), and emits the
+/// one-time [`POISON_QUARANTINE_APOLOGY_TEXT`]. Set low: a message that
+/// reliably crashes the runner three times running is poison (the canonical
+/// case: a huge base64 screenshot plus an oversized history), and every
+/// further retry is another guaranteed crash-loop iteration. Below this,
+/// the message is still retried on the next spawn — a genuinely transient
+/// crash (a provider blip mid-turn) recovers without losing the message.
+const QUARANTINE_CRASH_ATTEMPTS: i64 = 3;
+
+/// User-facing apology emitted exactly once when an inbound is quarantined
+/// after crashing the runner [`QUARANTINE_CRASH_ATTEMPTS`] times. Distinct
+/// from [`CRASH_RESTART_APOLOGY_TEXT`] (the transient-crash notice) so a user
+/// scanning chat understands this message was permanently skipped, not
+/// retried — and so an operator can tell the two apart in logs.
+pub(crate) const POISON_QUARANTINE_APOLOGY_TEXT: &str = "One of your recent messages repeatedly crashed the agent, so I'm \
+     skipping it to recover. If it had an attachment (like a large image or \
+     file), try resending a smaller version or describing it in text instead.";
+
 /// Title of the once-per-episode OOM `ErrorCard` (M21 S4).
 const OOM_CARD_TITLE: &str = "Task keeps running out of memory";
 
@@ -100,7 +120,27 @@ impl ContainerManager {
     /// tests can assert a reset session classifies as `Spawn`.
     pub(crate) fn classify(&self, session: &Session) -> ReconcileAction {
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
-        let pending = Self::has_pending_inbound(&paths).unwrap_or(false);
+        // "No pending work" and "I could not read the inbound DB" are very
+        // different facts that used to collapse into the same `false` via
+        // `.unwrap_or(false)`. On a full disk `open_inbound` fails, every
+        // Stopped session reads as idle, and the reconcile loop quietly
+        // stops spawning anything — a total stall with NOT ONE log line to
+        // find it by. The action is still Noop (there is nothing useful to
+        // do with an unreadable DB, and spawning blind would be worse), but
+        // it is now a stall you can see.
+        let pending = match Self::has_pending_inbound(&paths) {
+            Ok(pending) => pending,
+            Err(err) => {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    ?err,
+                    status = ?session.container_status,
+                    "cannot read the session's inbound DB; treating as no pending work this tick \
+                     (a full disk or an I/O error will stall this session until it clears)"
+                );
+                false
+            }
+        };
         match session.container_status {
             ContainerStatus::Stopped => {
                 if pending {
@@ -181,8 +221,21 @@ impl ContainerManager {
                 // Err(HostDegraded) into Ok here. The startup
                 // banner and the metric are the source of truth
                 // for "host is degraded".
+                //
+                // `HostResourceExhausted` rides the same collapse for the
+                // same reason, with one difference worth naming: it is
+                // self-clearing. The box being out of disk is an expected,
+                // transient, ALREADY-LOGGED condition (the tick's
+                // `refresh_host_resources` edge-logs it once), and the
+                // session stays Stopped with its inbound pending until the
+                // environment recovers. Returning Err here would print one
+                // "session reconcile failed" line per session per tick —
+                // which is the 2026-07-18 log storm, just relabelled.
                 match self.maybe_spawn(session).await {
-                    Ok(_) | Err(ManagerError::HostDegraded) => Ok(()),
+                    Ok(_)
+                    | Err(ManagerError::HostDegraded | ManagerError::HostResourceExhausted) => {
+                        Ok(())
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -309,6 +362,16 @@ impl ContainerManager {
             }
             RestartReason::StuckTool => CrashCause::Generic,
         };
+        // Upgrade a generic crash to `ResourceExhausted` when the host's
+        // disk probe says the box is full. An OOM kill keeps its own
+        // classification (the memory ceiling is the more specific and more
+        // actionable fact); everything else that dies on a full disk is
+        // almost certainly dying *of* the full disk, and saying so here is
+        // the difference between an operator following the thread and an
+        // operator reading 235 identical `cause="generic"` lines.
+        let disk = self.current_disk();
+        let cause =
+            cause.with_host_disk(disk.is_some_and(super::host_resources::DiskSpace::is_exhausted));
 
         // 1b. Tear down the session's previews before the container is
         //     removed — the crashed container's bridge IP is dead and may be
@@ -402,14 +465,25 @@ impl ContainerManager {
             copperclaw_metrics::inc_container_oom_kill();
         }
         copperclaw_metrics::observe_crash_backoff_level(record.streak);
+        // Free disk rides along on EVERY crash line, not just the ones we
+        // classified as resource-exhausted: the whole failure of the
+        // 2026-07-18 logs was that the crash record and the disk state
+        // lived in different lines and nothing joined them.
         warn!(
             session = %session.id.as_uuid(),
             cause = cause.as_str(),
             crash_streak = record.streak,
             oom_count = record.oom_count,
             respawn_backoff_secs = record.delay.as_secs(),
+            free_disk_bytes = disk.map(|d| d.free_bytes),
             "crash-restart recorded; respawn deferred by backoff"
         );
+        // Feed the global circuit breaker. Per-session backoff (just
+        // recorded above) answers "this session keeps crashing"; this
+        // answers "several DIFFERENT sessions just crashed, so what they
+        // share is broken." Only the trip edge has side effects, so a
+        // fleet-wide fault costs exactly one operator alert.
+        self.note_crash_for_env_breaker(session);
         if record.emit_oom_card {
             if let Err(err) = emit_oom_error_card(&paths) {
                 // Non-fatal, same posture as the apology emit above: the
@@ -635,38 +709,104 @@ fn emit_crash_restart_apologies(
 
     let now = chrono::Utc::now();
     let mut emitted = 0u32;
+    let mut quarantined = 0u32;
     for message_id in processing {
+        // F2 poison-message quarantine: bump this inbound's per-message crash
+        // counter FIRST. `emit_crash_restart_apologies` runs exactly once per
+        // crash-restart (and is idempotent across reconcile-tick repeats — it
+        // scans `processing_ack.status='processing'` rows, which this pass
+        // flips to `Failed`), so the counter advances by exactly one per crash
+        // this message survives in flight. A missing row (already reaped /
+        // idempotent repeat) yields no counter but still falls through to the
+        // claim cleanup so we never spin on it.
+        let attempts = match messages_in::increment_crash_attempts(&inbound, message_id) {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    message = %message_id.as_uuid(),
+                    ?err,
+                    "could not bump crash_attempts (inbound row missing?); continuing"
+                );
+                0
+            }
+        };
+
         // Look up the inbound row's routing. If the row is missing or
         // lacks channel routing, fall through to the mark-as-Failed
         // step so we don't loop on the same row again.
         let routing = lookup_inbound_routing(&inbound, message_id)?;
 
-        if let Some(routing) = routing {
-            let apology = WriteOutbound {
-                id: MessageId::new(),
-                in_reply_to: Some(routing.message_id),
-                timestamp: now,
-                deliver_after: None,
-                recurrence: None,
-                kind: MessageKind::Chat,
-                channel_type: Some(routing.channel_type.clone()),
-                platform_id: Some(routing.platform_id.clone()),
-                thread_id: routing.thread_id.clone(),
-                content: serde_json::json!({ "text": CRASH_RESTART_APOLOGY_TEXT }),
-            };
-            insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
-            emitted += 1;
+        if attempts >= QUARANTINE_CRASH_ATTEMPTS {
+            // The message has crashed the runner K times: it is poison. Mark
+            // the inbound row terminally `failed` so `get_pending` /
+            // `count_due` (both `status='pending'`-scoped) stop returning it —
+            // the retry loop is broken here, at the exact lifecycle point that
+            // otherwise re-claims it on every respawn. Emit the distinct
+            // one-time quarantine apology (once — after this, the row is no
+            // longer pending, so no fresh claim and no repeat apology).
+            if let Err(err) = messages_in::mark_failed(&inbound, message_id) {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    message = %message_id.as_uuid(),
+                    ?err,
+                    "could not quarantine (mark inbound failed); poison may retry"
+                );
+            }
+            if let Some(routing) = &routing {
+                let apology = WriteOutbound {
+                    id: MessageId::new(),
+                    in_reply_to: Some(routing.message_id),
+                    timestamp: now,
+                    deliver_after: None,
+                    recurrence: None,
+                    kind: MessageKind::Chat,
+                    channel_type: Some(routing.channel_type.clone()),
+                    platform_id: Some(routing.platform_id.clone()),
+                    thread_id: routing.thread_id.clone(),
+                    content: serde_json::json!({ "text": POISON_QUARANTINE_APOLOGY_TEXT }),
+                };
+                insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
+            }
+            quarantined += 1;
+            warn!(
+                session = %session.id.as_uuid(),
+                message = %message_id.as_uuid(),
+                attempts,
+                "poison inbound quarantined: crashed the runner too many times; skipping it"
+            );
+        } else {
+            // Below the quarantine threshold: transient-crash path. Emit the
+            // generic restart apology (if routed) and stamp the inbound so the
+            // host-sweep `pending_too_long` apology path stays out. The row is
+            // left `pending`, so the respawned runner retries it.
+            if let Some(routing) = &routing {
+                let apology = WriteOutbound {
+                    id: MessageId::new(),
+                    in_reply_to: Some(routing.message_id),
+                    timestamp: now,
+                    deliver_after: None,
+                    recurrence: None,
+                    kind: MessageKind::Chat,
+                    channel_type: Some(routing.channel_type.clone()),
+                    platform_id: Some(routing.platform_id.clone()),
+                    thread_id: routing.thread_id.clone(),
+                    content: serde_json::json!({ "text": CRASH_RESTART_APOLOGY_TEXT }),
+                };
+                insert_outbound(&outbound, &apology).map_err(ManagerError::Db)?;
+                emitted += 1;
+            }
+            // Stamp the inbound row so the host-sweep apology path won't
+            // also fire `pending_too_long` for it. We do this even when
+            // routing was missing — the row stays pending but won't get a
+            // second apology from the sweep.
+            mark_inbound_tries(&inbound, message_id)?;
         }
-
-        // Stamp the inbound row so the host-sweep apology path won't
-        // also fire `pending_too_long` for it. We do this even when
-        // routing was missing — the row stays pending but won't get a
-        // second apology from the sweep.
-        mark_inbound_tries(&inbound, message_id)?;
 
         // Flip the claim to Failed so the host-sweep `processing` reset
         // path won't also fire and create a duplicate retry. The
-        // runner-restart path owns this inbound from here on.
+        // runner-restart path owns this inbound from here on. Both the
+        // quarantine and the retry path do this.
         if let Err(err) =
             processing_ack::update_status(&outbound, message_id, ProcessingStatus::Failed)
         {
@@ -682,6 +822,7 @@ fn emit_crash_restart_apologies(
     info!(
         session = %session.id.as_uuid(),
         emitted,
+        quarantined,
         "crash-restart apologies emitted"
     );
     Ok(())
@@ -1405,6 +1546,179 @@ mod tests {
         );
     }
 
+    /// F2 (A) poison quarantine: an inbound that is in flight during
+    /// `QUARANTINE_CRASH_ATTEMPTS` successive crashes is quarantined — marked
+    /// terminally `failed` so it is never re-processed — and the user gets the
+    /// distinct one-time "repeatedly crashed" apology. Below the threshold the
+    /// message stays `pending` (still retried) and gets the transient-crash
+    /// apology. Drives `emit_crash_restart_apologies` directly, re-establishing
+    /// the `processing` claim between crashes exactly as a respawned runner
+    /// re-claiming the still-pending inbound would.
+    #[test]
+    fn poison_inbound_quarantined_after_k_crashes_but_retries_under_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+
+        let msg_id = copperclaw_types::MessageId::new();
+        let inbound = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &inbound,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "poison"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-42".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: Some("thread-7".into()),
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        let outbound = open_outbound(&paths).unwrap();
+        processing_ack::insert(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+
+        let read_status = |conn: &rusqlite::Connection| -> String {
+            conn.query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                params![msg_id.as_uuid().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Crashes 1..K-1: below threshold → message stays pending (retried),
+        // and it remains due for the next spawn.
+        for attempt in 1..QUARANTINE_CRASH_ATTEMPTS {
+            emit_crash_restart_apologies(&paths, &session).unwrap();
+            assert_eq!(
+                read_status(&inbound),
+                "pending",
+                "under K (attempt {attempt}) the message must stay pending for retry"
+            );
+            assert_eq!(
+                messages_in::count_due(&inbound).unwrap(),
+                1,
+                "under K the message is still due for the next spawn"
+            );
+            // The respawned runner re-claims the still-pending inbound.
+            processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+        }
+
+        // The K-th crash quarantines it.
+        emit_crash_restart_apologies(&paths, &session).unwrap();
+        assert_eq!(
+            read_status(&inbound),
+            "failed",
+            "at K crashes the poison message is quarantined (terminally failed)"
+        );
+        assert_eq!(
+            messages_in::count_due(&inbound).unwrap(),
+            0,
+            "a quarantined message is no longer processed"
+        );
+        let attempts: i64 = inbound
+            .query_row(
+                "SELECT crash_attempts FROM messages_in WHERE id = ?1",
+                params![msg_id.as_uuid().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, QUARANTINE_CRASH_ATTEMPTS);
+
+        // A distinct quarantine apology was emitted (not the transient one).
+        let chats: Vec<_> = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        let quarantine_apology = chats.iter().any(|r| {
+            r.content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t.contains("repeatedly crashed the agent"))
+        });
+        assert!(
+            quarantine_apology,
+            "expected the distinct poison-quarantine apology, got {chats:?}"
+        );
+    }
+
+    /// F2 (A) idempotency: once quarantined (inbound `failed`, claim `Failed`),
+    /// a further crash-restart pass finds no `processing` claim and neither
+    /// re-quarantines nor emits a duplicate apology.
+    #[test]
+    fn quarantine_is_idempotent_across_repeat_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+
+        let msg_id = copperclaw_types::MessageId::new();
+        let inbound = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &inbound,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "poison"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-9".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        let outbound = open_outbound(&paths).unwrap();
+        processing_ack::insert(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+
+        // Drive it to quarantine.
+        for _ in 0..QUARANTINE_CRASH_ATTEMPTS {
+            emit_crash_restart_apologies(&paths, &session).unwrap();
+            processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Processing).unwrap();
+        }
+        let chats_before = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .count();
+
+        // Now mark the claim Failed (the quarantine pass already did, but the
+        // loop above re-set it to Processing on its last turn). Simulate the
+        // sweep having reset it — a fresh pass with the message already
+        // `failed` must not re-quarantine or re-apologise.
+        processing_ack::update_status(&outbound, msg_id, ProcessingStatus::Failed).unwrap();
+        emit_crash_restart_apologies(&paths, &session).unwrap();
+        let chats_after = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .count();
+        assert_eq!(
+            chats_after, chats_before,
+            "a repeat pass after quarantine must not emit more apologies"
+        );
+    }
+
     /// Empty inbound DB + no processing_ack rows → no apology row
     /// lands. Covers the corner case where the container died before
     /// picking up the inbound (or no inbound was in-flight at all).
@@ -1766,5 +2080,299 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tries, APOLOGY_TRIES_MARKER);
+    }
+}
+
+/// Host-resource preflight + global circuit breaker (the 2026-07-18
+/// full-disk incident).
+///
+/// Everything here exercises a gap the pre-existing state-machine tests
+/// left wide open: none of them ever ran `classify` / `maybe_spawn`
+/// against a host that could not actually support a container, so the
+/// storm those conditions produce was invisible to the suite.
+#[cfg(test)]
+mod host_resource_tests {
+    use super::super::config::{ManagerConfig, SkillsMode};
+    use super::super::host_resources::{
+        ENV_FAULT_SESSION_THRESHOLD, ENV_FAULT_WINDOW, clear_disk_override, set_disk_override,
+    };
+    use super::super::spawn::{
+        DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS,
+    };
+    use super::*;
+    use copperclaw_cclaw::disk::GIB;
+    use copperclaw_db::central::CentralDb;
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
+    use std::path::PathBuf;
+
+    /// A filesystem with 64 KiB left on a 100 GiB volume — the shape the
+    /// host was in when `tasks_snapshot: write failed err=Os { code: 28,
+    /// StorageFull }` started appearing.
+    const FULL_DISK: (u64, u64) = (64 * 1024, 100 * GIB);
+    /// A comfortably healthy filesystem.
+    const HEALTHY_DISK: (u64, u64) = (500 * GIB, 1024 * GIB);
+
+    fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
+        ManagerConfig {
+            install_slug: "test".into(),
+            data_dir,
+            default_image_tag: "copperclaw/session:test".into(),
+            default_provider: "anthropic".into(),
+            default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
+            anthropic_api_key: Some("sk-test".into()),
+            anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            skills_dir: None,
+            groups_dir: None,
+            skills_mode: SkillsMode::Inline,
+            gpu_passthrough: false,
+            forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+        }
+    }
+
+    fn make_mgr(tmp: &tempfile::TempDir) -> (ContainerManager, CentralDb) {
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        (mgr, db)
+    }
+
+    fn fixture_session(db: &CentralDb) -> Session {
+        // Unique name/folder per call: these tests deliberately create
+        // SEVERAL sessions against one DB (distinct sessions being the
+        // entire point of the breaker), and agent-group folders are unique.
+        let slug = format!("demo-{}", uuid::Uuid::new_v4());
+        let ag = create_ag(
+            db,
+            CreateAgentGroup {
+                name: slug.clone(),
+                folder: slug,
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        create_session(
+            db,
+            CreateSession {
+                agent_group_id: ag.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A session with one pending chat inbound waiting — i.e. one that
+    /// `classify` will want to `Spawn`.
+    fn session_with_pending_inbound(tmp: &tempfile::TempDir, db: &CentralDb) -> Session {
+        let session = fixture_session(db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn spawn_preflight_refuses_a_container_when_the_disk_is_full() {
+        // The core regression. Before the preflight, this session spawned
+        // a container into a filesystem with no room, the container died
+        // mid-boot, and the reconcile loop read the dead container as a
+        // per-session crash — the first step of the storm.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = session_with_pending_inbound(&tmp, &db);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+
+        assert!(
+            mgr.spawn_blocked_by_host_resources().is_some(),
+            "a full disk must block the spawn preflight"
+        );
+        let err = mgr
+            .maybe_spawn(&session)
+            .await
+            .expect_err("spawn must be refused on a full disk");
+        assert!(
+            matches!(err, ManagerError::HostResourceExhausted),
+            "expected HostResourceExhausted, got {err:?}"
+        );
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn refused_spawn_leaves_the_session_stopped_with_its_inbound_pending() {
+        // Refusing is only correct if it loses nothing: the session must
+        // stay Stopped (so a later tick retries) and the inbound must stay
+        // pending (so the user's message is not dropped on the floor).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = session_with_pending_inbound(&tmp, &db);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+
+        assert_eq!(mgr.classify(&session), ReconcileAction::Spawn);
+        // `apply` collapses the refusal to Ok — one edge-logged warning
+        // per episode, NOT one "session reconcile failed" line per session
+        // per tick, which would just be the old log storm relabelled.
+        mgr.apply(&session, ReconcileAction::Spawn)
+            .await
+            .expect("resource exhaustion collapses to Ok, like HostDegraded");
+
+        let row = copperclaw_db::tables::sessions::get(&db, session.id).unwrap();
+        assert_eq!(row.container_status, ContainerStatus::Stopped);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        assert!(
+            ContainerManager::has_pending_inbound(&paths).unwrap(),
+            "the inbound must still be pending after a refused spawn"
+        );
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn a_healthy_disk_does_not_block_anything() {
+        // Guard against the preflight over-firing: WARN-level free space
+        // (low but not critical) must NOT stop work.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        // 50% free but under the 20 GiB absolute floor → WARN, not FAIL.
+        set_disk_override(15 * GIB, 30 * GIB);
+        mgr.refresh_host_resources();
+        assert!(
+            mgr.spawn_blocked_by_host_resources().is_none(),
+            "a WARN-level disk must not freeze the fleet"
+        );
+        assert!(!mgr.is_env_exhausted());
+        clear_disk_override();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn env_breaker_pauses_spawns_globally_then_re_arms_when_the_disk_recovers() {
+        // The piece that actually caps the storm. N distinct sessions
+        // crashing against one shared fault must produce ONE global pause,
+        // not N independent per-session backoff curves all retrying
+        // forever against the same full disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        mgr.refresh_host_resources();
+
+        let sessions: Vec<Session> = (0..ENV_FAULT_SESSION_THRESHOLD)
+            .map(|_| fixture_session(&db))
+            .collect();
+        for (i, session) in sessions.iter().enumerate() {
+            mgr.note_crash_for_env_breaker(session);
+            let last = i + 1 == ENV_FAULT_SESSION_THRESHOLD;
+            assert_eq!(
+                mgr.is_env_exhausted(),
+                last,
+                "the breaker trips on the crossing, not before (crash {})",
+                i + 1
+            );
+        }
+        // Spawns are now blocked for EVERY session, including ones that
+        // never crashed — the fault is the box, not the session.
+        let bystander = session_with_pending_inbound(&tmp, &db);
+        assert!(mgr.spawn_blocked_by_host_resources().is_some());
+        let err = mgr.maybe_spawn(&bystander).await.expect_err("blocked");
+        assert!(matches!(err, ManagerError::HostResourceExhausted));
+
+        // Mid-window: still paused, even with a perfectly healthy disk.
+        tokio::time::advance(ENV_FAULT_WINDOW / 2).await;
+        mgr.refresh_host_resources();
+        assert!(mgr.is_env_exhausted(), "the hold must survive one tick");
+
+        // Past the hold with a healthy disk: work resumes on its own.
+        tokio::time::advance(ENV_FAULT_WINDOW).await;
+        mgr.refresh_host_resources();
+        assert!(!mgr.is_env_exhausted(), "self-clears once the box is well");
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn operator_can_clear_the_environment_fault_by_hand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        for _ in 0..ENV_FAULT_SESSION_THRESHOLD {
+            let session = fixture_session(&db);
+            mgr.note_crash_for_env_breaker(&session);
+        }
+        assert!(mgr.is_env_exhausted());
+        mgr.clear_env_exhausted();
+        assert!(!mgr.is_env_exhausted());
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn a_full_disk_alone_flips_and_clears_the_environment_state() {
+        // No crashes needed: the probe alone is enough to stop burning
+        // doomed spawns, and enough to resume once space comes back.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _db) = make_mgr(&tmp);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+        mgr.refresh_host_resources();
+        assert!(mgr.is_env_exhausted());
+
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        mgr.refresh_host_resources();
+        assert!(!mgr.is_env_exhausted());
+        clear_disk_override();
+    }
+
+    #[test]
+    fn classify_noops_and_warns_when_the_inbound_db_cannot_be_read() {
+        // Silent-stall regression. `has_pending_inbound` used to be
+        // `.unwrap_or(false)`, so an unreadable inbound DB looked exactly
+        // like "no work to do": every Stopped session went Noop forever
+        // and NOT ONE log line said why. The action is still Noop (there
+        // is nothing useful to do with a DB you cannot read), but it is
+        // now an observable stall rather than an invisible one.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Make `open_inbound` fail the way a broken filesystem does: put a
+        // directory where the DB file belongs.
+        std::fs::create_dir_all(&paths.inbound_db).unwrap();
+
+        assert!(
+            ContainerManager::has_pending_inbound(&paths).is_err(),
+            "the fixture must actually break the inbound open"
+        );
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
     }
 }

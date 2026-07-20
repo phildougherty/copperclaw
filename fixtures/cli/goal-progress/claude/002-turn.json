@@ -1,0 +1,10 @@
+{
+  "_note": "Goal check-in wake 1, round 2: end the turn with a short progress report to the user.",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_goal_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Recorded day-1 docs progress."}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

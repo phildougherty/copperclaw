@@ -1,5 +1,5 @@
 {"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"[task] running: todo_update"},"files":0}
 {"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"Plan\n[!] Verify the build passes — app.py: SyntaxError: invalid syntax (line 3)\n(0/1 done, 0 in progress, 1 blocked, 0 pending)"},"files":0}
-{"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"[task] last: todo_update ok"},"files":0}
+{"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"last: todo_update ok · 1 tool call | <MMSS>\n  [todo_update] — Verify the build passes"},"files":0}
 {"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"Not yet — that step is blocked on a verify failure. See the checklist."},"files":0}
-{"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"[task] — done in <MMSS>, 1 tool call"},"files":0}
+{"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"working · done in <MMSS>, 1 tool call\n  [todo_update] — Verify the build passes"},"files":0}

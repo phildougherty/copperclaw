@@ -10,6 +10,7 @@ use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
 use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
+use copperclaw_channels_core::vocab;
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
@@ -154,6 +155,16 @@ impl ChannelAdapter for MatrixAdapter {
 
     fn supports_threads(&self) -> bool {
         true
+    }
+
+    /// Intentionally uncapped — the case the trait docs name explicitly.
+    /// The Matrix spec caps the *whole PDU* at 65 536 bytes (Server-Server
+    /// API), not the `body` field, and that budget is shared with
+    /// signatures, `prev_events` and `formatted_body`. There is no
+    /// per-message character limit to split on, and any number we invented
+    /// would be wrong in both directions.
+    fn max_message_chars(&self) -> Option<usize> {
+        None
     }
 
     async fn subscribe(
@@ -378,8 +389,9 @@ impl ChannelAdapter for MatrixAdapter {
 
     /// Native todo-list checklist — rendered as an `m.text` HTML
     /// event with a `<h4>` title carrying `done/total`, then a `<ul>`
-    /// list with one `<li>` per item. Each `<li>` is prefixed by a
-    /// status glyph (✅/▶/☐) and wraps completed items in `<s>` so
+    /// list with one `<li>` per item. Each `<li>` is prefixed by an
+    /// ASCII status glyph (`[x]` / `[~]` / `[!]` / `[ ]`) and wraps
+    /// completed items in `<s>` so
     /// the user can scan unfinished work at a glance. On mutation we
     /// send an `m.replace` relation so Element shows the same chip
     /// ticking through.
@@ -541,15 +553,14 @@ pub(crate) fn render_diff_html_matrix(diff: &DiffCard) -> String {
     out
 }
 
-/// ASCII-only status marker per the project's no-emoji rule. Element
-/// renders the symbol forms (U+23F3 / U+2713 / U+2717) as colourful
-/// emoji on iOS, so we stay strictly ASCII.
+/// Status marker for a breadcrumb, resolved through the shared transcript
+/// vocabulary. `vocab::for_channel("matrix")` binds [`vocab::ASCII`], so
+/// this yields `[~]` / `[ok]` / `[x]` — byte-identical to the literals
+/// this function hardcoded before M22 A3. Matrix stays on the ASCII
+/// binding per the project's no-emoji rule: Element renders the symbol
+/// forms (U+23F3 / U+2713 / U+2717) as colourful emoji on iOS.
 fn breadcrumb_glyph_matrix(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// Cap on steps rendered inside the `<details>` body — keeps a long
@@ -565,13 +576,8 @@ pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
     if !b.steps.is_empty() {
         return render_activity_html_matrix(b);
     }
-    // ASCII-only markers. Element renders U+23F3 / U+2713 / U+2717
-    // as colourful emoji on iOS, violating the project's no-emoji rule.
-    let glyph = match b.status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    };
+    // Vocab-resolved marker (matrix binds ASCII): `[~]` / `[ok]` / `[x]`.
+    let glyph = breadcrumb_glyph_matrix(b.status);
     let mut out = String::with_capacity(64);
     out.push_str(glyph);
     out.push(' ');
@@ -852,9 +858,12 @@ pub(crate) fn render_thinking_html_matrix(t: &ThinkingBlock) -> String {
 /// glyph prefix, `<s>` strikethrough on completed lines. Element
 /// renders this with proper list indentation.
 ///
-/// Glyphs are unicode `✅` / `▶` / `☐` so they survive every Matrix
-/// client (Element web, Element mobile, `FluffyChat`, etc.). Item text
-/// goes through [`escape_html_matrix`].
+/// Glyphs are the ASCII checkboxes from the shared transcript
+/// vocabulary (`[x]` completed, `[~]` in progress, `[!]` blocked,
+/// `[ ]` pending) — matrix binds [`vocab::ASCII`], per the project's
+/// no-emoji rule (Element on iOS renders symbol codepoints like
+/// U+2705 / U+25B6 / U+2610 as colourful emoji). Item text goes
+/// through [`escape_html_matrix`].
 pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
     let done = list.completed_count();
     let total = list.items.len();
@@ -865,14 +874,8 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
     out.push_str("</h4>");
     out.push_str("<ul>");
     for item in &list.items {
-        // ASCII-only glyphs per the project's no-emoji rule. Element on
-        // iOS renders the symbol forms (✅ / ▶ / ☐) as colourful emoji.
-        let glyph = match item.status {
-            TodoItemStatus::Completed => "[x]",
-            TodoItemStatus::InProgress => "[~]",
-            TodoItemStatus::Blocked => "[!]",
-            TodoItemStatus::Pending => "[ ]",
-        };
+        // Vocab-resolved checkbox (matrix binds ASCII — see fn docs).
+        let glyph = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
         out.push_str("<li>");
         out.push_str(glyph);
         out.push(' ');
@@ -1149,6 +1152,18 @@ mod tests {
         assert_eq!(adapter.channel_type().as_str(), "matrix");
         assert!(adapter.supports_threads());
         assert_eq!(adapter.bot_user_id(), "@bot:m.org");
+        adapter.shutdown().await;
+    }
+
+    /// Deliberately uncapped: the Matrix spec's 65 536-byte ceiling is on
+    /// the whole PDU, not on `body`, so there is no per-message character
+    /// limit to split against.
+    #[tokio::test]
+    async fn max_message_chars_is_uncapped_by_design() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        assert_eq!(adapter.max_message_chars(), None);
         adapter.shutdown().await;
     }
 
@@ -2377,5 +2392,119 @@ mod tests {
             "done strike: {html}"
         );
         assert!(html.contains("[ ] Dry dishes"), "pending: {html}");
+    }
+
+    // ── M22 A3 byte-identity: vocab-routed output == pre-vocab bytes ──
+    //
+    // Every expected value below is a hardcoded literal of the exact
+    // string the renderer produced BEFORE the glyph sites were rerouted
+    // through `vocab::for_channel("matrix")`. Deliberately NOT written in
+    // terms of the vocab constants — comparing against `vocab::ASCII`
+    // fields would be circular.
+
+    #[test]
+    fn breadcrumb_glyph_matrix_is_byte_identical_to_pre_vocab_literals() {
+        assert_eq!(
+            super::breadcrumb_glyph_matrix(BreadcrumbStatus::Running),
+            "[~]"
+        );
+        assert_eq!(
+            super::breadcrumb_glyph_matrix(BreadcrumbStatus::Done),
+            "[ok]"
+        );
+        assert_eq!(
+            super::breadcrumb_glyph_matrix(BreadcrumbStatus::Failed),
+            "[x]"
+        );
+    }
+
+    #[test]
+    fn render_breadcrumb_html_matrix_is_byte_identical_across_statuses() {
+        let running = Breadcrumb::running("shell").with_detail("cargo check");
+        assert_eq!(
+            super::render_breadcrumb_html_matrix(&running),
+            "[~] <code>shell</code> · cargo check"
+        );
+
+        let done = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        assert_eq!(
+            super::render_breadcrumb_html_matrix(&done),
+            "[ok] <code>shell</code> · cargo check — passed (0.4s)"
+        );
+
+        let failed = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(false, Some("exit 101".into()));
+        assert_eq!(
+            super::render_breadcrumb_html_matrix(&failed),
+            "[x] <code>shell</code> · cargo check — failed: exit 101"
+        );
+    }
+
+    #[test]
+    fn render_activity_html_matrix_is_byte_identical() {
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell").with_detail("npm run build"),
+            ],
+        };
+        assert_eq!(
+            super::render_breadcrumb_html_matrix(&agg),
+            "<details><summary>[~] shell npm run build · 1/2 steps</summary>\
+             <div>[ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i></div>\
+             <div>[~] <b>shell</b> <code>npm run build</code></div>\
+             </details>"
+        );
+    }
+
+    #[test]
+    fn render_todo_list_html_matrix_is_byte_identical_for_all_statuses() {
+        let list = copperclaw_channels_core::TodoList {
+            items: vec![
+                copperclaw_channels_core::TodoListItem {
+                    id: 1,
+                    text: "Wash".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                copperclaw_channels_core::TodoListItem {
+                    id: 2,
+                    text: "Scrub".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                copperclaw_channels_core::TodoListItem {
+                    id: 3,
+                    text: "Rinse".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("no water".into()),
+                },
+                copperclaw_channels_core::TodoListItem {
+                    id: 4,
+                    text: "Dry".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Chores".into()),
+        };
+        assert_eq!(
+            super::render_todo_list_html_matrix(&list),
+            "<h4>Chores (1/4)</h4><ul>\
+             <li>[x] <s>Wash</s></li>\
+             <li>[~] Scrub</li>\
+             <li>[!] Rinse <i>(blocked: no water)</i></li>\
+             <li>[ ] Dry</li>\
+             </ul>"
+        );
     }
 }

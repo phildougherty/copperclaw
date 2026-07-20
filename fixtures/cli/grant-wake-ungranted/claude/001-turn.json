@@ -1,0 +1,10 @@
+{
+  "_note": "Ungranted-propose, round 1: the autonomous fire attempts a credentialed-external action (web_fetch). With NO grant.json present, `autonomy_verdict` is NotGated and `policy.rs` layer 4 DENYs it with the stable `autonomous (heartbeat/scheduled) turn` reason — the block happens BEFORE dispatch (net-guard never runs), and no fire is charged. The reason is fed back to the model as an is_error tool result.",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_grant_ung_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_ung_1", "name": "web_fetch", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"url\": \"http://127.0.0.1/quarterly-report\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

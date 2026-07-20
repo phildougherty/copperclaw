@@ -33,7 +33,10 @@
 //! container state anyway, matching the S4 crash-loop tracker posture).
 
 use super::ContainerManager;
+use super::prompt::db_selector_to_skills_selector;
+use super::spawn::CODING_SKILL_NAMES;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+use copperclaw_db::tables::container_configs;
 use copperclaw_types::{Session, SessionId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -164,6 +167,21 @@ impl ContainerManager {
         let data_dir = self.cfg.data_dir.clone();
         let session_id = session.id;
         let agent_group_id = session.agent_group_id;
+        // M22 C2 (repo-attach half): surface, at cold start, whether this
+        // session is opening a pre-existing repository that the runner's
+        // attach flow (`copperclaw-runner::run::project`) will pick up —
+        // a clone persisted from a prior turn or an operator-seeded
+        // checkout under the session's `/data`. Host-side observability
+        // only; the runner performs the actual attach.
+        note_attachable_repos(&SessionPaths::new(&data_dir, agent_group_id, session_id).root);
+        // M22 S1 (skills-materialize half): stage the group's *selected*
+        // skills' supporting files (scripts/, data/) into the session's
+        // `/data/skills` via `copperclaw_skills::materialize`, so a skill
+        // can *run*, not just instruct. Separate from C2's repo-attach
+        // detection above; see `materialize_session_skills` below. Runs
+        // here, before the container starts, so the symlink farm is on
+        // disk when the runner boots.
+        self.materialize_session_skills(session);
         let watchdog = tokio::spawn(async move {
             tokio::time::sleep(SLOW_SPAWN_NOTICE_AFTER).await;
             // Still in flight past the threshold AND first time this
@@ -244,6 +262,268 @@ fn post_slow_spawn_notice(paths: &SessionPaths, session: SessionId) {
                 ?err,
                 "could not post slow-spawn notice",
             );
+        }
+    }
+}
+
+// ── M22 C2: repo-attach half ────────────────────────────────────────────
+//
+// This section is the C2 (open/attach an existing repository) counterpart
+// to the slow-spawn feedback above. Card S1 (Wave 3) adds the *skills-
+// materialize* half to this same file; keep the two clearly separated so
+// they don't collide.
+//
+// The runner (`copperclaw-runner::run::project`) performs the actual
+// attach inside the container (it must — the write logic lives in the
+// runner crate, which the host does not depend on). The host cannot clone
+// (decision (a): cloning is the agent's `shell` git) and cannot run the
+// attach. What it *can* do at cold start is observe, on the host side,
+// that a session's `/data` already holds an existing (cloned) repository
+// the runner will attach — useful operator signal on a cold spawn, and
+// the seam a future host-side attach-hint could hang from.
+
+/// The `.copperclaw/` convention dir + the two markers the runner's attach
+/// flow drops. Mirrored here (rather than shared) because the host does
+/// not depend on the runner crate; the strings are a stable on-disk
+/// contract, not private implementation.
+const ATTACH_STATE_DIR: &str = ".copperclaw";
+const ATTACH_MARKER: &str = "attached";
+const ATTACH_VERIFY_FILE: &str = "verify";
+/// Bound on the `.git/config` read — a backstop against a pathological
+/// file during a purely structural host-side scan.
+const MAX_GIT_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// Log (at most one info line) the existing, not-yet-attached repositories
+/// sitting directly under `session_root`. Best-effort and side-effect-free
+/// beyond the log + metric: never touches the repos, never fails a spawn.
+///
+/// M22 C2: increments `copperclaw_repo_attach_detected_total` per attachable
+/// repo detected here, so operators can see cold starts that reopen an existing
+/// codebase (the host-side companion to the runner's `copperclaw_repo_attach_total`).
+fn note_attachable_repos(session_root: &std::path::Path) {
+    let repos = scan_attachable_repos(session_root);
+    if repos.is_empty() {
+        return;
+    }
+    for _ in &repos {
+        copperclaw_metrics::inc_repo_attach_detected();
+    }
+    let names: Vec<String> = repos
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
+    info!(
+        count = repos.len(),
+        repos = %names.join(", "),
+        "cold start: existing repository present under session /data — the runner attach flow will open it",
+    );
+}
+
+/// Host-side detection of *attachable existing repos* directly under
+/// `session_root`: a git checkout with an `origin` remote (a clone, not a
+/// blank `git init` prototype) that carries a recognised toolchain
+/// manifest and has not been attached yet. Deliberately mirrors the
+/// runner's `is_attachable_existing_repo` discriminator so host and runner
+/// agree on what counts as attachable. Sorted for determinism.
+fn scan_attachable_repos(session_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(session_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.is_dir() && dir_is_attachable_repo(&dir) {
+            out.push(dir);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn dir_is_attachable_repo(dir: &std::path::Path) -> bool {
+    let state = dir.join(ATTACH_STATE_DIR);
+    // Already attached, or already carries a (non-empty) verify the agent
+    // manages — leave it alone.
+    if state.join(ATTACH_MARKER).is_file() {
+        return false;
+    }
+    if std::fs::metadata(state.join(ATTACH_VERIFY_FILE))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !repo_has_origin_remote(dir) {
+        return false;
+    }
+    ["Cargo.toml", "package.json", "pyproject.toml", "Makefile"]
+        .iter()
+        .any(|m| dir.join(m).is_file())
+}
+
+/// Whether `<dir>/.git/config` declares an `origin` remote. Reads only
+/// that one bounded file; no subprocess.
+fn repo_has_origin_remote(dir: &std::path::Path) -> bool {
+    use std::io::Read;
+    let git_dir = dir.join(".git");
+    if !git_dir.is_dir() {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(git_dir.join("config")) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    if file
+        .take(MAX_GIT_CONFIG_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    String::from_utf8_lossy(&buf).contains("[remote \"origin\"]")
+}
+
+// ── M22 S1: skills-materialize half ──────────────────────────────────────
+//
+// The S1 (wire `materialize` into container spawn) counterpart to the C2
+// repo-attach half above. Where C2 only *observes* an existing repo under
+// `/data`, S1 actively stages each *selected* skill's source directory into
+// the session's `/data/skills` so a skill's helper scripts reach the
+// container and can run — closing the gap that left `materialize.rs`
+// complete-but-orphaned (zero call sites): a skill's `SKILL.md` body was
+// spliced into the system prompt (inline mode) or written to `skills.json`
+// (callable mode), but its `scripts/`/`data/` never crossed the sandbox
+// boundary, so skills were inert text.
+//
+// Mechanism: `copperclaw_skills::materialize` creates a symlink farm at
+// `<session_root>/skills/<skill_id> -> <skill.dir>`. `<session_root>` is the
+// container's `/data` bind mount, so the farm appears in-container at
+// `/data/skills/`. The escape guard in `materialize.rs` (activated by
+// passing the configured skill roots as `allowed_roots`) rejects any skill
+// whose canonical dir escapes those roots — the defense-in-depth check
+// against a malicious per-group override pointing at an arbitrary host path.
+//
+// Security posture (see docs/plans/m22-security-reviews.md, S1): the files
+// that now reach the sandbox are operator/agent-authored skill content that
+// was *already trusted* (its `SKILL.md` body already shapes the agent's
+// behaviour via the prompt); no new external input is introduced, and the
+// escape guard bounds what can be linked. Read-only in intent — the farm is
+// symlinks the host writes; the agent consumes them.
+
+/// In-container subdirectory (under `/data`, the session bind mount) that
+/// receives the materialized skill symlink farm. A selected skill's helper
+/// script is then reachable at `/data/skills/<skill_id>/scripts/...`.
+/// Distinct from the sibling `/data/skills.json` catalogue file used by the
+/// callable-mode `load_skill` tool — a directory, not that file.
+const MATERIALIZED_SKILLS_SUBDIR: &str = "skills";
+
+impl ContainerManager {
+    /// Stage the group's selected skills into `<session_root>/skills` via
+    /// [`copperclaw_skills::materialize`] (an escape-guarded symlink farm),
+    /// so each selected skill's `scripts/`/`data/` reach the container's
+    /// `/data/skills`.
+    ///
+    /// The `SkillsSelector` is resolved exactly as
+    /// [`ContainerManager::runner_config_for`] resolves it, so the
+    /// materialized set matches the skills the system prompt advertises:
+    /// default `All` for a group with no container config, otherwise the
+    /// group's stored selector; the coding-skills cap
+    /// ([`CODING_SKILL_NAMES`]) is applied when `coding_enabled` is false
+    /// and the selector is the catch-all `All`.
+    ///
+    /// Best-effort: a missing skills dir, a registry scan failure, or a
+    /// per-skill link error is logged and swallowed — a skill that fails to
+    /// materialize simply isn't runnable this spawn; it never fails the
+    /// spawn. Idempotent (materialize re-points stale links, leaves matching
+    /// ones), so it is safe to run on every spawn.
+    pub(super) fn materialize_session_skills(&self, session: &Session) {
+        let Some(global) = self.cfg.skills_dir.as_deref() else {
+            return; // no global skills dir configured -> nothing to stage
+        };
+
+        // Per-group override root: `<groups_dir>/<ag>/skills`, only when it
+        // exists on disk (mirrors `select_callable_skills`).
+        let group_override_dir = self.cfg.groups_dir.as_deref().map(|root| {
+            root.join(session.agent_group_id.as_uuid().to_string())
+                .join("skills")
+        });
+        let group_override = group_override_dir
+            .as_ref()
+            .filter(|p| p.is_dir())
+            .map(|p| (session.agent_group_id, p.as_path()));
+
+        let registry = match copperclaw_skills::SkillRegistry::scan(global, group_override) {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    dir = %global.display(),
+                    "skills materialize: registry scan failed; nothing staged"
+                );
+                return;
+            }
+        };
+
+        // Resolve the selector + coding cap the same way runner_config_for
+        // does, from the group's container config (default `All`).
+        let cfg = container_configs::get(&self.central, session.agent_group_id).unwrap_or(None);
+        let selector = cfg
+            .as_ref()
+            .map_or(copperclaw_skills::SkillsSelector::All, |c| {
+                db_selector_to_skills_selector(&c.skills)
+            });
+        let coding_enabled = cfg.as_ref().is_some_and(|c| c.coding_enabled);
+        let exclude_coding =
+            !coding_enabled && matches!(selector, copperclaw_skills::SkillsSelector::All);
+
+        let mut selected = registry.list_for_group(session.agent_group_id, &selector);
+        if exclude_coding {
+            selected.retain(|s| !CODING_SKILL_NAMES.contains(&s.name.as_str()));
+        }
+        if selected.is_empty() {
+            return;
+        }
+
+        // Escape guard: a materialized skill dir must canonicalize under one
+        // of the configured skill roots (global + per-group override).
+        // Passing a non-empty `allowed_roots` activates the check in
+        // `materialize.rs`; an empty slice would disable it.
+        let mut allowed_roots = vec![global.to_path_buf()];
+        if let Some(dir) = group_override_dir.as_ref().filter(|p| p.is_dir()) {
+            allowed_roots.push(dir.clone());
+        }
+
+        let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
+        let dest = paths.root.join(MATERIALIZED_SKILLS_SUBDIR);
+        match copperclaw_skills::materialize(&selected, &dest, &allowed_roots) {
+            Ok(report) => {
+                let materialized = report.outcomes.iter().filter(|o| o.error.is_none()).count();
+                for err in report.errors() {
+                    warn!(?err, "skills materialize: per-skill link failed");
+                }
+                info!(
+                    session = %session.id.as_uuid(),
+                    materialized,
+                    total = selected.len(),
+                    dest = %dest.display(),
+                    "materialized selected skills into session /data/skills",
+                );
+                // M22 S1 metric: `copperclaw_skills_materialized_total`, labelled
+                // by agent group, incremented by the count of skill dirs that
+                // reached this container — the runnable-skills companion to S2's
+                // relevance-filtered counter.
+                copperclaw_metrics::add_skills_materialized(
+                    &session.agent_group_id.as_uuid().to_string(),
+                    materialized as u64,
+                );
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    dest = %dest.display(),
+                    "skills materialize: could not stage skills destination"
+                );
+            }
         }
     }
 }
@@ -758,6 +1038,325 @@ mod tests {
             slow_spawn_notices(tmp.path(), &session),
             2,
             "a new episode after a successful spawn may notice again",
+        );
+    }
+
+    // ── M22 C2: host-side repo-attach detection ──────────────────────
+
+    /// Write a `.git/config` under `repo` declaring (or not) an origin
+    /// remote — the one file the host discriminator reads.
+    fn write_git_config(repo: &std::path::Path, with_origin: bool) {
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let body = if with_origin {
+            "[core]\n[remote \"origin\"]\n\turl = https://example.com/acme/x.git\n"
+        } else {
+            "[core]\n\tbare = false\n"
+        };
+        std::fs::write(git.join("config"), body).unwrap();
+    }
+
+    #[test]
+    fn scan_detects_only_cloned_existing_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A cloned existing repo with a manifest → detected.
+        let cloned = root.join("acme-lib");
+        std::fs::create_dir_all(&cloned).unwrap();
+        std::fs::write(cloned.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        write_git_config(&cloned, true);
+
+        // A blank prototype (no origin) → ignored even with a manifest.
+        let proto = root.join("fresh-proto");
+        std::fs::create_dir_all(&proto).unwrap();
+        std::fs::write(proto.join("package.json"), "{}").unwrap();
+        write_git_config(&proto, false);
+
+        // A non-project dir (e.g. the memory store) → ignored.
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+
+        let found = scan_attachable_repos(root);
+        assert_eq!(found, vec![cloned]);
+    }
+
+    #[test]
+    fn scan_skips_already_attached_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("acme-lib");
+        std::fs::create_dir_all(repo.join(ATTACH_STATE_DIR)).unwrap();
+        std::fs::write(repo.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+        write_git_config(&repo, true);
+        // Marker present → the runner already attached it.
+        std::fs::write(
+            repo.join(ATTACH_STATE_DIR).join(ATTACH_MARKER),
+            "2026-07-17",
+        )
+        .unwrap();
+        assert!(scan_attachable_repos(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_of_missing_root_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(scan_attachable_repos(&tmp.path().join("nope")).is_empty());
+    }
+
+    // ── M22 S1: skills-materialize into the session /data ────────────────
+
+    /// A skill directory with an executable `scripts/run.sh` helper under
+    /// `skills_root/<name>` — the fixture shape S1 must make runnable.
+    fn write_skill_with_script(skills_root: &std::path::Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = skills_root.join(name);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: desc-of-{name}\n---\n# {name}\nbody\n"),
+        )
+        .unwrap();
+        let script = dir.join("scripts").join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+    }
+
+    /// A manager whose only non-default field is a configured global
+    /// `skills_dir` — enough to exercise `materialize_session_skills`.
+    fn manager_with_skills(
+        db: &CentralDb,
+        data_dir: &std::path::Path,
+        skills_dir: &std::path::Path,
+    ) -> Arc<ContainerManager> {
+        let mut cfg = manager_cfg(data_dir.to_path_buf());
+        cfg.skills_dir = Some(skills_dir.to_path_buf());
+        Arc::new(ContainerManager::new(
+            db.clone(),
+            Arc::new(HoldRuntime::default()) as Arc<dyn ContainerRuntime>,
+            cfg,
+        ))
+    }
+
+    /// Persist a container config for `ag` with the given selector + coding
+    /// flag so the selector-resolution path has a row to read.
+    fn upsert_group_cfg(
+        db: &CentralDb,
+        ag: copperclaw_types::AgentGroupId,
+        skills: container_configs::SkillsSelector,
+        coding_enabled: bool,
+    ) {
+        container_configs::upsert(
+            db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: ag,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec![],
+                packages_npm: vec![],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled,
+                surface_thinking: false,
+                tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
+                check_command: None,
+                verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
+            },
+        )
+        .unwrap();
+    }
+
+    fn materialized_farm(data_root: &std::path::Path, s: &Session) -> std::path::PathBuf {
+        SessionPaths::new(data_root, s.agent_group_id, s.id)
+            .root
+            .join(MATERIALIZED_SKILLS_SUBDIR)
+    }
+
+    /// Acceptance (unit + integration-at-the-layer-below): materialize is
+    /// invoked with the resolved skill set and produces a symlink farm under
+    /// the session `/data/skills`, through which a skill's helper script is
+    /// reachable AND executable — exactly what the container sees at
+    /// `/data/skills/<id>/scripts/run.sh`. A full container spawn is not
+    /// harness-drivable (the mock runtimes never exec), so executability is
+    /// asserted host-side through the same symlink the bind mount exposes.
+    #[test]
+    fn materialize_stages_selected_skill_scripts_into_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        let skills_root = tmp.path().join("skills");
+        write_skill_with_script(&skills_root, "alpha");
+        write_skill_with_script(&skills_root, "beta");
+        let mgr = manager_with_skills(&db, tmp.path(), &skills_root);
+
+        mgr.materialize_session_skills(&session);
+
+        let farm = materialized_farm(tmp.path(), &session);
+        // Default selector (no container config) is `All`: both skills link.
+        for name in ["alpha", "beta"] {
+            let link = farm.join(name);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} must be a symlink in the materialized farm",
+            );
+        }
+        // The helper script is reachable + executable THROUGH the farm.
+        let script = farm.join("alpha").join("scripts").join("run.sh");
+        let meta = std::fs::metadata(&script).unwrap(); // follows the symlink
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "materialized skill helper must be executable through the farm",
+        );
+    }
+
+    /// An `Explicit` selector materializes only the named skills.
+    #[test]
+    fn materialize_honours_explicit_selector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        let skills_root = tmp.path().join("skills");
+        write_skill_with_script(&skills_root, "alpha");
+        write_skill_with_script(&skills_root, "beta");
+        upsert_group_cfg(
+            &db,
+            session.agent_group_id,
+            container_configs::SkillsSelector::Explicit(vec!["alpha".into()]),
+            false,
+        );
+        let mgr = manager_with_skills(&db, tmp.path(), &skills_root);
+
+        mgr.materialize_session_skills(&session);
+
+        let farm = materialized_farm(tmp.path(), &session);
+        assert!(
+            farm.join("alpha").exists(),
+            "explicitly selected skill must materialize",
+        );
+        assert!(
+            !farm.join("beta").exists(),
+            "unselected skill must not materialize",
+        );
+    }
+
+    /// The coding-skills cap applies to the materialized set exactly as it
+    /// does to the prompt: a coding-bundle skill is dropped from `All` when
+    /// `coding_enabled` is false, so it never reaches the container.
+    #[test]
+    fn materialize_excludes_coding_skills_when_coding_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        let skills_root = tmp.path().join("skills");
+        assert!(CODING_SKILL_NAMES.contains(&"coding-task"));
+        write_skill_with_script(&skills_root, "coding-task");
+        write_skill_with_script(&skills_root, "alpha");
+        upsert_group_cfg(
+            &db,
+            session.agent_group_id,
+            container_configs::SkillsSelector::All,
+            false,
+        );
+        let mgr = manager_with_skills(&db, tmp.path(), &skills_root);
+
+        mgr.materialize_session_skills(&session);
+
+        let farm = materialized_farm(tmp.path(), &session);
+        assert!(farm.join("alpha").exists(), "non-coding skill materializes");
+        assert!(
+            !farm.join("coding-task").exists(),
+            "coding skill is capped out of All when coding_enabled is false",
+        );
+    }
+
+    /// No configured global skills dir -> a clean no-op: the farm dir is
+    /// never even created, and the spawn is untouched.
+    #[test]
+    fn materialize_is_noop_without_skills_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        // Default manager_cfg leaves skills_dir = None.
+        let mgr = make_manager(
+            &db,
+            Arc::new(HoldRuntime::default()) as _,
+            tmp.path(),
+            &Arc::new(SpawnActivity::new()),
+        );
+        mgr.materialize_session_skills(&session);
+        assert!(
+            !materialized_farm(tmp.path(), &session).exists(),
+            "no skills dir configured -> no farm created",
+        );
+    }
+
+    /// Re-running the materialize step across spawns is idempotent: the
+    /// farm still resolves to the same skill dir (materialize re-points
+    /// stale links and leaves matching ones).
+    #[test]
+    fn materialize_is_idempotent_across_spawns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        let skills_root = tmp.path().join("skills");
+        write_skill_with_script(&skills_root, "alpha");
+        let mgr = manager_with_skills(&db, tmp.path(), &skills_root);
+
+        mgr.materialize_session_skills(&session);
+        mgr.materialize_session_skills(&session);
+
+        let link = materialized_farm(tmp.path(), &session).join("alpha");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            skills_root.join("alpha").canonicalize().unwrap(),
+            "farm link must still resolve to the skill dir after re-materialize",
+        );
+    }
+
+    /// End-to-end against the committed on-disk fixture skill
+    /// (`fixtures/skills/runnable-helper`, which ships an executable
+    /// `scripts/greet.sh`): materialize stages it into the session
+    /// `/data/skills`, and its helper is executable through the farm — the
+    /// container's view of `/data/skills/runnable-helper/scripts/greet.sh`.
+    #[test]
+    fn materialize_makes_fixture_helper_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture_skills = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/skills")
+            .canonicalize()
+            .expect("fixtures/skills must exist");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let session = cold_session(&db, tmp.path());
+        let mgr = manager_with_skills(&db, tmp.path(), &fixture_skills);
+
+        mgr.materialize_session_skills(&session);
+
+        let script = materialized_farm(tmp.path(), &session)
+            .join("runnable-helper")
+            .join("scripts")
+            .join("greet.sh");
+        let meta = std::fs::metadata(&script).unwrap(); // follows the farm symlink
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "fixture helper must be executable through the materialized farm",
         );
     }
 }

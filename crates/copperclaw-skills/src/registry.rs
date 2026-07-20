@@ -78,20 +78,56 @@ impl Skill {
 
 /// Selector for which skills should be exposed to an agent group.
 ///
-/// Mirrors `copperclaw_db::tables::container_configs::SkillsSelector`:
-/// - `All` serializes as the JSON string `"all"`.
-/// - `Explicit(Vec<String>)` serializes as a JSON array of names.
+/// - `All` serializes as the JSON string `"all"` — every discovered skill
+///   inlines. This is the **default** (decision **e**): lowest risk, no
+///   task context required.
+/// - `Explicit(Vec<String>)` serializes as a JSON array of names — only the
+///   named skills, in listed order.
+/// - `Relevant { query, limit }` serializes as `{"relevant": {"query": ...,
+///   "limit": N}}` — an FTS-scored narrowing (M22 S2). Only the up-to-`limit`
+///   skills whose `description` is most relevant to `query` inline, cutting
+///   the all-skills prompt bloat noted in `copperclaw-runner`'s
+///   `compaction.rs`. `query` is the current task text supplied at
+///   selection time; `limit` is the cap on how many skills survive. See
+///   [`SkillRegistry::select_relevant`] and [`crate::relevance`].
+///
+/// `All`/`Explicit` mirror `copperclaw_db::tables::container_configs::
+/// SkillsSelector`; `Relevant` is skills-crate-only until the host config
+/// surface grows a matching persisted form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillsSelector {
     All,
     Explicit(Vec<String>),
+    /// FTS-scored narrowing: inline only the top-`limit` skills whose
+    /// `description` is relevant to `query`.
+    Relevant {
+        query: String,
+        limit: usize,
+    },
 }
 
 impl Serialize for SkillsSelector {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
         match self {
             SkillsSelector::All => ser.serialize_str("all"),
             SkillsSelector::Explicit(v) => v.serialize(ser),
+            SkillsSelector::Relevant { query, limit } => {
+                #[derive(Serialize)]
+                struct RelevantBody<'a> {
+                    query: &'a str,
+                    limit: usize,
+                }
+                let mut map = ser.serialize_map(Some(1))?;
+                map.serialize_entry(
+                    "relevant",
+                    &RelevantBody {
+                        query,
+                        limit: *limit,
+                    },
+                )?;
+                map.end()
+            }
         }
     }
 }
@@ -108,8 +144,22 @@ impl<'de> Deserialize<'de> for SkillsSelector {
             serde_json::Value::Array(_) => serde_json::from_value::<Vec<String>>(v)
                 .map(SkillsSelector::Explicit)
                 .map_err(D::Error::custom),
+            serde_json::Value::Object(ref map) if map.contains_key("relevant") => {
+                #[derive(Deserialize)]
+                struct RelevantBody {
+                    #[serde(default)]
+                    query: String,
+                    limit: usize,
+                }
+                let body: RelevantBody =
+                    serde_json::from_value(map["relevant"].clone()).map_err(D::Error::custom)?;
+                Ok(SkillsSelector::Relevant {
+                    query: body.query,
+                    limit: body.limit,
+                })
+            }
             other => Err(D::Error::custom(format!(
-                "expected \"all\" or a JSON array, got {other}"
+                "expected \"all\", a JSON array, or {{\"relevant\": ...}}, got {other}"
             ))),
         }
     }
@@ -189,6 +239,9 @@ impl SkillRegistry {
     /// the order they appear in `names`. Names that don't exist in the
     /// registry are **skipped** (and logged at `warn`); this keeps a group
     /// usable when a referenced skill has been removed.
+    /// `SkillsSelector::Relevant { query, limit }` returns the FTS-scored
+    /// subset (see [`Self::select_relevant`]); an off-topic `query` yields
+    /// fewer skills than `All`, shrinking the inlined prompt.
     pub fn list_for_group(&self, _ag: AgentGroupId, selector: &SkillsSelector) -> Vec<Skill> {
         match selector {
             SkillsSelector::All => self.skills.values().cloned().collect(),
@@ -203,6 +256,43 @@ impl SkillRegistry {
                     }
                 }
                 out
+            }
+            SkillsSelector::Relevant { query, limit } => self.select_relevant(query, *limit),
+        }
+    }
+
+    /// Rank the registry's skills by how relevant each one's `description` is
+    /// to `query` and return the top `limit`, most-relevant first.
+    ///
+    /// Reuses the memory store's full-text path via
+    /// [`crate::relevance::rank_descriptions`] (in-memory `SQLite` FTS5 + `bm25`,
+    /// normalized to `[0, 1]`). Only skills whose description *matched* the
+    /// query are returned, so an off-topic query returns **fewer** skills than
+    /// [`SkillsSelector::All`] would — the whole point of the narrowing
+    /// (decision **e**): inline stays default, relevance trims what inlines.
+    ///
+    /// Fail-open: an empty/tokenless `query` or an FTS error falls back to the
+    /// full registry so a scoring hiccup never silently strips every skill.
+    #[must_use]
+    pub fn select_relevant(&self, query: &str, limit: usize) -> Vec<Skill> {
+        if query.trim().is_empty() {
+            // No task context to score against -> behave like `All`.
+            return self.skills.values().cloned().collect();
+        }
+        let items: Vec<(String, String)> = self
+            .skills
+            .values()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
+        match crate::relevance::rank_descriptions(&items, query) {
+            Ok(ranked) => ranked
+                .into_iter()
+                .take(limit)
+                .filter_map(|r| self.skills.get(&r.name).cloned())
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "relevance scoring failed; falling back to all skills");
+                self.skills.values().cloned().collect()
             }
         }
     }
@@ -350,6 +440,35 @@ mod tests {
         assert_eq!(json, "[\"a\",\"b\"]");
         let back: SkillsSelector = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn selector_serde_relevant() {
+        let s = SkillsSelector::Relevant {
+            query: "deploy the telegram bot".into(),
+            limit: 8,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(
+            json,
+            "{\"relevant\":{\"query\":\"deploy the telegram bot\",\"limit\":8}}"
+        );
+        let back: SkillsSelector = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn selector_serde_relevant_query_defaults_empty() {
+        // A persisted form that carries only a limit round-trips with an
+        // empty query (the query is a runtime concern the host injects).
+        let back: SkillsSelector = serde_json::from_str("{\"relevant\":{\"limit\":3}}").unwrap();
+        assert_eq!(
+            back,
+            SkillsSelector::Relevant {
+                query: String::new(),
+                limit: 3
+            }
+        );
     }
 
     #[test]
@@ -572,6 +691,110 @@ mod tests {
         let reg = SkillRegistry::scan(&global, None).unwrap();
         let listed = reg.list_for_group(AgentGroupId::new(), &SkillsSelector::Explicit(vec![]));
         assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn select_relevant_ranks_on_topic_first_and_narrows() {
+        let td = TempDir::new().unwrap();
+        let global = td.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        write_skill(
+            &global,
+            "git-workflow",
+            "git-workflow",
+            "commit branch and push in git",
+        );
+        write_skill(
+            &global,
+            "dataviz",
+            "dataviz",
+            "build charts and dashboards to visualize data",
+        );
+        write_skill(
+            &global,
+            "research",
+            "research",
+            "fan out web searches and cite a report",
+        );
+        let reg = SkillRegistry::scan(&global, None).unwrap();
+
+        // On-topic query: the git skill ranks first, unrelated skills drop out.
+        let picked = reg.select_relevant("help me commit my branch in git", 10);
+        assert_eq!(picked.first().unwrap().name, "git-workflow");
+        assert!(picked.iter().all(|s| s.name != "dataviz"));
+        assert!(
+            picked.len() < reg.len(),
+            "off-topic skills excluded -> fewer than All"
+        );
+    }
+
+    #[test]
+    fn select_relevant_off_topic_is_smaller_than_all() {
+        let td = TempDir::new().unwrap();
+        let global = td.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        write_skill(
+            &global,
+            "git-workflow",
+            "git-workflow",
+            "commit and branch in git",
+        );
+        write_skill(
+            &global,
+            "dataviz",
+            "dataviz",
+            "build charts to visualize data",
+        );
+        write_skill(&global, "research", "research", "fan out web searches");
+        let reg = SkillRegistry::scan(&global, None).unwrap();
+
+        let all = reg.list_for_group(AgentGroupId::new(), &SkillsSelector::All);
+        let relevant = reg.list_for_group(
+            AgentGroupId::new(),
+            &SkillsSelector::Relevant {
+                query: "quantum gardening ornithology".into(),
+                limit: 10,
+            },
+        );
+        assert_eq!(all.len(), 3);
+        assert!(
+            relevant.len() < all.len(),
+            "off-topic Relevant must inline fewer skills than All: {} vs {}",
+            relevant.len(),
+            all.len()
+        );
+        assert!(relevant.is_empty(), "nothing overlaps the query");
+    }
+
+    #[test]
+    fn select_relevant_respects_limit() {
+        let td = TempDir::new().unwrap();
+        let global = td.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        for i in 0..5 {
+            write_skill(
+                &global,
+                &format!("skill-{i}"),
+                &format!("skill-{i}"),
+                "shared deployment keyword body",
+            );
+        }
+        let reg = SkillRegistry::scan(&global, None).unwrap();
+        let picked = reg.select_relevant("deployment", 2);
+        assert_eq!(picked.len(), 2, "limit caps the number of relevant skills");
+    }
+
+    #[test]
+    fn select_relevant_empty_query_falls_back_to_all() {
+        let td = TempDir::new().unwrap();
+        let global = td.path().join("global");
+        fs::create_dir_all(&global).unwrap();
+        write_skill(&global, "a", "a", "alpha");
+        write_skill(&global, "b", "b", "beta");
+        let reg = SkillRegistry::scan(&global, None).unwrap();
+        // No usable query -> behave like All rather than strip everything.
+        let picked = reg.select_relevant("   ", 10);
+        assert_eq!(picked.len(), 2);
     }
 
     #[test]

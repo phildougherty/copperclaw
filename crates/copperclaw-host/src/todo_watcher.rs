@@ -162,12 +162,17 @@ impl TodoWatcher {
         emitted
     }
 
-    /// Loop until shutdown. No-op (returns immediately) when the env
-    /// var is off — operators that don't want todo notifications
-    /// shouldn't pay even the polling cost.
+    /// Loop until shutdown. When the env var is off the watcher does no
+    /// polling — but it must still PARK on the shutdown token rather than
+    /// return, because this future is a supervised loop: the supervisor
+    /// treats any return while the host is running as an unexpected exit
+    /// (`is_cancelled() == false`) and restart-storms it forever (surfacing
+    /// as `todo_watcher (dead)` in `cclaw doctor`). Parking makes a disabled
+    /// opt-in loop a well-behaved idle task that exits only on real shutdown.
     pub async fn run_loop(self: Arc<Self>, shutdown: CancellationToken) {
         if !enable_from_env() {
-            debug!("todo_watcher: {ENABLE_ENV_VAR} not set; skipping background watcher",);
+            debug!("todo_watcher: {ENABLE_ENV_VAR} not set; idling until shutdown",);
+            shutdown.cancelled().await;
             return;
         }
         loop {
@@ -431,5 +436,46 @@ mod tests {
         let curr = vec![t(1, "Keep", "pending")];
         let out = diff_to_notifications(&prev, &curr);
         assert!(out.is_empty(), "deletes should be silent: {out:?}");
+    }
+
+    struct NoopDispatcher;
+    impl DeliveryDispatcher for NoopDispatcher {
+        fn set_typing(
+            &self,
+            _t: &DispatchTarget,
+        ) -> Option<tokio::sync::oneshot::Receiver<copperclaw_modules::TypingOutcome>> {
+            None
+        }
+        fn dispatch(&self, _t: &DispatchTarget, _m: &OutboundMessage) {}
+    }
+
+    /// A disabled watcher (env var unset — the default) must PARK on the
+    /// shutdown token, never return while the host runs — else the supervisor
+    /// classifies the return as an unexpected exit and restart-storms it,
+    /// surfacing as `todo_watcher (dead)` in `cclaw doctor`. Regression guard.
+    #[tokio::test]
+    async fn disabled_watcher_parks_until_shutdown_instead_of_returning() {
+        // COPPERCLAW_TODO_NOTIFICATIONS is unset in the test env → disabled path.
+        let central = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let watcher = std::sync::Arc::new(TodoWatcher::new(
+            central,
+            std::sync::Arc::new(NoopDispatcher),
+            tmp.path(),
+        ));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(std::sync::Arc::clone(&watcher).run_loop(shutdown.clone()));
+        // Before the fix this returned immediately; assert it is still parked.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "disabled watcher returned instead of parking — supervisor will restart-storm it"
+        );
+        // On real shutdown it drains promptly (an expected exit).
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("watcher returns promptly on shutdown")
+            .expect("run_loop task did not panic");
     }
 }

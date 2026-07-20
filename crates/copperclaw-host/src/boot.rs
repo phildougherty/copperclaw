@@ -942,6 +942,26 @@ pub async fn run_host(
         });
     }
 
+    // 13d. Child reaper. Periodically reclaims orphaned `create_agent`
+    // child sessions — a botched or abandoned delegation otherwise leaves
+    // the child's agent_group + session as an idle-but-warm, cost-burning
+    // agent. Conservative criteria (child-only, stopped, past a TTL grace,
+    // no pending inbound) live in `child_reaper` + the SQL guard in
+    // `sessions::list_reapable_children`. On by default; disable via
+    // `COPPERCLAW_CHILD_REAP=0`, tune the grace via
+    // `COPPERCLAW_CHILD_REAP_IDLE_SECS` (default 900s, floored at 60s).
+    let child_reaper = Arc::new(crate::child_reaper::ChildReaper::new(
+        state.central.clone(),
+        cfg.data_dir.clone(),
+    ));
+    {
+        let reaper = Arc::clone(&child_reaper);
+        let sd = shutdown.clone();
+        supervisor.register("child_reaper", move || {
+            Arc::clone(&reaper).run_loop(sd.clone())
+        });
+    }
+
     // Start the supervised loops + driver. `supervised` resolves only
     // after shutdown once every registered loop has drained; the status
     // Arc feeds the `host.status` handler on the admin socket below.

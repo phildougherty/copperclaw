@@ -42,6 +42,11 @@ pub enum SkillsSelector {
     All,
     /// Explicit allowlist of skill names. Serialized as a JSON array.
     Explicit(Vec<String>),
+    /// M22 S2: FTS relevance narrowing — inline only the top-`limit` skills
+    /// whose description scores against `query`. Serialized as the object
+    /// `{"relevant": {"query": "...", "limit": N}}`, matching the skills
+    /// crate's `SkillsSelector::Relevant` JSON shape 1:1.
+    Relevant { query: String, limit: usize },
 }
 
 impl Serialize for SkillsSelector {
@@ -49,6 +54,9 @@ impl Serialize for SkillsSelector {
         match self {
             SkillsSelector::All => ser.serialize_str("all"),
             SkillsSelector::Explicit(v) => v.serialize(ser),
+            SkillsSelector::Relevant { query, limit } => {
+                serde_json::json!({ "relevant": { "query": query, "limit": limit } }).serialize(ser)
+            }
         }
     }
 }
@@ -56,38 +64,55 @@ impl Serialize for SkillsSelector {
 impl<'de> Deserialize<'de> for SkillsSelector {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(de)?;
-        match v {
-            serde_json::Value::String(s) if s == "all" => Ok(SkillsSelector::All),
-            serde_json::Value::String(other) => Err(de::Error::custom(format!(
-                "expected \"all\", got \"{other}\""
-            ))),
-            serde_json::Value::Array(_) => serde_json::from_value::<Vec<String>>(v)
-                .map(SkillsSelector::Explicit)
-                .map_err(de::Error::custom),
-            other => Err(de::Error::custom(format!(
-                "expected \"all\" or a JSON array, got {other}"
-            ))),
-        }
+        SkillsSelector::from_value(v).map_err(de::Error::custom)
     }
 }
 
 impl SkillsSelector {
+    /// Shared JSON → `SkillsSelector` parse used by both `Deserialize` and
+    /// `from_json_str`, so the two paths can never drift.
+    fn from_value(v: serde_json::Value) -> Result<Self, String> {
+        match v {
+            serde_json::Value::String(s) if s == "all" => Ok(SkillsSelector::All),
+            serde_json::Value::String(other) => Err(format!("expected \"all\", got \"{other}\"")),
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<String>>(v)
+                .map(SkillsSelector::Explicit)
+                .map_err(|e| e.to_string()),
+            serde_json::Value::Object(ref map) if map.contains_key("relevant") => {
+                let inner = &map["relevant"];
+                let query = inner
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let limit = inner
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+                    .ok_or_else(|| "relevant selector missing integer \"limit\"".to_string())?;
+                Ok(SkillsSelector::Relevant { query, limit })
+            }
+            other => Err(format!(
+                "expected \"all\", a JSON array, or {{\"relevant\": ...}}, got {other}"
+            )),
+        }
+    }
+
     fn into_json_string(self) -> Result<String, DbError> {
         match self {
             SkillsSelector::All => Ok("\"all\"".to_string()),
             SkillsSelector::Explicit(v) => Ok(serde_json::to_string(&v)?),
+            SkillsSelector::Relevant { query, limit } => Ok(serde_json::json!({
+                "relevant": { "query": query, "limit": limit }
+            })
+            .to_string()),
         }
     }
 
     fn from_json_str(s: &str) -> Result<Self, DbError> {
         let v: serde_json::Value = serde_json::from_str(s)?;
-        match v {
-            serde_json::Value::String(s) if s == "all" => Ok(SkillsSelector::All),
-            serde_json::Value::Array(_) => Ok(SkillsSelector::Explicit(serde_json::from_value(v)?)),
-            other => Err(DbError::invariant(format!(
-                "invalid skills selector JSON: {other}"
-            ))),
-        }
+        SkillsSelector::from_value(v)
+            .map_err(|e| DbError::invariant(format!("invalid skills selector JSON: {e}")))
     }
 }
 
@@ -693,6 +718,8 @@ pub fn compute_fingerprint(cfg: &ContainerConfig) -> String {
     let skills_s = match &cfg.skills {
         SkillsSelector::All => "all".to_string(),
         SkillsSelector::Explicit(v) => v.join(","),
+        // M22 S2: stable hash contribution for the relevance selector.
+        SkillsSelector::Relevant { query, limit } => format!("relevant:{limit}:{query}"),
     };
     hasher.update(skills_s.as_bytes());
     hasher.update(b"\nmcp=");

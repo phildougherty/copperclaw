@@ -1,0 +1,35 @@
+{
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "id": "msg_replay_transcript_render_004"
+      }
+    },
+    {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "tool_use",
+        "id": "toolu_replay_transcript_render_004",
+        "name": "edit_file",
+        "input": {}
+      }
+    },
+    {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{\"path\": \"/tmp/copperclaw-m22-transcript-render/notes.txt\", \"old_string\": \"The quick summary line goes here.\", \"new_string\": \"Ship notes for the 0.9 cut: faster spawns, quieter logs.\"}"
+      }
+    },
+    {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    {
+      "type": "message_stop"
+    }
+  ]
+}

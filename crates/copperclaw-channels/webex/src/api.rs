@@ -14,9 +14,10 @@
 //! Error response bodies follow `{"message": "...", "errors": [...]}` and the
 //! `message` text is surfaced in the error string.
 
+use crate::factory::CHANNEL_TYPE_STR;
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, DiffCard, ErrorCard,
-    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Response, StatusCode};
@@ -481,14 +482,13 @@ const ACTIVITY_STEPS_CONTAINER_ID: &str = "activity_steps";
 
 /// ASCII-only status marker per the project's no-emoji rule (even
 /// non-emoji Unicode check / cross glyphs render as colourful emoji on
-/// some clients). Matches Telegram's `breadcrumb_glyph` / Teams's
+/// some clients), looked up through the transcript vocabulary
+/// ([`vocab::for_channel`] binds `webex` to [`vocab::ASCII`],
+/// byte-identical to the literals this adapter hardcoded before
+/// M22 A4). Matches Telegram's `breadcrumb_glyph` / Teams's
 /// `breadcrumb_marker`.
 fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// Adaptive-card colour for a breadcrumb / step status.
@@ -794,11 +794,15 @@ pub fn build_adaptive_todo_list(list: &TodoList) -> Value {
         "wrap": true,
     }));
     for item in list.items.iter().take(48) {
-        let (glyph, color) = match item.status {
-            TodoItemStatus::Completed => ("[x]", "Good"),
-            TodoItemStatus::InProgress => ("[~]", "Warning"),
-            TodoItemStatus::Blocked => ("[!]", "Attention"),
-            TodoItemStatus::Pending => ("[ ]", "Default"),
+        // ASCII-only glyphs via the vocab binding, per the project's
+        // no-emoji rule; the adaptive-card colour stays local (it is
+        // Webex theming, not transcript vocabulary).
+        let glyph = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
+        let color = match item.status {
+            TodoItemStatus::Completed => "Good",
+            TodoItemStatus::InProgress => "Warning",
+            TodoItemStatus::Blocked => "Attention",
+            TodoItemStatus::Pending => "Default",
         };
         let text = match item.blocked_reason_text() {
             Some(reason) => format!("{glyph} {} (blocked: {reason})", item.text.trim()),
@@ -1020,6 +1024,61 @@ mod tests {
 
     fn api(server: &MockServer) -> WebexApi {
         WebexApi::new(server.uri(), "tok-test")
+    }
+
+    #[test]
+    fn breadcrumb_marker_is_byte_identical_to_pre_vocab_literals() {
+        // M22 A4 byte-identity gate for the vocab rerouting: hardcoded
+        // literal expectations, NOT read through vocab constants (which
+        // would be circular).
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Running), "[~]");
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Done), "[ok]");
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Failed), "[x]");
+    }
+
+    #[test]
+    fn build_adaptive_todo_list_items_are_byte_identical_to_pre_vocab_literals() {
+        // Same M22 A4 byte-identity gate for the todo checkbox glyphs
+        // (all four statuses): hardcoded literal expectations.
+        use copperclaw_channels_core::TodoListItem;
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on API key".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        let card = build_adaptive_todo_list(&list);
+        let body = card["body"].as_array().expect("card body array");
+        assert_eq!(body[1]["text"], "[x] done item");
+        assert_eq!(body[2]["text"], "[~] active item");
+        assert_eq!(
+            body[3]["text"],
+            "[!] stuck item (blocked: waiting on API key)"
+        );
+        assert_eq!(body[4]["text"], "[ ] later item");
     }
 
     #[tokio::test]

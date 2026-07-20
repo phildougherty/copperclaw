@@ -243,6 +243,15 @@ pub(super) async fn run_llm_turn(
             if let Some(reason) = DegradeReason::from_error_text(&usage_reason) {
                 health.record_failure(idx, reason, turn_started_at);
             }
+            // M22 B4: fold this failed-but-billed call's tokens into the
+            // live per-inbound spend the Task HUD renders (a failed
+            // stream can still have billed a partial turn).
+            deps.spend.record(
+                provider_name,
+                model,
+                attempt.input_tokens,
+                attempt.output_tokens,
+            );
             emit_usage_report(
                 deps,
                 provider_name,
@@ -293,6 +302,14 @@ pub(super) async fn run_llm_turn(
         let mut out = attempt.out;
         out.input_tokens = attempt.input_tokens;
         out.output_tokens = attempt.output_tokens;
+        // M22 B4: fold this call's billed tokens into the live
+        // per-inbound spend the Task HUD renders.
+        deps.spend.record(
+            provider_name,
+            model,
+            attempt.input_tokens,
+            attempt.output_tokens,
+        );
         emit_usage_report(
             deps,
             provider_name,

@@ -1,0 +1,10 @@
+{
+  "_note": "Granted-act, round 1: the autonomous fire takes the pre-authorized credentialed-external action (web_fetch). The M22 A2 gate OPENS because the firing task's grant permits `web_fetch`, so the call is admitted (not the `autonomous (heartbeat/scheduled) turn` deny) and exactly one fire is charged BEFORE dispatch (a `grant_consume` System row). The URL is a loopback literal so the tool's own SSRF net-guard rejects it instantly and offline — that guard is orthogonal to the autonomy gate under test (the gate already opened + charged the fire); the deterministic proof is the grant_consume row, not the fetch body. Swap for mcp__<server>__post_message + a `mcp:<server>` grant for the 'send the granted message' framing.",
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_grant_granted_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_grant_1", "name": "web_fetch", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"url\": \"http://127.0.0.1/standup-digest\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

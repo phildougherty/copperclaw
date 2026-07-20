@@ -780,8 +780,21 @@ fn resolve_bind(preview_bind: Option<&str>) -> IpAddr {
     }
 }
 
+/// Environment variable that overrides the advertised host in preview URLs.
+/// Set it to a stable name/IP by which the operator's machine is reachable from
+/// wherever they open the link — e.g. a Tailscale `MagicDNS` name
+/// (`desk-1.tailXXXXXX.ts.net`) for off-LAN access over the tailnet, where the
+/// auto-detected `192.168.x` LAN IP would be unreachable. The proxy still
+/// *binds* per `preview_bind` (typically `0.0.0.0`, which includes the
+/// tailscale interface); this only changes the host rendered into the URL.
+/// Bare host only — no scheme, no port (the port is appended from the bound
+/// listener). Empty / unset falls back to LAN detection.
+const PREVIEW_HOST_ENV: &str = "COPPERCLAW_PREVIEW_HOST";
+
 /// The host string to render into the shareable URL for a given bind address.
 ///
+/// * [`PREVIEW_HOST_ENV`] set → that value verbatim (operator override, e.g. a
+///   Tailscale `MagicDNS` name), regardless of the bind.
 /// * A loopback bind → `127.0.0.1` (reachable from the host only).
 /// * A specific routable bind IP → that IP verbatim.
 /// * The unspecified bind (`0.0.0.0`) → the host's primary LAN IP, detected via
@@ -789,11 +802,28 @@ fn resolve_bind(preview_bind: Option<&str>) -> IpAddr {
 ///   packet is sent — and read the kernel-chosen source address). Falls back to
 ///   `127.0.0.1` when detection fails.
 fn display_host(bind: IpAddr) -> String {
+    if let Some(host) = preview_host_override() {
+        return host;
+    }
     if bind.is_unspecified() {
         primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string())
     } else {
         bind.to_string()
     }
+}
+
+/// Operator-configured advertised host for preview URLs, from
+/// [`PREVIEW_HOST_ENV`]. Trimmed; an empty value reads as unset.
+fn preview_host_override() -> Option<String> {
+    normalize_preview_host(std::env::var(PREVIEW_HOST_ENV).ok())
+}
+
+/// Normalize a raw [`PREVIEW_HOST_ENV`] value: trim surrounding whitespace and
+/// treat an empty/whitespace-only string as unset. Split out from the env read
+/// so it can be unit-tested without mutating process env (which the workspace's
+/// `unsafe`-free rule forbids).
+fn normalize_preview_host(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Detect the host's primary LAN IP without sending any packets: a UDP socket
@@ -1609,6 +1639,25 @@ mod tests {
     fn display_host_for_loopback_and_specific() {
         assert_eq!(display_host(IpAddr::V4(Ipv4Addr::LOCALHOST)), "127.0.0.1");
         assert_eq!(display_host("10.1.2.3".parse().unwrap()), "10.1.2.3");
+    }
+
+    #[test]
+    fn normalize_preview_host_trims_and_treats_empty_as_unset() {
+        assert_eq!(normalize_preview_host(None), None);
+        assert_eq!(normalize_preview_host(Some(String::new())), None);
+        assert_eq!(normalize_preview_host(Some("   ".into())), None);
+        assert_eq!(
+            normalize_preview_host(Some("  example.tailnet.ts.net  ".into())),
+            Some("example.tailnet.ts.net".to_string())
+        );
+    }
+
+    #[test]
+    fn preview_url_renders_tailscale_magicdns_host() {
+        // A Tailscale `MagicDNS` name has no `:`, so it renders unbracketed and
+        // the operator can open the link from anywhere on the tailnet.
+        let u = preview_url("example.tailnet.ts.net", 8100, "deadbeef");
+        assert_eq!(u, "http://example.tailnet.ts.net:8100/__preview/deadbeef");
     }
 
     #[test]

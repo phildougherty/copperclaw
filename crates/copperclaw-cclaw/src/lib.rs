@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod commands;
+pub mod disk;
 pub mod output;
 pub mod protocol;
 pub mod security;
@@ -220,6 +221,8 @@ where
         Ok(data) => {
             let text = if cli.json {
                 render_json_pretty(&data)
+            } else if call.command == "usage.rollup" {
+                render_usage_rollup(&data, palette)
             } else {
                 render_with(&data, palette)
             };
@@ -258,13 +261,96 @@ where
         "doctor" => run_doctor(args, transport, caller, as_json, palette).await,
         "security-audit" => security::run_security_audit(args, transport, caller, as_json).await,
         "completions" => run_completions(args),
-        "chat" => run_chat(args).await,
+        "chat" => run_chat(args, palette).await,
         "dashboard" => run_dashboard(transport, caller, as_json, palette).await,
         "groups.config-edit" => run_groups_config_edit(args, transport, caller).await,
         "sessions-get" => run_sessions_get(args, transport, caller, as_json, palette).await,
         "sessions-tail" => run_sessions_tail(args, transport, caller, as_json, palette).await,
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `cclaw usage` — token rollup table with a dollar cost column.
+// ---------------------------------------------------------------------------
+
+/// What an unpriced cost renders as: an em dash, never "$0.00". A zero
+/// is a claim ("this cost nothing"); a dash is an admission ("we don't
+/// know") — the host sends `cost_micros: null` for unknown models
+/// precisely so surfaces can keep the two apart.
+const COST_UNKNOWN: &str = "\u{2014}";
+
+/// Format a micro-dollar amount as dollars, rounded half-up to cents.
+///
+/// `420_000` micros -> `"$0.42"`; `425_000` -> `"$0.43"` (half rounds
+/// up). A genuine priced sub-cent value collapses to `"$0.00"` (3300
+/// micros = $0.0033), which is fine *because it was priced* — rendering
+/// an unknown cost is the caller's job, via [`COST_UNKNOWN`].
+fn format_cost_dollars(micros: u64) -> String {
+    let cents = micros.saturating_add(5_000) / 10_000;
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// Render the `usage.rollup` payload as the human `cclaw usage` table.
+///
+/// The wire payload (kept verbatim under `--json`) carries per-model
+/// slices (`models`), raw `cost_micros`, and `pricing_as_of` repeated on
+/// every row. The generic table renderer would dump all of that —
+/// nested JSON in a cell, micros nobody can read — so this projects each
+/// row down to the scalar columns, formats the group cost as dollars
+/// (em dash when the host could not price every model slice), and lifts
+/// `pricing_as_of` into a single footer line so stale pricing tables are
+/// self-evident.
+fn render_usage_rollup(data: &serde_json::Value, palette: Palette) -> String {
+    let Some(rows) = data.as_array() else {
+        return render_with(data, palette);
+    };
+    if rows.is_empty() || !rows.iter().all(serde_json::Value::is_object) {
+        return render_with(data, palette);
+    }
+    let projected: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            // preserve_order is on workspace-wide, so insertion order
+            // here is column order in the rendered table.
+            let mut o = serde_json::Map::new();
+            for key in [
+                "agent_group_id",
+                "turns",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+            ] {
+                if let Some(v) = r.get(key) {
+                    o.insert(key.to_string(), v.clone());
+                }
+            }
+            let cost = r
+                .get("cost_micros")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| COST_UNKNOWN.to_string(), format_cost_dollars);
+            o.insert("cost".to_string(), serde_json::Value::String(cost));
+            for key in ["first_at", "last_at"] {
+                if let Some(v) = r.get(key) {
+                    o.insert(key.to_string(), v.clone());
+                }
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    let mut out = render_with(&serde_json::Value::Array(projected), palette);
+    if let Some(as_of) = rows
+        .iter()
+        .find_map(|r| r.get("pricing_as_of").and_then(serde_json::Value::as_str))
+    {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&palette.dim(&format!("pricing as of {as_of}")));
+        out.push('\n');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -478,12 +564,31 @@ where
     }
 }
 
+/// Environment variable enabling `cclaw chat`'s replay mode (any
+/// non-empty value): the log is read from the START (no seek-to-end)
+/// and chat exits at log EOF instead of tailing, without opening the
+/// FIFO or reading stdin. Test-only escape hatch — it lets the
+/// `no_ansi_when_piped` integration test drive the real rendering path
+/// in a spawned binary against a fixture `chat.log` deterministically.
+pub const CHAT_REPLAY_ENV: &str = "CCLAW_CHAT_REPLAY";
+
 /// `cclaw chat` — interactive REPL against the local cli channel.
 ///
 /// Reads lines from this terminal's stdin, writes them into the host's
 /// chat FIFO, and tails `chat.log` for replies. Doesn't touch the
 /// socket at all — it's pure file I/O against the install layout
 /// `copperclaw-setup` produces. Exits on EOF (Ctrl-D) or Ctrl-C.
+///
+/// Incoming log lines follow the `CliFrame` sniff contract (a line
+/// starting with `{` is a JSONL frame, anything else is legacy text)
+/// and render per kind: tool breadcrumbs on a rail, todo checklists,
+/// dimmed thinking, colored diffs, red errors. The tail and stdin are
+/// unified under one `tokio::select!` event loop so exactly one task
+/// owns the terminal — the status-line repaint can never race the
+/// stdin reader. All repaint/color bytes route through the [`Palette`]
+/// (`no_ansi_when_piped` is the binding constraint; piped stdout gets
+/// neither ESC nor a bare `\r`). The prompt goes to stderr so
+/// `cclaw chat > out.txt` keeps stdout a pure transcript.
 ///
 /// If the FIFO is missing the host probably isn't running, so chat
 /// tries to launch it via `copperclaw start` (unless `--no-autostart`
@@ -492,24 +597,32 @@ where
 ///
 /// Long-but-flat: every branch is necessary for friendly errors.
 #[allow(clippy::too_many_lines)]
-async fn run_chat(args: &serde_json::Value) -> RunOutput {
+async fn run_chat(args: &serde_json::Value, palette: Palette) -> RunOutput {
     use std::path::PathBuf;
     use tokio::fs::OpenOptions;
     use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
-    let Some(install_root) = resolve_install_root() else {
+    let install_root = resolve_install_root();
+    let resolve_path = |key: &str, default_name: &str| -> Option<PathBuf> {
+        args.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| install_root.as_ref().map(|r| r.join(default_name)))
+    };
+    let Some(log_path) = resolve_path("log", "chat.log") else {
         return RunOutput::failure(
             "cclaw chat: could not resolve install root; pass --fifo / --log\n".to_string(),
         );
     };
-    let fifo_path: PathBuf = args
-        .get("fifo")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(|| install_root.join("chat.fifo"), PathBuf::from);
-    let log_path: PathBuf = args
-        .get("log")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(|| install_root.join("chat.log"), PathBuf::from);
+    let replay = std::env::var_os(CHAT_REPLAY_ENV).is_some_and(|v| !v.is_empty());
+    if replay {
+        return run_chat_replay(&log_path, palette).await;
+    }
+    let Some(fifo_path) = resolve_path("fifo", "chat.fifo") else {
+        return RunOutput::failure(
+            "cclaw chat: could not resolve install root; pass --fifo / --log\n".to_string(),
+        );
+    };
     let no_autostart = args
         .get("no_autostart")
         .and_then(serde_json::Value::as_bool)
@@ -574,8 +687,13 @@ async fn run_chat(args: &serde_json::Value) -> RunOutput {
         log_path.display()
     );
 
-    // Tail the log on a background task; print every new line to stdout.
-    let log_task = tokio::spawn(async move {
+    // Two producer tasks feed channels; the select! loop below is the
+    // ONLY writer to the terminal, so a status-line repaint can never
+    // interleave with transcript output or the prompt. (Reading through
+    // channels rather than select!-ing on `read_line` directly also
+    // sidesteps `read_line`'s cancellation-unsafety.)
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let tail_task = tokio::spawn(async move {
         let mut reader = log_reader;
         loop {
             let mut line = String::new();
@@ -585,39 +703,521 @@ async fn run_chat(args: &serde_json::Value) -> RunOutput {
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 }
                 Ok(_) => {
-                    if line.ends_with('\n') {
-                        print!("{line}");
-                    } else {
-                        println!("{line}");
+                    if log_tx.send(line).await.is_err() {
+                        break;
                     }
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
                 Err(_) => break,
             }
         }
     });
-
-    // Read terminal stdin line by line; pipe each into the FIFO.
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    loop {
-        let mut line = String::new();
-        match stdin.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                if let Err(e) = fifo.write_all(line.as_bytes()).await {
-                    eprintln!("cclaw chat: write to fifo failed: {e}");
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        loop {
+            let mut line = String::new();
+            match stdin.read_line(&mut line).await {
+                Ok(0) => break, // EOF — dropping in_tx ends the event loop.
+                Ok(_) => {
+                    if in_tx.send(line).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("cclaw chat: stdin read failed: {e}");
                     break;
                 }
-                let _ = fifo.flush().await;
+            }
+        }
+    });
+
+    let mut state = ChatRenderState::default();
+    let mut printer = ChatPrinter::new(palette);
+    printer.draw_bottom(state.status_line.as_deref());
+    loop {
+        tokio::select! {
+            maybe_input = in_rx.recv() => match maybe_input {
+                None => break, // stdin EOF (Ctrl-D)
+                Some(line) => {
+                    // The Enter keypress already moved the cursor past the
+                    // old bottom line; it stays in scrollback with the
+                    // user's echoed input, REPL-style. Just redraw.
+                    printer.input_consumed();
+                    if let Err(e) = fifo.write_all(line.as_bytes()).await {
+                        eprintln!("cclaw chat: write to fifo failed: {e}");
+                        break;
+                    }
+                    let _ = fifo.flush().await;
+                    printer.draw_bottom(state.status_line.as_deref());
+                }
+            },
+            maybe_log = log_rx.recv() => match maybe_log {
+                None => break, // tail task died (log unreadable)
+                Some(line) => {
+                    let rendered = render_chat_line(&line, palette, &mut state);
+                    printer.emit(&rendered, state.status_line.as_deref());
+                }
+            },
+        }
+    }
+    printer.finish();
+    tail_task.abort();
+    stdin_task.abort();
+    RunOutput::success(String::new())
+}
+
+/// Replay mode for `cclaw chat` (see [`CHAT_REPLAY_ENV`]): render the
+/// whole log from the start through the exact same per-frame path the
+/// interactive tail uses, then exit at EOF. No FIFO, no stdin.
+async fn run_chat_replay(log_path: &std::path::Path, palette: Palette) -> RunOutput {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(log_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return RunOutput::failure(format!(
+                "cclaw chat: open log {}: {e}\n",
+                log_path.display()
+            ));
+        }
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut state = ChatRenderState::default();
+    let mut printer = ChatPrinter::new(palette);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let rendered = render_chat_line(&line, palette, &mut state);
+                printer.emit(&rendered, state.status_line.as_deref());
             }
             Err(e) => {
-                eprintln!("cclaw chat: stdin read failed: {e}");
-                break;
+                return RunOutput::failure(format!(
+                    "cclaw chat: read log {}: {e}\n",
+                    log_path.display()
+                ));
             }
         }
     }
-    log_task.abort();
+    printer.finish();
     RunOutput::success(String::new())
+}
+
+// ---------------------------------------------------------------------------
+// `cclaw chat` rendering — CliFrame JSONL -> styled transcript lines.
+// ---------------------------------------------------------------------------
+
+use copperclaw_channels_cli::CliFrame;
+use copperclaw_channels_core::{
+    Breadcrumb, BreadcrumbStatus, Card, DiffCard, DiffLineKind, ErrorCard, ThinkingBlock,
+    TodoItemStatus, TodoList, vocab,
+};
+
+/// Identity of one rendered rail step: `(tool_name, detail)`. Status and
+/// summary are deliberately excluded — an edit frame that only advances a
+/// step's lifecycle must match the already-rendered step, not re-print it.
+type StepKey = (String, Option<String>);
+
+fn step_key(crumb: &Breadcrumb) -> StepKey {
+    (crumb.tool_name.clone(), crumb.detail.clone())
+}
+
+/// One rail step already printed to scrollback for the current HUD
+/// message, plus whether its result line has been printed yet.
+struct RenderedStep {
+    key: StepKey,
+    result_printed: bool,
+}
+
+/// Client-side dedupe state for the chat transcript (M22 Finding 3: the
+/// log is append-only edit frames; the CLIENT collapses them). Tracks
+/// which rail steps are already in scrollback so a repeated HUD frame
+/// prints only NEW steps, and the current bottom status line so repeats
+/// are suppressed.
+#[derive(Default)]
+struct ChatRenderState {
+    /// Steps of the current HUD (steps-carrying) breadcrumb already
+    /// printed, in order.
+    hud_steps: Vec<RenderedStep>,
+    /// Plain (unstyled) text of the bottom status line, for dedupe.
+    status_line: Option<String>,
+    /// The last single (step-less) breadcrumb chip printed, so its
+    /// completion edit frame prints only the result line.
+    last_single: Option<(StepKey, BreadcrumbStatus)>,
+}
+
+/// Output of rendering one log line: styled transcript lines destined
+/// for scrollback, plus whether the bottom status line changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RenderedChatLine {
+    lines: Vec<String>,
+    status_changed: bool,
+}
+
+impl RenderedChatLine {
+    fn from_lines(lines: Vec<String>) -> Self {
+        Self {
+            lines,
+            status_changed: false,
+        }
+    }
+}
+
+/// Sole terminal writer for `cclaw chat`. When styling is on (a real
+/// TTY, no `NO_COLOR` / `--no-color`), the bottom line holds the dimmed
+/// status (stdout) followed by the prompt (stderr) and is repainted in
+/// place via [`Palette::repaint_prefix`]. When styling is off — which
+/// includes every piped invocation — no `ESC` and no bare `\r` are ever
+/// written: transcript lines print plainly, and status-line changes
+/// print as ordinary deduped lines.
+struct ChatPrinter {
+    palette: Palette,
+    /// `palette.is_colored()` — true only on a real terminal, so all
+    /// repaint control bytes are gated on the same single decision as
+    /// color (the `no_ansi_when_piped` contract).
+    live: bool,
+    /// Whether the repainted bottom line is currently on screen.
+    bottom_drawn: bool,
+}
+
+impl ChatPrinter {
+    fn new(palette: Palette) -> Self {
+        Self {
+            palette,
+            live: palette.is_colored(),
+            bottom_drawn: false,
+        }
+    }
+
+    /// Erase the repainted bottom line if it is on screen. No-op when
+    /// styling is off ([`Palette::repaint_prefix`] is empty).
+    fn clear_bottom(&mut self) {
+        if self.live && self.bottom_drawn {
+            print!("{}", self.palette.repaint_prefix());
+            self.bottom_drawn = false;
+        }
+    }
+
+    /// Paint the bottom line: dimmed status text on stdout, then the
+    /// prompt on stderr (stderr so `cclaw chat > out.txt` keeps stdout a
+    /// pure transcript). TTY only.
+    fn draw_bottom(&mut self, status: Option<&str>) {
+        if !self.live {
+            return;
+        }
+        if let Some(s) = status {
+            print!("{} ", self.palette.dim(s));
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        eprint!("> ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.bottom_drawn = true;
+    }
+
+    /// The user pressed Enter: the terminal echo already scrolled the
+    /// old bottom line away, so just forget it (never `\r` over it).
+    fn input_consumed(&mut self) {
+        self.bottom_drawn = false;
+    }
+
+    /// Print one rendered log line's output: erase the bottom line,
+    /// print the transcript lines, then repaint status + prompt. On a
+    /// non-TTY a changed status prints as a plain deduped line instead.
+    fn emit(&mut self, rendered: &RenderedChatLine, status: Option<&str>) {
+        if rendered.lines.is_empty() && !rendered.status_changed {
+            return; // pure duplicate frame — avoid repaint flicker
+        }
+        self.clear_bottom();
+        for line in &rendered.lines {
+            println!("{line}");
+        }
+        if !self.live && rendered.status_changed {
+            if let Some(s) = status {
+                println!("{s}");
+            }
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        self.draw_bottom(status);
+    }
+
+    /// Leave the terminal on a fresh line at exit.
+    fn finish(&mut self) {
+        if self.live && self.bottom_drawn {
+            print!("{}", self.palette.repaint_prefix());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            self.bottom_drawn = false;
+        }
+    }
+}
+
+/// Render one raw `chat.log` line per the `CliFrame` sniff contract:
+/// a line starting with `{` is a JSONL frame, anything else is legacy
+/// labelled text printed verbatim. A `{`-line that fails to parse is
+/// also printed verbatim (defensive: never drop transcript content).
+fn render_chat_line(line: &str, palette: Palette, state: &mut ChatRenderState) -> RenderedChatLine {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        return RenderedChatLine::default();
+    }
+    if trimmed.starts_with('{') {
+        match serde_json::from_str::<CliFrame>(trimmed) {
+            Ok(frame) => return render_chat_frame(&frame, palette, state),
+            Err(_) => return RenderedChatLine::from_lines(vec![trimmed.to_string()]),
+        }
+    }
+    RenderedChatLine::from_lines(vec![trimmed.to_string()])
+}
+
+/// Render one structured frame into styled transcript lines.
+fn render_chat_frame(
+    frame: &CliFrame,
+    palette: Palette,
+    state: &mut ChatRenderState,
+) -> RenderedChatLine {
+    match frame {
+        CliFrame::Chat { text, files } => {
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            if !files.is_empty() {
+                lines.push(palette.dim(&format!("[files: {}]", files.join(", "))));
+            }
+            RenderedChatLine::from_lines(lines)
+        }
+        CliFrame::Card { card } => RenderedChatLine::from_lines(render_card_lines(card, palette)),
+        CliFrame::Breadcrumb { breadcrumb } => render_breadcrumb_frame(breadcrumb, palette, state),
+        CliFrame::Diff { diff } => RenderedChatLine::from_lines(render_diff_lines(diff, palette)),
+        CliFrame::Collapsible { text, summary, .. } => {
+            let mut lines = vec![palette.dim(summary)];
+            lines.extend(text.lines().map(str::to_string));
+            RenderedChatLine::from_lines(lines)
+        }
+        CliFrame::TodoList { todo_list } => {
+            RenderedChatLine::from_lines(render_todo_lines(todo_list, palette))
+        }
+        CliFrame::Error { error } => {
+            RenderedChatLine::from_lines(render_error_lines(error, palette))
+        }
+        CliFrame::Thinking { thinking } => {
+            RenderedChatLine::from_lines(render_thinking_lines(thinking, palette))
+        }
+    }
+}
+
+/// One rail step line: status-colored vocab marker + bold tool name +
+/// dimmed detail. Color-off form: `⏺ shell(cargo check)`.
+fn rail_step_line(crumb: &Breadcrumb, palette: Palette) -> String {
+    let rail = &vocab::for_channel("cli").rail;
+    let marker = rail.for_status(crumb.status);
+    let marker = match crumb.status {
+        BreadcrumbStatus::Running => palette.warn(marker),
+        BreadcrumbStatus::Done => palette.ok(marker),
+        BreadcrumbStatus::Failed => palette.fail(marker),
+    };
+    match &crumb.detail {
+        Some(detail) => format!(
+            "{marker} {}({})",
+            palette.header(&crumb.tool_name),
+            palette.dim(detail)
+        ),
+        None => format!("{marker} {}", palette.header(&crumb.tool_name)),
+    }
+}
+
+/// One rail result line under a step. Color-off form: `  ⎿ passed in 3.1s`.
+fn rail_result_line(summary: &str, status: BreadcrumbStatus, palette: Palette) -> String {
+    let rail = &vocab::for_channel("cli").rail;
+    let text = if status == BreadcrumbStatus::Failed {
+        palette.fail(summary)
+    } else {
+        palette.dim(summary)
+    };
+    format!("  {} {text}", palette.dim(rail.result_leader))
+}
+
+/// Render a breadcrumb frame with client-side dedupe.
+///
+/// A steps-carrying frame is a HUD aggregate that arrives repeatedly as
+/// edit frames: print only steps not yet in scrollback (plus late result
+/// lines for steps that have since completed) and update the bottom
+/// status line from the top-level summary. A step-less frame is a single
+/// tool chip: its completion edit prints only the result line.
+fn render_breadcrumb_frame(
+    crumb: &Breadcrumb,
+    palette: Palette,
+    state: &mut ChatRenderState,
+) -> RenderedChatLine {
+    let mut lines = Vec::new();
+    if crumb.steps.is_empty() {
+        let key = step_key(crumb);
+        match &state.last_single {
+            // Duplicate edit frame — same chip, same lifecycle. Skip.
+            Some((k, st)) if *k == key && *st == crumb.status => {}
+            // Completion edit of the chip already in scrollback: print
+            // only the result line.
+            Some((k, BreadcrumbStatus::Running)) if *k == key => {
+                let summary = crumb.summary.as_deref().unwrap_or(crumb.status.as_str());
+                lines.push(rail_result_line(summary, crumb.status, palette));
+                state.last_single = Some((key, crumb.status));
+            }
+            _ => {
+                lines.push(rail_step_line(crumb, palette));
+                if crumb.status != BreadcrumbStatus::Running {
+                    if let Some(summary) = &crumb.summary {
+                        lines.push(rail_result_line(summary, crumb.status, palette));
+                    }
+                }
+                state.last_single = Some((key, crumb.status));
+            }
+        }
+        return RenderedChatLine::from_lines(lines);
+    }
+
+    // HUD aggregate. A frame whose steps don't extend the rendered
+    // prefix is a NEW logical HUD message — reset and render from
+    // scratch.
+    let extends_prefix = state.hud_steps.len() <= crumb.steps.len()
+        && state
+            .hud_steps
+            .iter()
+            .zip(&crumb.steps)
+            .all(|(rendered, step)| rendered.key == step_key(step));
+    if !extends_prefix {
+        state.hud_steps.clear();
+    }
+    // Late result lines for already-rendered steps that have completed.
+    for (rendered, step) in state.hud_steps.iter_mut().zip(&crumb.steps) {
+        if !rendered.result_printed {
+            if let Some(summary) = &step.summary {
+                lines.push(rail_result_line(summary, step.status, palette));
+                rendered.result_printed = true;
+            }
+        }
+    }
+    // New steps.
+    for step in &crumb.steps[state.hud_steps.len()..] {
+        lines.push(rail_step_line(step, palette));
+        let mut result_printed = false;
+        if let Some(summary) = &step.summary {
+            lines.push(rail_result_line(summary, step.status, palette));
+            result_printed = true;
+        }
+        state.hud_steps.push(RenderedStep {
+            key: step_key(step),
+            result_printed,
+        });
+    }
+    // Bottom status line from the collapsed top-level summary.
+    let status_text = crumb
+        .summary
+        .clone()
+        .unwrap_or_else(|| match &crumb.detail {
+            Some(detail) => format!("{}({detail})", crumb.tool_name),
+            None => crumb.tool_name.clone(),
+        });
+    let status_changed = state.status_line.as_deref() != Some(status_text.as_str());
+    if status_changed {
+        state.status_line = Some(status_text);
+    }
+    RenderedChatLine {
+        lines,
+        status_changed,
+    }
+}
+
+/// Card: bold title, body lines, `label: value` fields.
+fn render_card_lines(card: &Card, palette: Palette) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(title) = &card.title {
+        lines.push(palette.header(title));
+    }
+    if let Some(body) = &card.body {
+        lines.extend(body.lines().map(str::to_string));
+    }
+    for field in &card.fields {
+        lines.push(format!("{}: {}", palette.header(&field.label), field.value));
+    }
+    lines
+}
+
+/// Todo checklist: ASCII checkbox glyphs from the cli vocab binding,
+/// strikethrough for completed items, blocked reason appended.
+fn render_todo_lines(todo: &TodoList, palette: Palette) -> Vec<String> {
+    let glyphs = &vocab::for_channel("cli").todo;
+    let mut lines = Vec::new();
+    if let Some(title) = &todo.title {
+        lines.push(palette.header(title));
+    }
+    for item in &todo.items {
+        let glyph = glyphs.get(item.status);
+        let text = match item.status {
+            TodoItemStatus::Completed => palette.strike(&item.text),
+            TodoItemStatus::InProgress | TodoItemStatus::Blocked => item.text.clone(),
+            TodoItemStatus::Pending => palette.dim(&item.text),
+        };
+        let mut line = format!("{glyph} {text}");
+        if item.status == TodoItemStatus::Blocked {
+            if let Some(reason) = item.blocked_reason_text() {
+                line.push_str(&palette.dim(&format!(" — {reason}")));
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// Diff: bold `path (+A -R)` header, dimmed hunk markers, green added /
+/// red removed lines with unified-diff prefixes.
+fn render_diff_lines(diff: &DiffCard, palette: Palette) -> Vec<String> {
+    let mut lines = vec![palette.header(&format!(
+        "{} (+{} -{})",
+        diff.path, diff.added, diff.removed
+    ))];
+    for hunk in &diff.hunks {
+        lines.push(palette.dim(&format!(
+            "@@ -{},{} +{},{} @@",
+            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+        )));
+        for line in &hunk.lines {
+            lines.push(match line.kind {
+                DiffLineKind::Add => palette.diff_add(&format!("+{}", line.text)),
+                DiffLineKind::Remove => palette.diff_remove(&format!("-{}", line.text)),
+                DiffLineKind::Context => format!(" {}", line.text),
+            });
+        }
+    }
+    if diff.truncated {
+        lines.push(palette.dim("[diff truncated]"));
+    }
+    lines
+}
+
+/// Error card: red headline, dimmed details, retry footer.
+fn render_error_lines(error: &ErrorCard, palette: Palette) -> Vec<String> {
+    let mut lines = vec![palette.fail(&format!(
+        "[{} error] {}: {}",
+        error.kind.label(),
+        error.title,
+        error.summary
+    ))];
+    if let Some(details) = &error.details {
+        lines.extend(details.lines().map(|l| palette.dim(l)));
+    }
+    if error.retryable {
+        lines.push(palette.dim("(will retry automatically)"));
+    }
+    lines
+}
+
+/// Thinking block: dimmed text; redacted blocks show a placeholder.
+fn render_thinking_lines(thinking: &ThinkingBlock, palette: Palette) -> Vec<String> {
+    if thinking.redacted {
+        return vec![palette.dim("[thinking redacted]")];
+    }
+    thinking.text.lines().map(|l| palette.dim(l)).collect()
 }
 
 /// Outcome of [`try_autostart_host`].
@@ -1376,65 +1976,29 @@ where
     finalise_doctor(&checks, as_json, palette)
 }
 
-/// Byte thresholds for the `disk-space` doctor check, kept next to the
-/// pure classifier they parameterise. WARN below 10% free *or* below
-/// 20 GiB free (whichever trips first); FAIL below 3% free *or* below
-/// 5 GiB free.
-const GIB: u64 = 1024 * 1024 * 1024;
-const DISK_WARN_BYTES: u64 = 20 * GIB;
-const DISK_FAIL_BYTES: u64 = 5 * GIB;
+/// The thresholds, the pure classifier, and the `statvfs` call now live in
+/// [`crate::disk`] — the host's spawn preflight
+/// (`copperclaw_host::container_manager::host_resources`) classifies free
+/// space with the *same* numbers, and two copies would drift into `doctor`
+/// saying OK while the reconcile loop refuses every spawn. What stays here
+/// is only the doctor-specific presentation.
+use crate::disk::{DISK_FIX, DiskLevel, free_pct, human_bytes};
 
-/// Remediation hint shared by the WARN/FAIL disk rows.
-const DISK_FIX: &str = "reclaim space: rotate/delete old host logs under \
-    <data>/logs, `docker system prune -af --volumes`, and clear stale \
-    Rust `target/` dirs (`cargo clean` in dev checkouts)";
-
-/// Classify free disk into a [`CheckLevel`]. Pure so the boundaries are
-/// unit-testable without touching a real filesystem. Percent is compared
-/// with integer (u128) math to stay clippy-clean (no float casts) and
-/// overflow-free: `free/total < n%`  ⇔  `free*100 < total*n`.
+/// `disk-space` doctor severity from free bytes. Thin adapter over
+/// [`crate::disk::level`] mapping the shared band onto doctor's own
+/// [`CheckLevel`].
 fn disk_level(free_bytes: u64, total_bytes: u64) -> CheckLevel {
-    let free = u128::from(free_bytes);
-    let total = u128::from(total_bytes);
-    let below_pct = |n: u128| total != 0 && free * 100 < total * n;
-    if below_pct(3) || free_bytes < DISK_FAIL_BYTES {
-        CheckLevel::Fail
-    } else if below_pct(10) || free_bytes < DISK_WARN_BYTES {
-        CheckLevel::Warn
-    } else {
-        CheckLevel::Ok
+    match crate::disk::level(free_bytes, total_bytes) {
+        DiskLevel::Ok => CheckLevel::Ok,
+        DiskLevel::Warn => CheckLevel::Warn,
+        DiskLevel::Fail => CheckLevel::Fail,
     }
 }
 
-/// Human-readable byte size (binary units) for disk-check detail lines.
-/// Integer-only (no float casts) to stay clippy-pedantic-clean; one
-/// decimal place via scaled u128 arithmetic with round-to-nearest.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut unit = 0;
-    let mut scale: u64 = 1;
-    while unit < UNITS.len() - 1 && n / scale >= 1024 {
-        scale *= 1024;
-        unit += 1;
-    }
-    if unit == 0 {
-        return format!("{n} B");
-    }
-    let scale = u128::from(scale);
-    let tenths = (u128::from(n) * 10 + scale / 2) / scale;
-    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
-}
-
-/// Integer free-space percentage (rounded down) for detail lines. Result
-/// is 0..=100, so the `try_from` fallback is unreachable in practice; it
-/// exists to dodge a lossy-cast clippy lint without an `as` cast.
-fn free_pct(free_bytes: u64, total_bytes: u64) -> u64 {
-    if total_bytes == 0 {
-        return 0;
-    }
-    let pct = (u128::from(free_bytes) * 100) / u128::from(total_bytes);
-    u64::try_from(pct).unwrap_or(100)
-}
+/// One binary gibibyte — test-only alias so the existing boundary tests
+/// keep reading in GiB. Non-test code goes through [`crate::disk`].
+#[cfg(test)]
+const GIB: u64 = crate::disk::GIB;
 
 // Test seam: when set on the current thread, `disk_space_check` skips the
 // real `statvfs` and reports these synthetic `(free, total)` bytes. Keeps
@@ -1514,16 +2078,8 @@ fn disk_check_bytes(free: u64, total: u64, label_path: &std::path::Path) -> Chec
 /// path resolution above stays readable. `label_path` is what the detail
 /// line names (the data dir), `stat_path` is what we actually statvfs.
 fn disk_check_at(stat_path: &std::path::Path, label_path: &std::path::Path) -> Check {
-    match rustix::fs::statvfs(stat_path) {
-        Ok(vfs) => {
-            // Bytes = block count * fragment size. `f_bavail` is the space
-            // available to unprivileged writers (excludes root-reserved
-            // blocks) — the number that actually predicts write failures.
-            let frag = vfs.f_frsize;
-            let total = vfs.f_blocks.saturating_mul(frag);
-            let free = vfs.f_bavail.saturating_mul(frag);
-            disk_check_bytes(free, total, label_path)
-        }
+    match crate::disk::statvfs_bytes(stat_path) {
+        Ok((free, total)) => disk_check_bytes(free, total, label_path),
         Err(e) => Check::warn(
             "disk-space",
             format!("could not stat {}: {e}", stat_path.display()),
@@ -4279,6 +4835,436 @@ mod tests {
         set_data_root_override(None);
     }
 
+    // --- chat rendering ----------------------------------------------------
+
+    fn plain_state() -> ChatRenderState {
+        ChatRenderState::default()
+    }
+
+    fn render_plain(frame: &CliFrame, state: &mut ChatRenderState) -> RenderedChatLine {
+        render_chat_frame(frame, Palette::plain(), state)
+    }
+
+    #[test]
+    fn chat_render_legacy_line_passes_through_verbatim() {
+        let mut state = plain_state();
+        let out = render_chat_line("agent> hello there\n", Palette::plain(), &mut state);
+        assert_eq!(out.lines, vec!["agent> hello there".to_string()]);
+        assert!(!out.status_changed);
+    }
+
+    #[test]
+    fn chat_render_malformed_json_line_passes_through_verbatim() {
+        let mut state = plain_state();
+        let out = render_chat_line("{not json}\n", Palette::plain(), &mut state);
+        assert_eq!(out.lines, vec!["{not json}".to_string()]);
+    }
+
+    #[test]
+    fn chat_render_empty_line_renders_nothing() {
+        let mut state = plain_state();
+        let out = render_chat_line("\n", Palette::plain(), &mut state);
+        assert_eq!(out, RenderedChatLine::default());
+    }
+
+    #[test]
+    fn chat_render_chat_frame_text_and_files() {
+        let mut state = plain_state();
+        let frame = CliFrame::Chat {
+            text: "hello\nworld".into(),
+            files: vec!["a.txt".into(), "b.png".into()],
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "hello".to_string(),
+                "world".to_string(),
+                "[files: a.txt, b.png]".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_card_frame_title_body_fields() {
+        let mut state = plain_state();
+        let frame = CliFrame::Card {
+            card: copperclaw_channels_core::Card {
+                title: Some("Deploy report".into()),
+                body: Some("all green".into()),
+                fields: vec![copperclaw_channels_core::CardField {
+                    label: "env".into(),
+                    value: "prod".into(),
+                    inline: false,
+                }],
+                buttons: vec![],
+                image_url: None,
+            },
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "Deploy report".to_string(),
+                "all green".to_string(),
+                "env: prod".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_collapsible_frame_summary_then_body() {
+        let mut state = plain_state();
+        let frame = CliFrame::Collapsible {
+            text: "line one\nline two".into(),
+            summary: "2 lines of output".into(),
+            preview_lines: vec!["line one".into()],
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "2 lines of output".to_string(),
+                "line one".to_string(),
+                "line two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_breadcrumb_single_chip_running_then_done() {
+        let mut state = plain_state();
+        let running = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("shell").with_detail("cargo check"),
+        };
+        let out = render_plain(&running, &mut state);
+        // RAIL binding: running marker is U+25CB WHITE CIRCLE.
+        assert_eq!(out.lines, vec!["\u{25CB} shell(cargo check)".to_string()]);
+
+        // The completion edit frame prints ONLY the result line — the
+        // step line is already in scrollback.
+        let done = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("shell")
+                .with_detail("cargo check")
+                .finished(true, Some("passed in 3.1s".into())),
+        };
+        let out = render_plain(&done, &mut state);
+        assert_eq!(
+            out.lines,
+            vec!["  \u{23BF} passed in 3.1s".to_string()],
+            "completion edit must print only the result line"
+        );
+
+        // An exact duplicate edit frame renders nothing.
+        let out = render_plain(&done, &mut state);
+        assert!(out.lines.is_empty());
+    }
+
+    #[test]
+    fn chat_render_breadcrumb_fresh_done_chip_prints_step_and_result() {
+        let mut state = plain_state();
+        let frame = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("edit_file")
+                .with_detail("src/lib.rs")
+                .finished(false, Some("permission denied".into())),
+        };
+        let out = render_plain(&frame, &mut state);
+        // Failed marker is U+00D7 MULTIPLICATION SIGN on the RAIL binding.
+        assert_eq!(
+            out.lines,
+            vec![
+                "\u{D7} edit_file(src/lib.rs)".to_string(),
+                "  \u{23BF} permission denied".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_hud_frames_dedupe_steps_and_track_status_line() {
+        let mut state = plain_state();
+        let step1 = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("ok".into()));
+        let step2 = Breadcrumb::running("edit_file").with_detail("src/lib.rs");
+        let hud1 = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("task")
+                .with_steps(vec![step1.clone(), step2.clone()])
+                .with_detail("building"),
+        };
+        let out = render_plain(&hud1, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "\u{23FA} shell(cargo check)".to_string(),
+                "  \u{23BF} ok".to_string(),
+                "\u{25CB} edit_file(src/lib.rs)".to_string(),
+            ]
+        );
+        assert!(out.status_changed);
+        assert_eq!(state.status_line.as_deref(), Some("task(building)"));
+
+        // Edit frame: step2 completed, one NEW step appended, summary set.
+        let step2_done = step2.clone().finished(true, Some("wrote 12 lines".into()));
+        let step3 = Breadcrumb::running("web_search").with_detail("rust select");
+        let hud2 = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb {
+                summary: Some("Exploring (0:12)".into()),
+                ..Breadcrumb::running("task").with_steps(vec![
+                    step1.clone(),
+                    step2_done,
+                    step3.clone(),
+                ])
+            },
+        };
+        let out = render_plain(&hud2, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "  \u{23BF} wrote 12 lines".to_string(),
+                "\u{25CB} web_search(rust select)".to_string(),
+            ],
+            "repeat frames must print only late results plus NEW steps"
+        );
+        assert!(out.status_changed);
+        assert_eq!(state.status_line.as_deref(), Some("Exploring (0:12)"));
+
+        // Same frame again: nothing new, status unchanged.
+        let out = render_plain(&hud2, &mut state);
+        assert!(out.lines.is_empty());
+        assert!(!out.status_changed);
+    }
+
+    #[test]
+    fn chat_render_hud_new_message_resets_step_dedupe() {
+        let mut state = plain_state();
+        let hud1 = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("task")
+                .with_steps(vec![Breadcrumb::running("shell").with_detail("a")]),
+        };
+        assert_eq!(render_plain(&hud1, &mut state).lines.len(), 1);
+        // A frame whose steps do NOT extend the rendered prefix is a new
+        // logical HUD message: render from scratch.
+        let hud2 = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("task")
+                .with_steps(vec![Breadcrumb::running("shell").with_detail("b")]),
+        };
+        let out = render_plain(&hud2, &mut state);
+        assert_eq!(out.lines, vec!["\u{25CB} shell(b)".to_string()]);
+    }
+
+    #[test]
+    fn chat_render_todo_list_checkboxes() {
+        let mut state = plain_state();
+        let frame = CliFrame::TodoList {
+            todo_list: copperclaw_channels_core::TodoList {
+                title: Some("Plan".into()),
+                items: vec![
+                    copperclaw_channels_core::TodoListItem {
+                        id: 1,
+                        text: "write tests".into(),
+                        status: TodoItemStatus::Completed,
+                        blocked_reason: None,
+                    },
+                    copperclaw_channels_core::TodoListItem {
+                        id: 2,
+                        text: "run gate".into(),
+                        status: TodoItemStatus::InProgress,
+                        blocked_reason: None,
+                    },
+                    copperclaw_channels_core::TodoListItem {
+                        id: 3,
+                        text: "deploy".into(),
+                        status: TodoItemStatus::Blocked,
+                        blocked_reason: Some("no creds".into()),
+                    },
+                    copperclaw_channels_core::TodoListItem {
+                        id: 4,
+                        text: "announce".into(),
+                        status: TodoItemStatus::Pending,
+                        blocked_reason: None,
+                    },
+                ],
+            },
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "Plan".to_string(),
+                "[x] write tests".to_string(),
+                "[~] run gate".to_string(),
+                "[!] deploy — no creds".to_string(),
+                "[ ] announce".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_thinking_dimmed_and_redacted_placeholder() {
+        let mut state = plain_state();
+        let visible = CliFrame::Thinking {
+            thinking: copperclaw_channels_core::ThinkingBlock::visible("hmm\nokay"),
+        };
+        let out = render_plain(&visible, &mut state);
+        assert_eq!(out.lines, vec!["hmm".to_string(), "okay".to_string()]);
+
+        let redacted = CliFrame::Thinking {
+            thinking: copperclaw_channels_core::ThinkingBlock::redacted("opaque-blob"),
+        };
+        let out = render_plain(&redacted, &mut state);
+        assert_eq!(out.lines, vec!["[thinking redacted]".to_string()]);
+        assert!(
+            !out.lines[0].contains("opaque-blob"),
+            "redacted blob must never render"
+        );
+    }
+
+    #[test]
+    fn chat_render_diff_frame_header_hunks_and_truncation() {
+        let mut state = plain_state();
+        let frame = CliFrame::Diff {
+            diff: copperclaw_channels_core::DiffCard {
+                path: "src/main.rs".into(),
+                language: Some("rust".into()),
+                hunks: vec![copperclaw_channels_core::DiffHunk {
+                    old_start: 1,
+                    old_lines: 2,
+                    new_start: 1,
+                    new_lines: 2,
+                    lines: vec![
+                        copperclaw_channels_core::DiffLine {
+                            kind: DiffLineKind::Context,
+                            text: "fn main() {".into(),
+                        },
+                        copperclaw_channels_core::DiffLine {
+                            kind: DiffLineKind::Remove,
+                            text: "    old();".into(),
+                        },
+                        copperclaw_channels_core::DiffLine {
+                            kind: DiffLineKind::Add,
+                            text: "    new();".into(),
+                        },
+                    ],
+                }],
+                added: 1,
+                removed: 1,
+                truncated: true,
+            },
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "src/main.rs (+1 -1)".to_string(),
+                "@@ -1,2 +1,2 @@".to_string(),
+                " fn main() {".to_string(),
+                "-    old();".to_string(),
+                "+    new();".to_string(),
+                "[diff truncated]".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_error_frame_headline_details_retry() {
+        let mut state = plain_state();
+        let frame = CliFrame::Error {
+            error: copperclaw_channels_core::ErrorCard {
+                title: "Something went wrong".into(),
+                summary: "provider rate limited".into(),
+                kind: copperclaw_channels_core::ErrorCardKind::Provider,
+                details: Some("HTTP 429".into()),
+                retryable: true,
+            },
+        };
+        let out = render_plain(&frame, &mut state);
+        assert_eq!(
+            out.lines,
+            vec![
+                "[provider error] Something went wrong: provider rate limited".to_string(),
+                "HTTP 429".to_string(),
+                "(will retry automatically)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_render_rail_lines_styled_when_colored() {
+        // Palette construction is pure — cfg(test) only pins the
+        // is_terminal resolver, not palette rendering — so the "on" side
+        // of the rail styling is testable in-process.
+        let p = Palette::new(true);
+        let mut state = plain_state();
+        let frame = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("shell").with_detail("cargo check"),
+        };
+        let out = render_chat_frame(&frame, p, &mut state);
+        let line = &out.lines[0];
+        // Marker colored yellow (running), tool name bold, detail dim.
+        assert!(line.contains(&p.warn("\u{25CB}")));
+        assert!(line.contains(&p.header("shell")));
+        assert!(line.contains(&p.dim("cargo check")));
+
+        // Failed completion: red marker on a fresh chip, red summary.
+        let mut state = plain_state();
+        let failed = CliFrame::Breadcrumb {
+            breadcrumb: Breadcrumb::running("shell")
+                .with_detail("cargo test")
+                .finished(false, Some("2 failed".into())),
+        };
+        let out = render_chat_frame(&failed, p, &mut state);
+        assert!(out.lines[0].contains(&p.fail("\u{D7}")));
+        assert!(out.lines[1].contains(&p.fail("2 failed")));
+    }
+
+    #[test]
+    fn chat_render_diff_and_todo_styled_when_colored() {
+        let p = Palette::new(true);
+        let mut state = plain_state();
+        let diff = CliFrame::Diff {
+            diff: copperclaw_channels_core::DiffCard {
+                path: "a.rs".into(),
+                language: None,
+                hunks: vec![copperclaw_channels_core::DiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![
+                        copperclaw_channels_core::DiffLine {
+                            kind: DiffLineKind::Add,
+                            text: "x".into(),
+                        },
+                        copperclaw_channels_core::DiffLine {
+                            kind: DiffLineKind::Remove,
+                            text: "y".into(),
+                        },
+                    ],
+                }],
+                added: 1,
+                removed: 1,
+                truncated: false,
+            },
+        };
+        let out = render_chat_frame(&diff, p, &mut state);
+        assert!(out.lines.contains(&p.diff_add("+x")));
+        assert!(out.lines.contains(&p.diff_remove("-y")));
+
+        let todo = CliFrame::TodoList {
+            todo_list: copperclaw_channels_core::TodoList {
+                title: None,
+                items: vec![copperclaw_channels_core::TodoListItem {
+                    id: 1,
+                    text: "done thing".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                }],
+            },
+        };
+        let out = render_chat_frame(&todo, p, &mut state);
+        assert_eq!(out.lines, vec![format!("[x] {}", p.strike("done thing"))]);
+    }
+
     // --- chat --------------------------------------------------------------
 
     #[tokio::test]
@@ -4475,6 +5461,131 @@ mod tests {
         ] {
             assert!(parsed.get(key).is_some(), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn format_cost_dollars_rounds_half_up_to_cents() {
+        // A genuine priced zero (e.g. ollama's $0/MTok) renders "$0.00".
+        assert_eq!(format_cost_dollars(0), "$0.00");
+        // Priced sub-cent value also collapses to "$0.00" — acceptable
+        // because it *was* priced; unknown is the em dash, not zero.
+        assert_eq!(format_cost_dollars(3_300), "$0.00");
+        assert_eq!(format_cost_dollars(420_000), "$0.42");
+        // Half rounds up: 42.5 cents -> 43.
+        assert_eq!(format_cost_dollars(425_000), "$0.43");
+        assert_eq!(format_cost_dollars(424_999), "$0.42");
+        // Dollars are not zero-padded; cents always two digits.
+        assert_eq!(format_cost_dollars(1_234_567_890), "$1234.57");
+    }
+
+    #[tokio::test]
+    async fn usage_table_has_cost_column_and_pricing_footer() {
+        let t = StubTransport::ok(json!([
+            {
+                "agent_group_id": "ag-priced",
+                "turns": 3,
+                "input_tokens": 100,
+                "output_tokens": 200,
+                "total_tokens": 300,
+                "first_at": "2026-07-20T00:00:00+00:00",
+                "last_at": "2026-07-20T01:00:00+00:00",
+                "models": [{
+                    "model": "claude-sonnet-4-6",
+                    "provider": "anthropic",
+                    "turns": 3,
+                    "input_tokens": 100,
+                    "output_tokens": 200,
+                    "cost_micros": 420_000,
+                }],
+                "cost_micros": 420_000,
+                "pricing_as_of": "2026-07-20",
+            },
+            {
+                "agent_group_id": "ag-unknown",
+                "turns": 1,
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "total_tokens": 30,
+                "first_at": "2026-07-20T00:00:00+00:00",
+                "last_at": "2026-07-20T01:00:00+00:00",
+                "models": [{
+                    "model": "mystery-model",
+                    "provider": "ollama-cloud",
+                    "turns": 1,
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cost_micros": null,
+                }],
+                "cost_micros": null,
+                "pricing_as_of": "2026-07-20",
+            },
+        ]));
+        let out = run_cli(["cclaw", "usage"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        // (a) priced group renders dollars, (b) unpriced renders an em
+        // dash — never a confidently wrong "$0.00".
+        assert!(out.stdout.contains("COST"), "stdout={:?}", out.stdout);
+        assert!(out.stdout.contains("$0.42"), "stdout={:?}", out.stdout);
+        assert!(out.stdout.contains(COST_UNKNOWN), "stdout={:?}", out.stdout);
+        assert!(!out.stdout.contains("$0.00"), "stdout={:?}", out.stdout);
+        // (c) pricing vintage is a single footer line, not a column.
+        assert!(out.stdout.contains("pricing as of 2026-07-20"));
+        assert!(!out.stdout.contains("PRICING_AS_OF"));
+        // The nested per-model slices and raw micros stay off the table.
+        assert!(!out.stdout.contains("cost_micros"));
+        assert!(!out.stdout.contains("claude-sonnet-4-6"));
+        assert!(!out.stdout.contains("420000"));
+    }
+
+    #[tokio::test]
+    async fn usage_json_passes_handler_payload_through() {
+        let payload = json!([{
+            "agent_group_id": "ag-1",
+            "turns": 1,
+            "input_tokens": 100,
+            "output_tokens": 200,
+            "total_tokens": 300,
+            "first_at": "2026-07-20T00:00:00+00:00",
+            "last_at": "2026-07-20T01:00:00+00:00",
+            "models": [{
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+                "turns": 1,
+                "input_tokens": 100,
+                "output_tokens": 200,
+                "cost_micros": 3_300,
+            }],
+            "cost_micros": 3_300,
+            "pricing_as_of": "2026-07-20",
+        }]);
+        let t = StubTransport::ok(payload.clone());
+        let out = run_cli(["cclaw", "--json", "usage"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(out.stdout.trim()).expect("valid json");
+        // Byte-for-byte handler payload: models, cost_micros, and
+        // pricing_as_of all survive untouched.
+        assert_eq!(parsed, payload);
+    }
+
+    #[tokio::test]
+    async fn usage_table_without_pricing_keys_omits_footer() {
+        // An older host that predates C3 sends rows without models /
+        // cost_micros / pricing_as_of; the cost column degrades to em
+        // dashes and the footer disappears rather than lying.
+        let t = StubTransport::ok(json!([{
+            "agent_group_id": "ag-old",
+            "turns": 1,
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "total_tokens": 30,
+            "first_at": "2026-07-20T00:00:00+00:00",
+            "last_at": "2026-07-20T01:00:00+00:00",
+        }]));
+        let out = run_cli(["cclaw", "usage"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        assert!(out.stdout.contains(COST_UNKNOWN));
+        assert!(!out.stdout.contains("pricing as of"));
     }
 
     #[tokio::test]

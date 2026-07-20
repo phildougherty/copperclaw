@@ -1,0 +1,33 @@
+{
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "id": "msg_replay_autocompact_001"
+      }
+    },
+    {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "text",
+        "text": ""
+      }
+    },
+    {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "text_delta",
+        "text": "Here is the summary of the deployment design doc. The rollout is split into three phases. Phase one provisions the new inference hosts behind the feature flag, mirrors five percent of production traffic to them, and compares latency histograms nightly. Phase two widens the mirror to half of all traffic, enables the write path against the shadow store, and adds the reconciliation job that flags any divergence between the two stores within fifteen minutes. Phase three flips the flag for all tenants, keeps the old fleet warm for two weeks as a rollback target, and then decommissions it. The main open risks called out are cache warm-up time after the flip and the unbounded backlog the reconciliation job could accumulate if divergence is persistent rather than transient."
+      }
+    },
+    {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    {
+      "type": "message_stop"
+    }
+  ]
+}

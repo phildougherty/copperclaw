@@ -1,1 +1,4 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"[task] running: shell (echo hello)"},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"last: shell ok · 1 tool call | 0:00\n  [shell] echo hello — hello"},"files":0}
 {"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"I ran echo hello and got 'hello' back."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"working · done in 0:00, 1 tool call\n  [shell] echo hello — hello"},"files":0}

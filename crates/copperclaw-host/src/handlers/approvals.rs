@@ -48,7 +48,9 @@ use super::{db_err, opt_str, parse_uuid, req_str};
 use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::pending_approvals::{ApprovalStatus, DecisionOutcome};
-use copperclaw_db::tables::{container_configs, messaging_groups, pending_approvals, users};
+use copperclaw_db::tables::{
+    container_configs, messaging_groups, pending_approvals, task_grants, users,
+};
 use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
 use copperclaw_types::{AgentGroupId, ApprovalId};
 use serde_json::{Value, json};
@@ -248,6 +250,12 @@ pub fn resolve_approve(
         // skills override dir. Validates (frontmatter + name==dir) and enforces
         // containment before the write; the next container spawn discovers it.
         "save_skill" => apply_save_skill(&row)?,
+        // M22 A1: persist an agent-authored, human-approved task capability
+        // grant. The pending row was raised by the delivery service with the
+        // concrete `task_id` resolved host-side; approving INSERTs the
+        // `task_grants` row (already `approved`, `granted_by = decided_by`). No
+        // row exists before this point, so a grant persists ONLY after approval.
+        "task_grant" => apply_task_grant(central, &row, decided_by)?,
         // M18 V2: flip the group's `preview_enabled` master switch — the same
         // effect as `cclaw groups config update --field preview_enabled=true`.
         // The pending row is raised host-side by the preview manager when the
@@ -735,6 +743,15 @@ fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, E
         Ok(written) => {
             // M19 A4: dedicated saved/rejected counter at the true write site.
             copperclaw_metrics::inc_skills_saved("saved");
+            // M22 S3 metric: observe the effective version persisted (1 on a
+            // first save, N+1 on a re-save). `save_group_skill` writes the
+            // version but returns only the path, so read it back from the
+            // group's listing; a read hiccup simply skips the observation.
+            if let Ok(listing) = copperclaw_skills::list_group_skills(&dest) {
+                if let Some(entry) = listing.iter().find(|s| s.name == name) {
+                    copperclaw_metrics::observe_skill_version_saved(entry.version);
+                }
+            }
             written
         }
         // A well-formed but invalid skill (bad frontmatter, name mismatch,
@@ -755,6 +772,80 @@ fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, E
         "path": written.to_string_lossy(),
         "note": "skill saved to the group's skills override; it is discovered and \
                  available on the agent's NEXT session (no rebuild needed)",
+    }))
+}
+
+/// `task_grant` family (M22 A1): persist a human-approved task capability
+/// grant. The pending row was raised by the delivery service, which resolved
+/// the concrete `task_id` (from the task the same `schedule_task` call created)
+/// and stamped the agent-proposed scope + bounds into the payload. Approving
+/// INSERTs the `task_grants` row already `status = approved`, with
+/// `granted_by = decided_by` for audit. There is no grant row before this call,
+/// so a grant persists ONLY after approval (the acceptance invariant). The
+/// runner/autonomy gate (A2) later consults the grant via
+/// `task_grants::effective_grant`, which reads it inert once it expires,
+/// exhausts its budget, or is revoked.
+///
+/// A1 metric wish (M1 sweeps it — this card must not touch `copperclaw-metrics`):
+/// `copperclaw_task_grants_total{outcome}` (approved / revoked / expired).
+fn apply_task_grant(
+    central: &CentralDb,
+    row: &pending_approvals::PendingApproval,
+    decided_by: &str,
+) -> Result<Value, ErrorPayload> {
+    let bad = |msg: &str| ErrorPayload::new("bad_request", msg.to_string());
+    let task_id = row
+        .payload
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("task_grant payload requires a non-empty string `task_id`"))?;
+    let capability_scope = row
+        .payload
+        .get("capability_scope")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| bad("task_grant payload requires a non-empty string `capability_scope`"))?;
+    let token_budget = row.payload.get("token_budget").and_then(Value::as_i64);
+    let max_fires = row.payload.get("max_fires").and_then(Value::as_i64);
+    let expires_at = match row.payload.get("expires_at").and_then(Value::as_str) {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| bad(&format!("task_grant `expires_at` is not RFC-3339: {e}")))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+
+    let grant = task_grants::insert_approved(
+        central,
+        task_grants::NewTaskGrant {
+            id: format!("grant_{}", uuid::Uuid::now_v7()),
+            task_id: task_id.to_string(),
+            capability_scope: capability_scope.to_string(),
+            token_budget,
+            max_fires,
+            expires_at,
+            granted_by: Some(decided_by.to_string()),
+        },
+    )
+    .map_err(db_err)?;
+
+    // M22 A1 metric: an operator-approved grant persisted.
+    copperclaw_metrics::inc_task_grant("approved");
+
+    Ok(json!({
+        "kind": "task_grant",
+        "grant_id": grant.id,
+        "task_id": grant.task_id,
+        "capability_scope": grant.capability_scope,
+        "token_budget": grant.token_budget,
+        "max_fires": grant.max_fires,
+        "expires_at": grant.expires_at.map(|t| t.to_rfc3339()),
+        "granted_by": grant.granted_by,
+        "note": "capability grant approved and recorded; the task may act within this \
+                 scope on autonomous fires until it expires, exhausts its budget, or is \
+                 revoked",
     }))
 }
 
@@ -1323,6 +1414,145 @@ mod tests {
         );
         let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
+    }
+
+    // -----------------------------------------------------------------------
+    // M22 A1: task_grant approval → persist bounded capability grant
+    // -----------------------------------------------------------------------
+
+    fn seed_task(db: &CentralDb, ag: copperclaw_types::AgentGroupId, id: &str) -> String {
+        use copperclaw_db::tables::tasks::{NewTask, insert as insert_task};
+        insert_task(
+            db,
+            NewTask {
+                id: id.into(),
+                agent_group_id: ag,
+                session_id: copperclaw_types::SessionId::new(),
+                name: Some("standup".into()),
+                prompt: "post standup".into(),
+                when_spec: "daily at 09:00".into(),
+                recurrence: Some("0 9 * * *".into()),
+                next_fire: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            },
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Round-trip through the approval card: a pending `task_grant` approval,
+    /// once approved, persists a live `task_grants` row (grant persists ONLY
+    /// after approval), and `effective_grant` reads it live + in-scope.
+    #[test]
+    fn approve_task_grant_persists_and_reads_live() {
+        use copperclaw_db::tables::task_grants;
+        let db = db();
+        let ag = seed_ag(&db);
+        let task_id = seed_task(&db, ag, "t-1");
+        // Before approval: no grant.
+        assert!(
+            task_grants::effective_grant(&db, &task_id, chrono::Utc::now())
+                .unwrap()
+                .is_none()
+        );
+        let expires = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let id = insert_pending(
+            &db,
+            "task_grant",
+            UpsertPendingApproval {
+                request_id: format!("task-grant:{task_id}"),
+                payload: json!({
+                    "task_id": task_id,
+                    "capability_scope": "send_message:telegram",
+                    "token_budget": 50000,
+                    "max_fires": 30,
+                    "expires_at": expires,
+                    "reason": "morning standup posting",
+                }),
+                agent_group_id: Some(ag),
+                title: "Authorize task: standup".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "task_grant");
+        assert_eq!(v["side_effect"]["task_id"], task_id);
+        assert_eq!(
+            v["side_effect"]["capability_scope"],
+            "send_message:telegram"
+        );
+        // Persisted + live + in-scope; granted_by recorded as the decider.
+        let eff = task_grants::effective_grant(&db, &task_id, chrono::Utc::now())
+            .unwrap()
+            .expect("grant persisted live after approval");
+        assert!(eff.permits("send_message:telegram"));
+        assert!(!eff.permits("send_email"));
+        assert_eq!(eff.granted_by.as_deref(), Some("host"));
+        assert_eq!(eff.fires_remaining(), Some(30));
+    }
+
+    /// Denying a `task_grant` approval must NOT persist any grant.
+    #[test]
+    fn deny_task_grant_leaves_no_grant() {
+        use copperclaw_db::tables::task_grants;
+        let db = db();
+        let ag = seed_ag(&db);
+        let task_id = seed_task(&db, ag, "t-1");
+        let expires = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let id = insert_pending(
+            &db,
+            "task_grant",
+            UpsertPendingApproval {
+                request_id: format!("task-grant:{task_id}"),
+                payload: json!({
+                    "task_id": task_id,
+                    "capability_scope": "send_message:telegram",
+                    "max_fires": 30,
+                    "expires_at": expires,
+                    "reason": "r",
+                }),
+                agent_group_id: Some(ag),
+                title: "Authorize task".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        // Deny settles the pending row; the point is that NO grant is persisted.
+        deny(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert!(
+            task_grants::list_for_task(&db, &task_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            task_grants::effective_grant(&db, &task_id, chrono::Utc::now())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn approve_task_grant_missing_task_id_is_bad_request() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "task_grant",
+            UpsertPendingApproval {
+                request_id: "tg-notask".into(),
+                payload: json!({ "capability_scope": "send_message", "max_fires": 1 }),
+                agent_group_id: Some(ag),
+                title: "Authorize task".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        // Row stays pending (not silently approved) on a bad payload.
+        let row = get_row(&db, id).unwrap();
+        assert_eq!(row.status, ApprovalStatus::Pending);
     }
 
     #[test]

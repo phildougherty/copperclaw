@@ -53,6 +53,18 @@ pub const HOST_MCP_CALL_DEADLINE_SECS: u64 = 90;
 pub const PREVIEW_SERVER: &str = "__preview";
 /// Base value for exponential backoff between retries.
 pub const BACKOFF_BASE_MS: u64 = 5_000;
+/// Cap assumed by the too-long backstop in [`call_adapter`] when the adapter
+/// declares no `max_message_chars` at all but the platform still rejected the
+/// body as over-length. 4096 is the tightest common chat limit (Telegram).
+pub const TOO_LONG_RETRY_FALLBACK_CAP: usize = 4096;
+/// How long an idle streaming-edit split state
+/// ([`DeliveryService::edit_splits`]) is kept before pruning. A stream that
+/// stops mid-flight leaves an entry behind; the next overflow past this
+/// window starts a fresh anchor rather than extending a stale tail.
+pub const EDIT_SPLIT_TTL_SECS: u64 = 3_600;
+/// Size at which a write to [`DeliveryService::edit_splits`] triggers a TTL
+/// sweep. Keeps the map bounded without paying a scan on every edit.
+pub const EDIT_SPLIT_PRUNE_THRESHOLD: usize = 256;
 /// Age ceiling (hours) for a pending outbound row whose channel has no live
 /// adapter (M21 S5). Below the ceiling the row stays pending — the adapter
 /// may simply not have been wired yet this boot; past it the row is
@@ -67,6 +79,18 @@ pub const NO_ADAPTER_MAX_AGE_HOURS: i64 = 24;
 /// (`cclaw doctor`, M21 O1) can match this prefix to distinguish no-adapter
 /// dead letters from adapter-failure ones.
 pub const NO_ADAPTER_DROP_REASON: &str = "no_adapter";
+/// Reason prefix recorded in `outbound_dropped_messages.last_error` for rows
+/// dead-lettered because no dispatch target was resolvable (M22). Distinct from
+/// [`NO_ADAPTER_DROP_REASON`]: there the destination is known but unserviced,
+/// here there is no destination at all.
+///
+/// Deliberately NOT reachable by host-local `MessageKind::System` control rows
+/// — those are processed route-free (see `process_row`), because the `delegate`
+/// profile's contained children are spawned with NO `session_routing` by
+/// design and still emit a `usage_report` every turn. There is intentionally no
+/// parent-route fallback: letting a contained worker inherit its parent's chat
+/// route would break the containment property the profile exists to provide.
+pub const NO_ROUTE_DROP_REASON: &str = "no_route";
 
 /// A pair `(session_id, message_out_id)` used to dedupe concurrent attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -233,6 +257,33 @@ struct RetryState {
     first_chunk_pid: Option<String>,
 }
 
+/// Streaming-edit overflow state for ONE anchor message.
+///
+/// A streamed reply is delivered as a first chat message plus a run of `edit`
+/// system actions, each carrying the FULL text so far. Once that text passes
+/// the channel's cap the anchor can no longer hold it, so delivery spills into
+/// follow-up messages — and every later edit must extend the LAST of those,
+/// not re-post the whole stream. This records where the spill got to.
+///
+/// Keyed in [`DeliveryService::edit_splits`] by the ANCHOR's platform message
+/// id (stable for the life of the stream, and what `delivered` stores), not by
+/// the moving tail.
+///
+/// In-memory only: a host restart mid-stream loses the split point, and the
+/// stream resumes editing the anchor. That degrades to the pre-fix behaviour
+/// for one stream rather than requiring a migration.
+#[derive(Debug, Clone)]
+struct EditSplitState {
+    /// Chars of the logical stream text already flushed into messages BEFORE
+    /// `tail_external_id`. The tail is responsible for everything past this.
+    committed: usize,
+    /// Platform message id successive edits currently extend. Starts as the
+    /// anchor itself and moves forward on each overflow.
+    tail_external_id: String,
+    /// Last touch, for TTL pruning ([`EDIT_SPLIT_TTL_SECS`]).
+    updated: Instant,
+}
+
 /// Outcome of [`DeliveryService::try_action_via_adapter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionAdapterOutcome {
@@ -380,6 +431,10 @@ pub struct DeliveryService {
     /// (e.g. after a host restart); cleared when the plan fully completes
     /// so a later fresh plan re-pins.
     todo_anchors: DashMap<SessionId, String>,
+    /// Streaming-edit overflow state, keyed by ANCHOR platform message id.
+    /// Present only for streams that have outgrown the channel's cap; see
+    /// [`EditSplitState`] and `try_streaming_edit_split`.
+    edit_splits: DashMap<String, EditSplitState>,
     /// Per-session in-flight guard for host-proxied external MCP tool calls.
     /// A session present here has a drain task running; the active loop skips
     /// re-spawning one so a slow external call is never executed twice. `Arc`
@@ -445,6 +500,7 @@ impl DeliveryService {
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
+            edit_splits: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
             tunnel_broker: std::sync::OnceLock::new(),
@@ -491,6 +547,7 @@ impl DeliveryService {
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
+            edit_splits: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
             tunnel_broker: std::sync::OnceLock::new(),
@@ -797,12 +854,9 @@ impl DeliveryService {
                     }
                 }
                 Err(DeliveryError::NoRoute(_)) => {
-                    let in_conn = inbound_pool.connect()?;
-                    delivered::insert(&in_conn, row.id, None, "failed")?;
-                    self.retries.remove(&key);
+                    self.record_no_route(sess, &row, &key, routing.as_ref(), &inbound_pool)?;
                     report.failed += 1;
-                    copperclaw_metrics::inc_delivery_failed(&channel_label);
-                    warn!(?row.id, "no route resolvable, marking failed");
+                    warn!(?row.id, "no route resolvable, dead-lettering row");
                 }
                 Err(err) => {
                     // Non-retryable adapter error -> mark failed immediately.
@@ -1146,12 +1200,28 @@ impl DeliveryService {
         routing: Option<&copperclaw_types::routing::SessionRouting>,
         inbound_pool: &SessionPool,
     ) -> Result<(), DeliveryError> {
-        let target = Self::resolve_target(row, routing).ok_or(DeliveryError::NoRoute(sess.id))?;
+        let resolved = Self::resolve_target(row, routing);
+
+        // `MessageKind::System` rows are host-local control messages
+        // (`usage_report`, `install_packages`, `add_mcp_server`, `goal`, …) —
+        // they are applied against the central DB and never touch a channel, so
+        // a resolvable route is NOT a precondition for them. It used to be, and
+        // that made every turn's `usage_report` from a `delegate`-profile child
+        // (spawned with no `session_routing` on purpose) fail as `NoRoute` — so
+        // delegate token spend never reached `agent_turns` and was invisible to
+        // `cclaw usage` and to budget enforcement. `handle_system` now takes an
+        // optional target and demands a real one only for the sub-actions that
+        // genuinely dispatch to a channel.
+        if row.kind == MessageKind::System {
+            return self
+                .handle_system(sess, row, resolved.as_ref(), inbound_pool)
+                .await;
+        }
+        let target = resolved.ok_or(DeliveryError::NoRoute(sess.id))?;
 
         match row.kind {
-            MessageKind::System => {
-                self.handle_system(sess, row, &target, inbound_pool).await?;
-            }
+            // Handled above, route-free.
+            MessageKind::System => {}
             MessageKind::Agent => {
                 // Agent-to-agent delivery: the `agent_to_agent::AgentDispatchModule`
                 // owns the implementation via the action registry. Its handler
@@ -1280,11 +1350,20 @@ impl DeliveryService {
         Ok(())
     }
 
+    /// Apply one `MessageKind::System` control row.
+    ///
+    /// `target` is OPTIONAL: most system actions are host-local mutations that
+    /// never address a channel, and requiring a route here permanently failed
+    /// the route-less `delegate` children's per-turn `usage_report` rows. The
+    /// sub-actions that really do dispatch to a channel (`save_skill` /
+    /// `task_grant` approval cards, `update_breadcrumb`, `edit` / `reaction`)
+    /// unwrap it below and surface [`DeliveryError::NoRoute`] when absent —
+    /// there is deliberately no parent-route fallback.
     async fn handle_system(
         &self,
         sess: &Session,
         row: &MessageOutRow,
-        target: &DispatchTarget,
+        target: Option<&DispatchTarget>,
         inbound_pool: &SessionPool,
     ) -> Result<(), DeliveryError> {
         let Some(action) = parse_system_content(&row.content)? else {
@@ -1332,7 +1411,60 @@ impl DeliveryService {
         // operator approves (the `save_skill` apply arm in the host's approvals
         // handler). Secure-by-default: nothing lands on disk without approval.
         if action.name == "save_skill" {
+            let target = target.ok_or(DeliveryError::NoRoute(sess.id))?;
             self.raise_save_skill_approval(sess, row, target, inbound_pool, &action.payload)?;
+            return Ok(());
+        }
+        // `task_grant` (M22 A1): the runner emits this alongside a `schedule`
+        // create when the agent's `schedule_task` call carried a `grant`. Like
+        // `save_skill` it is APPROVAL-GATED — we resolve the concrete task id
+        // (the schedule create row, processed just before this one, already
+        // created the task), raise a pending approval + card, and persist the
+        // `task_grants` row only when an operator approves (the `task_grant`
+        // apply arm in the host's approvals handler). Nothing is authorized
+        // without approval.
+        if action.name == "task_grant" {
+            let target = target.ok_or(DeliveryError::NoRoute(sess.id))?;
+            self.raise_task_grant_approval(sess, row, target, inbound_pool, &action.payload)?;
+            return Ok(());
+        }
+        // `goal` (M22 A3): the runner emits this when the agent calls
+        // `create_goal` / `update_goal`. A goal is internal tracking state — it
+        // authorizes nothing on its own — so unlike `save_skill` / `task_grant`
+        // it applies IMMEDIATELY against the central `goals` table (mirroring
+        // `install_packages`), not via an approval card. Any external ACTION a
+        // goal check-in wake later takes stays gated by A2's grant machinery.
+        if action.name == "goal" {
+            let apply = apply_goal(&self.central, sess, &action.payload);
+            self.finish_self_mod("goal", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
+        // `condition` (M22 A4): the runner emits this when the agent calls
+        // `register_condition` / `set_condition_flag`. Like `goal` it is
+        // internal tracking state — it authorizes nothing on its own (any
+        // autonomous action a condition-driven wake later takes stays gated by
+        // A2's grant machinery at fire time) — so it applies IMMEDIATELY against
+        // the central `conditions` / `condition_flags` tables, not via an
+        // approval card.
+        if action.name == "condition" {
+            let apply = apply_condition(&self.central, sess, &action.payload);
+            self.finish_self_mod("condition", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
+        // `grant_consume` (M22 A2H): the runner emits this when a GRANTED
+        // autonomous action actually fires (`charge_grant_fire_once` in the
+        // runner's `tool_dispatch`). It is pure internal accounting — it
+        // authorizes nothing, it only DEBITS an already-approved grant — so it
+        // applies IMMEDIATELY (like `goal` / `condition`, NOT approval-gated),
+        // decrementing the central `task_grants` row via `consume_fire` (+
+        // `consume_tokens` when the payload carries a token count). This is what
+        // makes `max_fires` / token budgets enforceable ACROSS fires: without
+        // it the runner's per-turn/in-snapshot bounds hold, but the central
+        // grant never depletes, so `effective_grant` (hence the next spawn's
+        // grant.json) would never read the grant exhausted.
+        if action.name == "grant_consume" {
+            let apply = apply_grant_consume(&self.central, &action.payload);
+            self.finish_self_mod("grant_consume", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
 
@@ -1346,6 +1478,7 @@ impl DeliveryService {
         // platform id isn't known (no edit-API support, or chip
         // hasn't been delivered yet).
         if action.name == "update_breadcrumb" {
+            let target = target.ok_or(DeliveryError::NoRoute(sess.id))?;
             self.handle_update_breadcrumb(row, target, inbound_pool, &action.payload, sess)
                 .await?;
             return Ok(());
@@ -1356,11 +1489,14 @@ impl DeliveryService {
         // reports `Unsupported` (CLI / webhooks / etc.) OR when the original
         // row's platform message id is missing — the handler is expected to
         // return a fallback `OutboundMessage` we then dispatch normally.
-        if let Some(()) = self
-            .maybe_handle_edit_or_reaction(sess, row, &action, target, inbound_pool)
-            .await?
-        {
-            return Ok(());
+        if matches!(action.name.as_str(), "edit" | "reaction") {
+            let target = target.ok_or(DeliveryError::NoRoute(sess.id))?;
+            if let Some(()) = self
+                .maybe_handle_edit_or_reaction(sess, row, &action, target, inbound_pool)
+                .await?
+            {
+                return Ok(());
+            }
         }
 
         let handler = self.actions.get(&action.name).map(|r| r.clone());
@@ -1375,7 +1511,12 @@ impl DeliveryService {
         // both threaded into `DeliveryActionInput` so the scheduling
         // handler can identify which session a `schedule` op targets.
         // Other handlers ignore the extra context.
-        let mut handler_target = target.clone();
+        // A route-less system row still reaches its registered handler — the
+        // handler-dispatch tail below only touches a channel when the handler
+        // hands back a message AND the target carries both a channel type and a
+        // platform id, so an empty target degrades to "apply side effects, then
+        // record delivered=ok" rather than failing the row.
+        let mut handler_target = target.cloned().unwrap_or_default();
         if handler_target.agent_group_id.is_none() {
             handler_target.agent_group_id = Some(sess.agent_group_id);
         }
@@ -1407,7 +1548,9 @@ impl DeliveryService {
         // If the handler asked us to deliver a message, route it through the
         // normal channel dispatch path.
         if let Some(msg) = output.message {
-            let dispatch_target = output.dispatch.unwrap_or_else(|| target.clone());
+            let dispatch_target = output
+                .dispatch
+                .unwrap_or_else(|| target.cloned().unwrap_or_default());
             let Some(channel_type) = dispatch_target.channel_type.clone() else {
                 let in_conn = inbound_pool.connect()?;
                 delivered::insert(&in_conn, row.id, None, "ok")?;
@@ -1559,6 +1702,27 @@ impl DeliveryService {
             return Ok(ActionAdapterOutcome::FallThrough);
         };
 
+        // Over-cap streaming edits are handled before the plain edit call:
+        // `editMessageText` enforces the SAME length limit as `sendMessage`,
+        // so a streamed reply that grows past the cap would otherwise fail on
+        // every subsequent edit, permanently.
+        if action_name == "edit" {
+            if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+                if let Some(outcome) = self
+                    .try_streaming_edit_split(
+                        adapter.as_ref(),
+                        &platform_id,
+                        target.thread_id.as_deref(),
+                        &external_id,
+                        text,
+                    )
+                    .await?
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
+
         let call_result = match action_name {
             "edit" => {
                 let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) else {
@@ -1620,6 +1784,168 @@ impl DeliveryService {
                 Err(DeliveryError::Adapter(other))
             }
         }
+    }
+
+    /// Handle a streaming `edit` whose text has outgrown the channel's cap.
+    ///
+    /// A streamed reply arrives as one chat message plus a run of `edit`
+    /// actions, each carrying the FULL text so far. `editMessageText` enforces
+    /// the same length limit as `sendMessage`, so once the stream crosses the
+    /// cap every remaining edit fails — the reply freezes at whatever prefix
+    /// happened to land, and the row eventually drops. This is the path the
+    /// production `BadRequest("Bad Request: message is too long")` came from.
+    ///
+    /// The fix keeps ONE logical stream spread across several messages:
+    ///
+    /// - Text is accounted in two pieces — `committed` chars already flushed
+    ///   into earlier messages, and the remainder the current TAIL message
+    ///   owns. Only the remainder is ever sent.
+    /// - While the remainder fits, the tail is edited in place, so successive
+    ///   ticks keep extending coherently instead of re-posting the stream.
+    /// - When the remainder overflows, it is split fence-aware: the tail takes
+    ///   the first chunk, each later chunk becomes a NEW message, and the last
+    ///   one becomes the new tail for subsequent ticks.
+    ///
+    /// Returns `Ok(None)` when this is an ordinary in-cap edit on a stream
+    /// that has never overflowed — the caller's plain `edit_message` path is
+    /// exactly right and stays in charge. `Ok(Some(_))` means handled.
+    async fn try_streaming_edit_split(
+        &self,
+        adapter: &dyn ChannelAdapter,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        anchor: &str,
+        text: &str,
+    ) -> Result<Option<ActionAdapterOutcome>, DeliveryError> {
+        // Same headroom the splitter applies — an edit renders exactly like a
+        // send, so it needs exactly the same margin.
+        let byte_cap =
+            copperclaw_channels_core::markdown::effective_max(adapter.max_message_bytes())
+                .filter(|c| *c > 0);
+        let Some(cap) =
+            copperclaw_channels_core::markdown::effective_max(adapter.max_message_chars())
+                .filter(|c| *c > 0)
+                .or(byte_cap)
+        else {
+            // Channel declares no cap: nothing to split against.
+            return Ok(None);
+        };
+
+        let prior = self
+            .edit_splits
+            .get(anchor)
+            .map(|s| (s.committed, s.tail_external_id.clone()));
+        let has_state = prior.is_some();
+        let (committed, tail) = prior.unwrap_or_else(|| (0, anchor.to_string()));
+
+        // What the CURRENT tail message is responsible for.
+        let remainder: String = text.chars().skip(committed).collect();
+
+        if remainder.chars().count() <= cap && byte_cap.is_none_or(|b| remainder.len() <= b) {
+            if !has_state {
+                // Ordinary in-cap edit on a stream that never overflowed.
+                return Ok(None);
+            }
+            // Already spilled; keep extending the tail in place.
+            match adapter
+                .edit_message(platform_id, thread_id, &tail, &remainder)
+                .await
+            {
+                Ok(()) => {}
+                Err(AdapterError::Unsupported(reason)) => {
+                    info!(reason, "adapter cannot edit; falling back");
+                    return Ok(Some(ActionAdapterOutcome::FallThrough));
+                }
+                Err(other) => return Err(DeliveryError::Adapter(other)),
+            }
+            self.touch_edit_split(anchor, committed, &tail);
+            return Ok(Some(ActionAdapterOutcome::Done));
+        }
+
+        let chunks =
+            split_text_into_chunks(&remainder, cap, byte_cap, adapter.channel_type().as_str());
+        let Some(last) = chunks.len().checked_sub(1) else {
+            return Ok(None);
+        };
+
+        // Extend the tail with the first chunk FIRST: if the adapter can't
+        // edit at all, nothing has been sent yet and falling through to the
+        // synthetic-chat path (which is itself split) is still clean.
+        match adapter
+            .edit_message(platform_id, thread_id, &tail, &chunks[0])
+            .await
+        {
+            Ok(()) => {}
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(reason, "adapter cannot edit; falling back");
+                return Ok(Some(ActionAdapterOutcome::FallThrough));
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        }
+
+        let mut new_committed = committed;
+        let mut rem = remainder;
+        let mut tail_id = tail;
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i < last {
+                // Advance the accounting past the text this chunk froze into
+                // a now-complete message. `source_consumed` (not the chunk's
+                // own length) because the splitter adds synthetic fence
+                // markers that never existed in the source.
+                let consumed = source_consumed(chunk, &rem);
+                if consumed == 0 {
+                    // Cannot account for this chunk. Leave `committed` where
+                    // it is: the next tick re-splits from the same point,
+                    // which may repeat text but never loses any.
+                    warn!(
+                        channel = adapter.channel_type().as_str(),
+                        "streaming edit chunk shares no prefix with its source; \
+                         split accounting not advanced"
+                    );
+                } else {
+                    new_committed += consumed;
+                    rem = rem.chars().skip(consumed).collect();
+                    // The splitter trims boundary whitespace; skip it here too
+                    // so the next chunk's prefix match lines up.
+                    let ws = rem.chars().take_while(|c| c.is_whitespace()).count();
+                    new_committed += ws;
+                    rem = rem.chars().skip(ws).collect();
+                }
+            }
+            if i > 0 {
+                let msg = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": chunk }),
+                    files: vec![],
+                };
+                if let Some(pid) = call_adapter(adapter, platform_id, thread_id, &msg).await? {
+                    tail_id = pid;
+                }
+            }
+        }
+
+        self.touch_edit_split(anchor, new_committed, &tail_id);
+        Ok(Some(ActionAdapterOutcome::Done))
+    }
+
+    /// Record streaming-edit split progress for `anchor`, pruning entries left
+    /// behind by streams that stopped mid-flight once the map grows past
+    /// [`EDIT_SPLIT_PRUNE_THRESHOLD`].
+    fn touch_edit_split(&self, anchor: &str, committed: usize, tail: &str) {
+        let now = Instant::now();
+        if self.edit_splits.len() > EDIT_SPLIT_PRUNE_THRESHOLD {
+            let ttl = Duration::from_secs(EDIT_SPLIT_TTL_SECS);
+            self.edit_splits
+                .retain(|_, s| now.duration_since(s.updated) < ttl);
+        }
+        self.edit_splits.insert(
+            anchor.to_string(),
+            EditSplitState {
+                committed,
+                tail_external_id: tail.to_string(),
+                updated: now,
+            },
+        );
     }
 
     /// Resolve an `install_packages` / `add_mcp_server` apply result
@@ -1798,6 +2124,159 @@ impl DeliveryService {
         Ok(())
     }
 
+    /// Raise an approval for an agent-authored task capability `grant` (M22 A1)
+    /// and dispatch an approve/deny card to the originating channel.
+    ///
+    /// The grant references its task by name (`task_name`); the concrete task id
+    /// is assigned host-side, so we resolve it HERE from the session's tasks
+    /// (the `schedule` create row that created it was processed just before this
+    /// row) and stamp it into the pending payload. Nothing is authorized here —
+    /// the `task_grants` row lands only when an operator approves (the host's
+    /// `task_grant` approval apply arm). Idempotent on `(session, task_name)` via
+    /// a stable `request_id`, so a retry doesn't stack cards. If the task can't
+    /// be resolved (e.g. its create failed), the request is refused with a
+    /// self-mod failure so the agent learns rather than the row silently
+    /// dropping.
+    fn raise_task_grant_approval(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        payload: &serde_json::Value,
+    ) -> Result<(), DeliveryError> {
+        let ag = sess.agent_group_id;
+        let task_name = payload
+            .get("task_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let capability_scope = payload
+            .get("capability_scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if task_name.is_empty() || capability_scope.trim().is_empty() {
+            record_task_grant_failure(
+                sess,
+                row,
+                inbound_pool,
+                "task_grant payload is missing `task_name` or `capability_scope`",
+            )?;
+            return Ok(());
+        }
+
+        // Resolve the concrete task id from the just-created task.
+        let task = match copperclaw_db::tables::tasks::latest_for_session_by_name(
+            &self.central,
+            sess.id,
+            &task_name,
+        ) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!(
+                        "could not find a task named `{task_name}` to attach the grant to; the \
+                         task must be scheduled in the same call"
+                    ),
+                )?;
+                return Ok(());
+            }
+            Err(err) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!("could not resolve the task for the grant: {err}"),
+                )?;
+                return Ok(());
+            }
+        };
+
+        // Host-trusted payload: the resolved task id plus the agent-proposed
+        // (already tool-validated) scope + bounds. The apply arm inserts the
+        // grant from exactly this.
+        let payload_out = serde_json::json!({
+            "task_id": task.id,
+            "task_name": task_name,
+            "capability_scope": capability_scope,
+            "token_budget": payload.get("token_budget").cloned().unwrap_or(serde_json::Value::Null),
+            "max_fires": payload.get("max_fires").cloned().unwrap_or(serde_json::Value::Null),
+            "expires_at": payload.get("expires_at").cloned().unwrap_or(serde_json::Value::Null),
+            "reason": reason,
+        });
+
+        let approval = match pending_approvals::upsert(
+            &self.central,
+            pending_approvals::UpsertPendingApproval {
+                request_id: format!("task-grant:{}:{task_name}", task.id),
+                action: "task_grant".to_string(),
+                payload: payload_out,
+                agent_group_id: Some(ag),
+                session_id: Some(sess.id),
+                channel_type: target.channel_type.clone(),
+                platform_id: target.platform_id.clone(),
+                title: format!("Authorize task `{task_name}`"),
+                ..Default::default()
+            },
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                record_task_grant_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!("could not record the task_grant approval: {err}"),
+                )?;
+                return Ok(());
+            }
+        };
+
+        if target.channel_type.is_some() && target.platform_id.is_some() {
+            let approval_id = approval.approval_id.as_uuid().to_string();
+            let body = if reason.trim().is_empty() {
+                format!(
+                    "The agent wants to pre-authorize the scheduled task `{task_name}` to act \
+                     autonomously within `{capability_scope}`."
+                )
+            } else {
+                format!(
+                    "The agent wants to pre-authorize the scheduled task `{task_name}` to act \
+                     autonomously within `{capability_scope}`.\n\nReason: {reason}"
+                )
+            };
+            let card = OutboundMessage {
+                kind: MessageKind::Card,
+                content: serde_json::json!({
+                    "card": {
+                        "title": format!("Authorize task `{task_name}`"),
+                        "body": body,
+                        "buttons": [
+                            { "label": "Authorize", "value": format!("approve:{approval_id}"), "style": "primary" },
+                            { "label": "Not now", "value": format!("deny:{approval_id}"), "style": "danger" },
+                        ],
+                    },
+                }),
+                files: vec![],
+            };
+            self.dispatcher.dispatch(target, &card);
+        }
+
+        copperclaw_metrics::inc_self_mod_succeeded("task_grant");
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "ok")?;
+        Ok(())
+    }
+
     async fn dispatch_chat(
         &self,
         session_id: SessionId,
@@ -1853,6 +2332,29 @@ impl DeliveryService {
                 .await;
         }
 
+        // Empty-payload guard. A `Chat` row whose `text` is missing, not a
+        // string, or whitespace-only has nothing to deliver: the splitter
+        // passes it through untouched, the adapter rejects it (telegram:
+        // `BadRequest("telegram deliver requires text or files")`), and the
+        // row then burns its whole retry budget before the exhaustion arm
+        // emits a user-facing `MessageKind::Error` receipt for what is really
+        // a runner-side condition. Note every `OutboundMessage` this crate
+        // builds hardcodes `files: vec![]`, so the "or files" half of that
+        // adapter check can never rescue a text-less row.
+        //
+        // Record it as a delivered no-op instead: nothing reaches the user,
+        // nothing retries, and no spurious error card is emitted.
+        if row.kind == MessageKind::Chat && chat_text_is_empty(&row.content) {
+            warn!(
+                session = %session_id,
+                msg_id = ?row.id,
+                "outbound chat row carries no text; recording delivered no-op"
+            );
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        }
+
         // Split if the adapter advertises a per-message char cap and the
         // body would exceed it. Returns a vec of contents to send in order;
         // the first element's platform_message_id is the one we record so
@@ -1860,6 +2362,7 @@ impl DeliveryService {
         let parts = split_chat_content_if_needed(
             &row.content,
             adapter.max_message_chars(),
+            adapter.max_message_bytes(),
             adapter.channel_type().as_str(),
         );
 
@@ -3104,6 +3607,88 @@ impl DeliveryService {
     /// out-of-vocabulary kind would poison `outbound-list` for every row),
     /// and replaying hours-stale UI chrome is meaningless. For those, the
     /// terminal `failed` record plus the log line is the whole story.
+    /// Dead-letter one outbound row for which no dispatch target could be
+    /// resolved (M22). Previously this path wrote nothing central at all — the
+    /// row was silently marked `failed` and `cclaw dropped-messages
+    /// outbound-list` stayed empty through 550+ real drops in a single day.
+    ///
+    /// Mirrors [`Self::record_no_adapter_expired`]: replayable kinds get an
+    /// `outbound_dropped_messages` row (written FIRST, so a failure of the
+    /// terminal write below can at worst duplicate a visible dead letter rather
+    /// than lose the only copy), ephemeral UI kinds get the terminal record and
+    /// the log line only. No user-facing `ErrorCard` — by definition there is
+    /// nowhere to send one.
+    ///
+    /// `MessageKind::System` rows can no longer arrive here for the host-local
+    /// actions; only the channel-dispatching sub-actions can, and those are
+    /// genuinely undeliverable without a route.
+    fn record_no_route(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        key: &DeliveryKey,
+        routing: Option<&copperclaw_types::routing::SessionRouting>,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let replayable = matches!(
+            row.kind,
+            MessageKind::Chat
+                | MessageKind::Task
+                | MessageKind::Webhook
+                | MessageKind::System
+                | MessageKind::Agent
+                | MessageKind::Card
+        );
+        if replayable {
+            // Same fallback order as `resolve_target` — whatever partial
+            // routing exists is worth recording for the operator, even though
+            // by construction it is not a complete channel + platform pair.
+            let channel_type = row
+                .channel_type
+                .clone()
+                .or_else(|| routing.and_then(|r| r.channel_type.clone()));
+            let platform_id = row
+                .platform_id
+                .clone()
+                .or_else(|| routing.and_then(|r| r.platform_id.clone()));
+            let thread_id = row
+                .thread_id
+                .clone()
+                .or_else(|| routing.and_then(|r| r.thread_id.clone()));
+            let last_error = format!(
+                "{NO_ROUTE_DROP_REASON}: no dispatch target resolvable (row and session_routing \
+                 carry no channel + platform pair); replay with `cclaw dropped-messages replay` \
+                 once the session has routing"
+            );
+            outbound_dropped_messages::insert(
+                &self.central,
+                outbound_dropped_messages::InsertOutboundDropped {
+                    session_id: sess.id,
+                    agent_group_id: sess.agent_group_id,
+                    message_out_id: row.id,
+                    channel_type,
+                    platform_id,
+                    thread_id,
+                    kind: row.kind,
+                    content: row.content.clone(),
+                    last_error,
+                },
+            )?;
+        }
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "failed")?;
+        self.retries.remove(key);
+        let channel_label = row
+            .channel_type
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |ct| ct.as_str().to_owned());
+        copperclaw_metrics::inc_delivery_failed(&channel_label);
+        copperclaw_metrics::inc_delivery_dead_letter(
+            copperclaw_metrics::DEAD_LETTER_REASON_NO_ROUTE,
+        );
+        Ok(())
+    }
+
     fn record_no_adapter_expired(
         &self,
         sess: &Session,
@@ -3197,21 +3782,40 @@ impl DeliveryService {
 ///   if neither produced a small-enough chunk.
 /// - Preserves the rest of `content`'s shape on every chunk so adapter-
 ///   specific keys like `parse_mode` continue to apply per part.
+///
+/// `max` is the channel's DECLARED cap (`ChannelAdapter::max_message_chars`).
+/// It is shrunk by [`copperclaw_channels_core::markdown::effective_max`]
+/// before use: adapters render markdown to their own flavor AFTER the split
+/// (telegram runs `render(.., Flavor::Html)`), and rendering only ever grows
+/// the string, so a chunk that fits the declared cap as markdown can exceed
+/// it at the API and be rejected as "message is too long". Applying the
+/// headroom HERE — the single place the cap is turned into a chunk size —
+/// means every caller gets it without re-deriving a margin of its own.
 pub(crate) fn split_chat_content_if_needed(
     content: &serde_json::Value,
     max: Option<usize>,
+    max_bytes: Option<usize>,
     channel_type: &str,
 ) -> Vec<serde_json::Value> {
-    let Some(max) = max.filter(|m| *m > 0) else {
+    let eff_chars = copperclaw_channels_core::markdown::effective_max(max).filter(|m| *m > 0);
+    let eff_bytes = copperclaw_channels_core::markdown::effective_max(max_bytes).filter(|m| *m > 0);
+    if eff_chars.is_none() && eff_bytes.is_none() {
         return vec![content.clone()];
-    };
+    }
     let Some(text) = content.get("text").and_then(|v| v.as_str()) else {
         return vec![content.clone()];
     };
-    if text.chars().count() <= max {
+    if eff_chars.is_none_or(|m| text.chars().count() <= m)
+        && eff_bytes.is_none_or(|b| text.len() <= b)
+    {
         return vec![content.clone()];
     }
-    let chunks = split_text_into_chunks(text, max, channel_type);
+    let chunks = split_text_into_chunks(
+        text,
+        eff_chars.unwrap_or(usize::MAX),
+        eff_bytes,
+        channel_type,
+    );
     chunks
         .into_iter()
         .map(|chunk| {
@@ -3224,14 +3828,64 @@ pub(crate) fn split_chat_content_if_needed(
         .collect()
 }
 
+/// True when a `Chat` row's content carries no deliverable text — the `text`
+/// field is absent, is not a string, or is whitespace-only. See the
+/// empty-payload guard in [`DeliveryService::dispatch_chat`].
+pub(crate) fn chat_text_is_empty(content: &serde_json::Value) -> bool {
+    match content.get("text").and_then(serde_json::Value::as_str) {
+        Some(text) => text.trim().is_empty(),
+        None => true,
+    }
+}
+
+/// Number of leading chars `a` and `b` share.
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// How many chars of `source` a splitter chunk consumed.
+///
+/// A chunk is a prefix of its source EXCEPT for the fence-aware splitter's
+/// two synthetic edits: it may append a closing fence marker when it cuts
+/// inside a fenced block, and prepend the reopened fence line to the chunk
+/// that follows such a cut. Neither exists in the source, so a naive
+/// `chunk.chars().count()` over-counts and a naive prefix match returns 0 on
+/// a reopened chunk. Compare on the longest common prefix, retrying past a
+/// synthetic leading fence line when the direct match is empty.
+///
+/// Used only to advance streaming-edit split accounting; a `0` return is
+/// handled by the caller as "cannot account for this chunk".
+fn source_consumed(chunk: &str, source: &str) -> usize {
+    let direct = common_prefix_chars(chunk, source);
+    if direct > 0 {
+        return direct;
+    }
+    match chunk.split_once('\n') {
+        Some((head, tail)) if head.trim_start().starts_with("```") => {
+            common_prefix_chars(tail, source)
+        }
+        _ => 0,
+    }
+}
+
 /// Greedy, fence-aware chunker honoring `max` chars per chunk. Migrated to
 /// [`copperclaw_channels_core::markdown`] in M18/C5b (the shared renderer
 /// absorbed C2's splitter + `fence.rs`); this thin delegate preserves the
 /// call site and keeps `host-delivery`'s C2 splitter tests exercising the
 /// migrated logic. See [`copperclaw_channels_core::markdown::split_into_chunks`]
 /// for the cut-preference and fence close/reopen rules.
-fn split_text_into_chunks(text: &str, max: usize, channel_type: &str) -> Vec<String> {
-    copperclaw_channels_core::markdown::split_into_chunks(text, max, channel_type)
+fn split_text_into_chunks(
+    text: &str,
+    max: usize,
+    max_bytes: Option<usize>,
+    channel_type: &str,
+) -> Vec<String> {
+    copperclaw_channels_core::markdown::split_into_chunks_within_bytes(
+        text,
+        max,
+        max_bytes,
+        channel_type,
+    )
 }
 
 /// Wrap an adapter `deliver` call so the `?` operator at the call sites can
@@ -3247,7 +3901,108 @@ fn split_text_into_chunks(text: &str, max: usize, channel_type: &str) -> Vec<Str
 /// incremented. If the adapter has no fallback (default impl) or the
 /// fallback itself fails, the ORIGINAL error is returned so the caller's
 /// failure-handling stays unchanged.
+///
+/// `call_adapter` is ALSO the crate's cap-aware send surface. A
+/// `MessageKind::Chat` message whose text exceeds the adapter's effective cap
+/// is split here (fence-aware, via [`split_chat_content_if_needed`]) and
+/// delivered as consecutive messages, returning the FIRST part's platform id
+/// as the anchor. This is deliberately at the bottom of the stack rather than
+/// at each call site: the seven `Unsupported` rich-kind fallbacks
+/// (collapsible / card / breadcrumb / todo list / error / thinking / diff) and
+/// the delivery-action output path all synthesize a plain `Chat` message and
+/// call straight through here, so every one of them inherits the splitter from
+/// this single place. Rows that arrived via `dispatch_chat` were already split
+/// against the same cap, so their parts pass through as single messages —
+/// there is no double split.
 async fn call_adapter(
+    adapter: &dyn ChannelAdapter,
+    platform_id: &str,
+    thread_id: Option<&str>,
+    message: &OutboundMessage,
+) -> Result<Option<String>, DeliveryError> {
+    // Non-chat kinds carry structured content the splitter must not touch.
+    let parts = if message.kind == MessageKind::Chat {
+        split_chat_content_if_needed(
+            &message.content,
+            adapter.max_message_chars(),
+            adapter.max_message_bytes(),
+            adapter.channel_type().as_str(),
+        )
+    } else {
+        vec![message.content.clone()]
+    };
+    if parts.len() > 1 {
+        return deliver_parts(adapter, platform_id, thread_id, message, &parts).await;
+    }
+
+    match call_adapter_once(adapter, platform_id, thread_id, message).await {
+        // Backstop: the adapter's declared cap was wrong, or the platform
+        // moved it. Nothing was sent (this is the single-part branch), so a
+        // re-split retry cannot duplicate anything — halve the cap and try
+        // again rather than letting the reply drop permanently.
+        Err(DeliveryError::Adapter(AdapterError::BadRequest(msg)))
+            if message.kind == MessageKind::Chat && is_too_long_bad_request(&msg) =>
+        {
+            let declared = adapter
+                .max_message_chars()
+                .unwrap_or(TOO_LONG_RETRY_FALLBACK_CAP);
+            let retry_parts = split_chat_content_if_needed(
+                &message.content,
+                Some((declared / 2).max(1)),
+                adapter.max_message_bytes().map(|b| (b / 2).max(1)),
+                adapter.channel_type().as_str(),
+            );
+            if retry_parts.len() <= 1 {
+                // Halving didn't produce a split (e.g. no text field) — the
+                // rejection is not something re-splitting can fix.
+                return Err(DeliveryError::Adapter(AdapterError::BadRequest(msg)));
+            }
+            warn!(
+                channel = adapter.channel_type().as_str(),
+                parts = retry_parts.len(),
+                %msg,
+                "adapter rejected message as too long; re-splitting at a reduced cap"
+            );
+            deliver_parts(adapter, platform_id, thread_id, message, &retry_parts).await
+        }
+        other => other,
+    }
+}
+
+/// Deliver a pre-split chat body as consecutive messages, returning the FIRST
+/// part's platform id (the anchor future edits / reactions target). Attached
+/// files ride along with the first part only, so a retry-free multi-part send
+/// doesn't upload them once per chunk.
+async fn deliver_parts(
+    adapter: &dyn ChannelAdapter,
+    platform_id: &str,
+    thread_id: Option<&str>,
+    message: &OutboundMessage,
+    parts: &[serde_json::Value],
+) -> Result<Option<String>, DeliveryError> {
+    copperclaw_metrics::inc_delivery_chat_split(adapter.channel_type().as_str());
+    let mut first = None;
+    for (i, content) in parts.iter().enumerate() {
+        let part = OutboundMessage {
+            kind: message.kind,
+            content: content.clone(),
+            files: if i == 0 {
+                message.files.clone()
+            } else {
+                vec![]
+            },
+        };
+        let pid = call_adapter_once(adapter, platform_id, thread_id, &part).await?;
+        if i == 0 {
+            first = pid;
+        }
+    }
+    Ok(first)
+}
+
+/// One `deliver` call plus the plain-text formatting fallback. Split out of
+/// [`call_adapter`] so the cap-aware splitter can drive it per chunk.
+async fn call_adapter_once(
     adapter: &dyn ChannelAdapter,
     platform_id: &str,
     thread_id: Option<&str>,
@@ -3333,6 +4088,25 @@ pub(crate) fn is_formatting_bad_request(msg: &str) -> bool {
         || m.contains("embeds")
         || m.contains("format")
         || m.contains("formatting")
+}
+
+/// Return `true` when a `BadRequest` says the message body exceeded the
+/// platform's length limit. Distinct from [`is_formatting_bad_request`]: the
+/// markup was fine, there was simply too much of it, so a plain-text retry
+/// re-sends the same over-length body — only re-splitting can help.
+///
+/// This is a BACKSTOP, not the primary defence. The primary defence is the
+/// cap-aware split in [`call_adapter`] plus the render headroom applied by
+/// [`split_chat_content_if_needed`]. This matcher exists for the cases those
+/// cannot know about: an adapter that under-declares (or omits)
+/// `max_message_chars`, or a platform that tightens its limit.
+///
+/// Patterns covered (case-insensitive):
+/// - Telegram: `Bad Request: message is too long`, `MESSAGE_TOO_LONG`.
+/// - Generic: `text is too long`, `caption is too long`, `msg_too_long`.
+pub(crate) fn is_too_long_bad_request(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("too long") || m.contains("too_long")
 }
 
 /// Return `true` when a `BadRequest` indicates the message an edit targeted is
@@ -3817,6 +4591,61 @@ fn record_save_skill_failure(
     Ok(())
 }
 
+/// Record a `task_grant` request that could not be queued for approval
+/// (unresolvable task or malformed payload): mark the delivery row failed and
+/// surface a `self_mod_error` inbound so the agent learns. The M22 A1 twin of
+/// [`record_save_skill_failure`].
+fn record_task_grant_failure(
+    sess: &Session,
+    row: &MessageOutRow,
+    inbound_pool: &SessionPool,
+    reason: &str,
+) -> Result<(), DeliveryError> {
+    warn!(
+        session = %sess.id.as_uuid(),
+        agent_group = %sess.agent_group_id.as_uuid(),
+        reason,
+        "task_grant request refused before approval",
+    );
+    copperclaw_metrics::inc_self_mod_failed("task_grant");
+    let in_conn = inbound_pool.connect()?;
+    delivered::insert(&in_conn, row.id, Some(reason), "failed")?;
+    let inbound_row = messages_in::WriteInbound {
+        id: MessageId::new(),
+        kind: MessageKind::System,
+        timestamp: chrono::Utc::now(),
+        content: serde_json::json!({
+            "kind": "system",
+            "content": {
+                "self_mod_error": {
+                    "action": "task_grant",
+                    "error": reason,
+                    "guidance": "The capability grant could not be authorized. The task itself may still have been scheduled; if you meant to grant it, schedule the task and its grant in the same call.",
+                }
+            }
+        }),
+        trigger: false,
+        on_wake: false,
+        process_after: None,
+        recurrence: None,
+        series_id: None,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        source_session_id: None,
+        reply_to: None,
+        is_group: None,
+    };
+    if let Err(insert_err) = messages_in::insert(&in_conn, &inbound_row) {
+        warn!(
+            session = %sess.id.as_uuid(),
+            ?insert_err,
+            "task_grant self_mod_error inbound write failed; agent will not see the failure"
+        );
+    }
+    Ok(())
+}
+
 /// Ensure a `container_configs` row exists for `agent_group_id`,
 /// creating a default one if absent. Mirrors the host's MCP-handler
 /// `ensure_config_row` so the apply helpers below don't trip on a
@@ -3942,6 +4771,257 @@ fn apply_add_mcp_server(
         obj.insert(name, transport);
     }
     container_configs::set_mcp_servers(central, agent_group_id, current)?;
+    Ok(())
+}
+
+/// Apply a `goal` system payload against the central `goals` table (M22 A3).
+///
+/// Two ops:
+///   * `create` — INSERT a new goal for this session, computing the first
+///     `next_checkin` from `first_checkin` (absolute) or the `checkin_recurrence`
+///     cron; and
+///   * `update` — patch a goal by id: an `objective` refine, a `status`
+///     transition (validated by `goals::set_status`), and/or a `progress` note
+///     appended to the goal's log (accruing `progress_tokens`).
+///
+/// A goal is internal state (decision (d)), so this applies immediately — no
+/// approval gate. An unknown op / malformed payload surfaces as a
+/// `DbError::Invariant` so the delivery loop records a self-mod failure the
+/// agent can see, rather than silently dropping the row.
+fn apply_goal(
+    central: &copperclaw_db::central::CentralDb,
+    sess: &Session,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::goals::{self, GoalStatus, NewGoal, UpdateFields};
+    use copperclaw_modules::scheduling::{When, compute_next_fire};
+
+    let op = payload.get("op").and_then(serde_json::Value::as_str);
+    let body = payload.get("payload").unwrap_or(&serde_json::Value::Null);
+    let str_field = |key: &str| -> Option<String> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let i64_field =
+        |key: &str| -> Option<i64> { body.get(key).and_then(serde_json::Value::as_i64) };
+    let ts_field = |key: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+
+    match op {
+        Some("create") => {
+            let objective = str_field("objective").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("goal create: missing objective")
+            })?;
+            let checkin_recurrence = str_field("checkin_recurrence");
+            let now = chrono::Utc::now();
+            // First check-in: an explicit `first_checkin`, else derived from the
+            // recurrence, else none (a goal driven only by an external task).
+            let next_checkin = ts_field("first_checkin").or_else(|| {
+                checkin_recurrence
+                    .as_deref()
+                    .and_then(|rec| compute_next_fire(&When::At(now), now, Some(rec)))
+            });
+            goals::insert(
+                central,
+                NewGoal {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    agent_group_id: sess.agent_group_id,
+                    session_id: sess.id,
+                    objective,
+                    task_id: None,
+                    grant_id: None,
+                    token_budget: i64_field("token_budget"),
+                    checkin_recurrence,
+                    checkin_prompt: str_field("checkin_prompt"),
+                    next_checkin,
+                },
+            )?;
+            Ok(())
+        }
+        Some("update") => {
+            let id = str_field("id")
+                .ok_or_else(|| copperclaw_db::DbError::invariant("goal update: missing id"))?;
+            // Objective refine first, then status transition, then progress.
+            if let Some(objective) = str_field("objective") {
+                goals::update(
+                    central,
+                    &id,
+                    UpdateFields {
+                        objective: Some(objective),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            if let Some(status_str) = str_field("status") {
+                let status: GoalStatus = status_str
+                    .parse()
+                    .map_err(|e: String| copperclaw_db::DbError::invariant(e))?;
+                goals::set_status(central, &id, status)?;
+                // M22 A3 metric: count goal completions / abandonments.
+                if status.is_terminal() {
+                    copperclaw_metrics::inc_goal_status(status.as_str());
+                }
+            }
+            if let Some(note) = str_field("progress") {
+                goals::record_progress(
+                    central,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &id,
+                    &note,
+                    i64_field("progress_tokens"),
+                )?;
+                // M22 A3 metric: a goal progress entry was recorded.
+                copperclaw_metrics::inc_goal_progress_recorded();
+            }
+            Ok(())
+        }
+        other => Err(copperclaw_db::DbError::invariant(format!(
+            "goal: unknown op {other:?}"
+        ))),
+    }
+}
+
+/// Apply a `{"condition": {...}}` system row (M22 A4): register / deregister a
+/// durable HEARTBEAT-style condition, or set / clear a per-session flag latch.
+/// Mirrors [`apply_goal`] — internal tracking state applied immediately.
+fn apply_condition(
+    central: &copperclaw_db::central::CentralDb,
+    sess: &Session,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::conditions::{self, NewCondition};
+
+    let op = payload.get("op").and_then(serde_json::Value::as_str);
+    let body = payload.get("payload").unwrap_or(&serde_json::Value::Null);
+    let str_field = |key: &str| -> Option<String> {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    let i64_field =
+        |key: &str| -> Option<i64> { body.get(key).and_then(serde_json::Value::as_i64) };
+
+    match op {
+        Some("register") => {
+            let id = str_field("id").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing id")
+            })?;
+            let kind = str_field("kind").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing kind")
+            })?;
+            let prompt = str_field("prompt").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition register: missing prompt")
+            })?;
+            conditions::upsert(
+                central,
+                NewCondition {
+                    id,
+                    agent_group_id: sess.agent_group_id,
+                    session_id: sess.id,
+                    kind,
+                    threshold: i64_field("threshold"),
+                    flag: str_field("flag"),
+                    prompt,
+                    grant_id: str_field("grant_id"),
+                },
+            )?;
+            Ok(())
+        }
+        Some("remove") => {
+            let id = str_field("id")
+                .ok_or_else(|| copperclaw_db::DbError::invariant("condition remove: missing id"))?;
+            conditions::soft_remove(central, &id, chrono::Utc::now())?;
+            Ok(())
+        }
+        Some("set_flag") => {
+            let flag = str_field("flag").ok_or_else(|| {
+                copperclaw_db::DbError::invariant("condition set_flag: missing flag")
+            })?;
+            let value = body
+                .get("value")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if value {
+                conditions::set_flag(
+                    central,
+                    sess.agent_group_id,
+                    sess.id,
+                    &flag,
+                    chrono::Utc::now(),
+                )?;
+            } else {
+                conditions::clear_flag(central, sess.id, &flag)?;
+            }
+            Ok(())
+        }
+        other => Err(copperclaw_db::DbError::invariant(format!(
+            "condition: unknown op {other:?}"
+        ))),
+    }
+}
+
+/// Apply a `{"grant_consume": {...}}` system row (M22 A2H): DEBIT an
+/// already-approved `task_grants` row as a granted autonomous fire happens.
+///
+/// Payload shape (emitted by the runner's `charge_grant_fire_once`):
+/// `{ "grant_id": "...", "task_id": "...", "fires": 1 }`, optionally carrying a
+/// `"tokens"` count. `task_id` is informational (the fire was already authorized
+/// against `grant_id` in-runner); we debit `grant_id` directly. `fires` defaults
+/// to 1 and is clamped non-negative; each unit is one [`consume_fire`] call
+/// (which bumps `fires_consumed` by one), so a grant with `max_fires` genuinely
+/// depletes across fires and `effective_grant` reads it inert once spent.
+///
+/// This is internal accounting, NOT approval-gated — it can only *reduce* an
+/// existing authorization, never widen one.
+fn apply_grant_consume(
+    central: &copperclaw_db::central::CentralDb,
+    payload: &serde_json::Value,
+) -> Result<(), copperclaw_db::DbError> {
+    use copperclaw_db::tables::task_grants;
+
+    let grant_id = payload
+        .get("grant_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| copperclaw_db::DbError::invariant("grant_consume: missing grant_id"))?;
+    let now = chrono::Utc::now();
+
+    // A `grant_consume` row means at least one fire happened; default to 1 and
+    // clamp negatives away so a malformed payload can never *credit* a grant.
+    let fires = payload
+        .get("fires")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1)
+        .max(0);
+    for _ in 0..fires {
+        task_grants::consume_fire(central, grant_id, now)?;
+    }
+    // M22 A2 (host half) metric: grant fires debited after an autonomous action.
+    if let Ok(n) = u64::try_from(fires) {
+        if n > 0 {
+            copperclaw_metrics::add_grant_fires_consumed(n);
+        }
+    }
+
+    // Optional token spend. `consume_tokens` rejects negatives itself; we only
+    // call it for a positive count.
+    if let Some(tokens) = payload.get("tokens").and_then(serde_json::Value::as_i64) {
+        if tokens > 0 {
+            task_grants::consume_tokens(central, grant_id, tokens, now)?;
+            // M22 A2 (host half) metric: grant token budget debited.
+            if let Ok(t) = u64::try_from(tokens) {
+                copperclaw_metrics::add_grant_tokens_consumed(t);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4134,17 +5214,74 @@ mod tests {
     #[test]
     fn split_chat_passthrough_when_no_cap_or_short_text() {
         let v = json!({"text":"hello"});
-        let parts = split_chat_content_if_needed(&v, None, "test");
+        let parts = split_chat_content_if_needed(&v, None, None, "test");
         assert_eq!(parts.len(), 1);
-        let parts = split_chat_content_if_needed(&v, Some(4096), "test");
+        let parts = split_chat_content_if_needed(&v, Some(4096), None, "test");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], v);
+    }
+
+    /// REGRESSION (fix 2): a channel whose platform cap is denominated in
+    /// BYTES (webex 7 439 B, teams 28 KB, wechat 2 048 B) now declares
+    /// `max_message_bytes`, and the host's split path must honour it. A
+    /// CJK body is 3 bytes/char, so a char-only split passes the cap and
+    /// every part still blows the byte budget.
+    #[test]
+    fn split_chat_honours_byte_cap_on_cjk_text() {
+        let cap = 7439usize;
+        let eff = copperclaw_channels_core::markdown::effective_max(Some(cap)).unwrap();
+        let text = "这是一个很长的中文回复内容。".repeat(700);
+        let v = json!({ "text": text });
+
+        // Char cap alone: parts fit in chars but not in bytes.
+        let char_only = split_chat_content_if_needed(&v, Some(cap), None, "webex");
+        assert!(
+            char_only
+                .iter()
+                .any(|p| p["text"].as_str().unwrap().len() > cap),
+            "fixture no longer demonstrates the byte overshoot"
+        );
+
+        let parts = split_chat_content_if_needed(&v, Some(cap), Some(cap), "webex");
+        assert!(parts.len() > char_only.len());
+        for (i, p) in parts.iter().enumerate() {
+            let t = p["text"].as_str().unwrap();
+            assert!(
+                t.len() <= eff,
+                "part {i} is {} bytes, over the effective byte cap {eff}",
+                t.len()
+            );
+        }
+    }
+
+    /// The byte cap must not change ASCII chunking — that is the whole
+    /// reason it is a second cap rather than a `bytes / 4` char cap.
+    #[test]
+    fn split_chat_byte_cap_is_a_no_op_for_ascii() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+        let v = json!({ "text": text });
+        assert_eq!(
+            split_chat_content_if_needed(&v, Some(2000), None, "webex"),
+            split_chat_content_if_needed(&v, Some(2000), Some(2000), "webex")
+        );
+    }
+
+    /// A byte cap alone (no char cap) still opts the channel into the
+    /// splitter.
+    #[test]
+    fn split_chat_byte_cap_alone_enables_splitting() {
+        let v = json!({ "text": "漢字".repeat(500) });
+        let parts = split_chat_content_if_needed(&v, None, Some(600), "test");
+        assert!(parts.len() > 1);
+        for p in &parts {
+            assert!(p["text"].as_str().unwrap().len() <= 540);
+        }
     }
 
     #[test]
     fn split_chat_passthrough_when_no_text_field() {
         let v = json!({"foo":"bar"});
-        let parts = split_chat_content_if_needed(&v, Some(10), "test");
+        let parts = split_chat_content_if_needed(&v, Some(10), None, "test");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], v);
     }
@@ -4153,7 +5290,7 @@ mod tests {
     fn split_chat_breaks_on_paragraph_when_possible() {
         let text = format!("{}\n\n{}", "a".repeat(50), "b".repeat(50));
         let v = json!({"text": text, "parse_mode": "MarkdownV2"});
-        let parts = split_chat_content_if_needed(&v, Some(60), "test");
+        let parts = split_chat_content_if_needed(&v, Some(60), None, "test");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "a".repeat(50));
         assert_eq!(parts[1]["text"].as_str().unwrap(), "b".repeat(50));
@@ -4166,7 +5303,7 @@ mod tests {
     fn split_chat_breaks_on_sentence_when_no_paragraph() {
         let text = format!("{}. {}", "a".repeat(40), "b".repeat(40));
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(50), "test");
+        let parts = split_chat_content_if_needed(&v, Some(50), None, "test");
         assert_eq!(parts.len(), 2);
         assert!(parts[0]["text"].as_str().unwrap().ends_with('.'));
     }
@@ -4175,7 +5312,7 @@ mod tests {
     fn split_chat_hard_cuts_when_no_natural_boundary() {
         let text = "x".repeat(100);
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(30), "test");
+        let parts = split_chat_content_if_needed(&v, Some(30), None, "test");
         assert!(parts.len() >= 4);
         for p in &parts {
             assert!(p["text"].as_str().unwrap().chars().count() <= 30);
@@ -4184,19 +5321,30 @@ mod tests {
 
     #[test]
     fn split_chat_counts_chars_not_bytes() {
-        // CJK char is 3 bytes in UTF-8 but should count as 1.
+        // CJK char is 3 bytes in UTF-8 but should count as 1. `max` is the
+        // DECLARED cap; the splitter chunks against the render-headroom
+        // shrunk value, so assert against that rather than restating 10.
+        let effective = copperclaw_channels_core::markdown::effective_max(Some(10)).unwrap();
         let text = "漢".repeat(20);
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(10), "test");
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["text"].as_str().unwrap().chars().count(), 10);
+        let parts = split_chat_content_if_needed(&v, Some(10), None, "test");
+        assert!(parts.len() > 1, "{parts:?}");
+        for p in &parts {
+            assert!(p["text"].as_str().unwrap().chars().count() <= effective);
+        }
+        // Byte-counting would have cut after 3 chars (10 bytes); char-counting
+        // fills the chunk.
+        assert_eq!(
+            parts[0]["text"].as_str().unwrap().chars().count(),
+            effective
+        );
     }
 
     /// Split `text` at `max` and assert the shared fence-splitting
     /// invariants: every chunk fits the cap and parses with balanced
     /// fences. Returns the chunks for case-specific assertions.
     fn split_balanced(text: &str, max: usize) -> Vec<String> {
-        let chunks = split_text_into_chunks(text, max, "test");
+        let chunks = split_text_into_chunks(text, max, None, "test");
         for (i, c) in chunks.iter().enumerate() {
             assert!(
                 c.chars().count() <= max,
@@ -4340,7 +5488,7 @@ mod tests {
         });
         let text = format!("Here is the script:\n\n```python\n{code}```");
         let v = json!({"text": text, "parse_mode": "MarkdownV2"});
-        let parts = split_chat_content_if_needed(&v, Some(500), "test");
+        let parts = split_chat_content_if_needed(&v, Some(500), None, "test");
         assert!(parts.len() > 2, "{}", parts.len());
         for p in &parts {
             let t = p["text"].as_str().unwrap();
@@ -5183,7 +6331,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_route_marks_row_failed() {
+    async fn no_route_dead_letters_user_facing_row() {
+        // A user-facing (Chat) row with no resolvable target is still terminal
+        // — but it must now leave a trace: an `outbound_dropped_messages` row
+        // with the `no_route` reason. Before M22 this path wrote NOTHING
+        // central, so `cclaw dropped-messages outbound-list` was empty through
+        // hundreds of real drops.
         let (service, _root, sess, _mock) = make_service().await;
         let out_pool = service
             .session_paths
@@ -5205,6 +6358,90 @@ mod tests {
         let listed = delivered::list(&in_conn).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "failed");
+
+        let drops = outbound_dropped_messages::list(service.central(), None, None).unwrap();
+        assert_eq!(drops.len(), 1, "the unroutable chat row is dead-lettered");
+        let drop = &drops[0];
+        assert!(
+            drop.last_error.starts_with(NO_ROUTE_DROP_REASON),
+            "reason prefix is `no_route`, got: {}",
+            drop.last_error
+        );
+        assert_eq!(drop.message_out_id, row.id);
+        assert_eq!(drop.kind, MessageKind::Chat);
+        assert_eq!(drop.channel_type, None);
+        assert_eq!(drop.platform_id, None);
+        assert_eq!(drop.content, json!({"text":"hi"}));
+    }
+
+    #[tokio::test]
+    async fn route_less_system_usage_report_is_recorded_not_failed() {
+        // The 550-drops-a-day bug. `delegate`-profile children are spawned
+        // with NO `session_routing` by design (containment), and emit one
+        // `usage_report` System row per turn. Route resolution used to be a
+        // hard precondition ahead of the kind match, so every one of those
+        // rows was marked terminally failed and the child's token spend never
+        // reached `agent_turns` — invisible to `cclaw usage` and to budget
+        // enforcement. It must now process cleanly, route-free, with no
+        // parent-route fallback anywhere in the path.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let mut row = make_row(
+            MessageKind::System,
+            json!({
+                "usage_report": {
+                    "session_id": sess.id.as_uuid().to_string(),
+                    "agent_group_id": sess.agent_group_id.as_uuid().to_string(),
+                    "seq": 7,
+                    "model": "qwen3.6:27b",
+                    "provider": "ollama",
+                    "input_tokens": 1234,
+                    "output_tokens": 56,
+                    "status": "ok",
+                }
+            }),
+        );
+        // Contained child: no routing on the row, and none written to the
+        // session's inbound `session_routing` either.
+        row.channel_type = None;
+        row.platform_id = None;
+        row.thread_id = None;
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 0, "a route-less usage_report must not fail");
+        assert_eq!(rpt.delivered, 1);
+
+        // It reached `record_usage_report` -> `agent_turns`.
+        let turns = copperclaw_db::tables::agent_turns::recent_for_group(
+            service.central(),
+            &sess.agent_group_id.as_uuid().to_string(),
+            Utc::now() - chrono::Duration::hours(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(turns.len(), 1, "usage landed in agent_turns");
+        assert_eq!(turns[0].input_tokens, 1234);
+        assert_eq!(turns[0].output_tokens, 56);
+
+        // Terminal record is `ok`, and nothing was dead-lettered.
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ok");
+        assert!(
+            outbound_dropped_messages::list(service.central(), None, None)
+                .unwrap()
+                .is_empty(),
+            "host-local control rows are never dead-lettered for lack of a route"
+        );
     }
 
     #[tokio::test]
@@ -5804,6 +7041,216 @@ mod tests {
         )
         .unwrap();
         (db, ag.id)
+    }
+
+    /// A real session row over `central_with_ag`, so `apply_goal`'s FK
+    /// (`goals.agent_group_id`) resolves.
+    fn central_ag_session() -> (copperclaw_db::central::CentralDb, Session) {
+        let (db, ag) = central_with_ag();
+        let sess = copperclaw_db::tables::sessions::create(
+            &db,
+            copperclaw_db::tables::sessions::CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        (db, sess)
+    }
+
+    /// M22 A3: the host `goal` handler persists a `create` op into the central
+    /// `goals` table, computing the first check-in from the recurrence, then an
+    /// `update` op records progress + transitions the lifecycle — the full
+    /// create→progress→complete round-trip through the delivery-action payload.
+    #[test]
+    fn apply_goal_create_then_update_roundtrip() {
+        use copperclaw_db::tables::goals::{self, GoalStatus};
+        let (db, sess) = central_ag_session();
+
+        apply_goal(
+            &db,
+            &sess,
+            &json!({
+                "op": "create",
+                "payload": {
+                    "objective": "keep the docs current",
+                    "checkin_recurrence": "0 9 * * *",
+                    "token_budget": 5000
+                }
+            }),
+        )
+        .unwrap();
+
+        let created = goals::list_for_session(&db, sess.id).unwrap();
+        assert_eq!(created.len(), 1);
+        let goal = &created[0];
+        assert_eq!(goal.objective, "keep the docs current");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(goal.token_budget, Some(5000));
+        assert!(
+            goal.next_checkin.is_some(),
+            "first check-in derived from the recurrence"
+        );
+
+        // Report progress.
+        apply_goal(
+            &db,
+            &sess,
+            &json!({
+                "op": "update",
+                "payload": { "id": goal.id, "progress": "drafted README", "progress_tokens": 200 }
+            }),
+        )
+        .unwrap();
+        let after = goals::get(&db, &goal.id).unwrap().unwrap();
+        assert_eq!(after.tokens_consumed, 200);
+        assert_eq!(goals::list_progress(&db, &goal.id).unwrap().len(), 1);
+
+        // Complete it.
+        apply_goal(
+            &db,
+            &sess,
+            &json!({ "op": "update", "payload": { "id": goal.id, "status": "completed" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            goals::get(&db, &goal.id).unwrap().unwrap().status,
+            GoalStatus::Completed
+        );
+    }
+
+    /// Seed a task for `sess` so a `task_grants` row (FK → tasks) can be
+    /// inserted against it.
+    fn seed_task_for(db: &copperclaw_db::central::CentralDb, sess: &Session, task_id: &str) {
+        copperclaw_db::tables::tasks::insert(
+            db,
+            copperclaw_db::tables::tasks::NewTask {
+                id: task_id.into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                name: Some("t".into()),
+                prompt: "p".into(),
+                when_spec: Utc::now().to_rfc3339(),
+                recurrence: None,
+                next_fire: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn grant_consume_decrements_fires_and_exhausts_grant() {
+        use copperclaw_db::tables::task_grants::{self, NewTaskGrant};
+        let (db, sess) = central_ag_session();
+        seed_task_for(&db, &sess, "task_g");
+        task_grants::insert_approved(
+            &db,
+            NewTaskGrant {
+                id: "grant_1".into(),
+                task_id: "task_g".into(),
+                capability_scope: "web_fetch".into(),
+                token_budget: Some(1000),
+                max_fires: Some(2),
+                expires_at: None,
+                granted_by: None,
+            },
+        )
+        .unwrap();
+
+        // First fire (with a token spend) → one fire + 250 tokens consumed;
+        // the grant is still live (1 fire, 750 tokens left).
+        apply_grant_consume(
+            &db,
+            &json!({ "grant_id": "grant_1", "task_id": "task_g", "fires": 1, "tokens": 250 }),
+        )
+        .unwrap();
+        let live = task_grants::effective_grant(&db, "task_g", Utc::now())
+            .unwrap()
+            .expect("grant still live after one fire");
+        assert_eq!(live.fires_remaining(), Some(1));
+        assert_eq!(live.tokens_remaining(), Some(750));
+
+        // Second fire → fires exhausted → effective_grant reads inert (None),
+        // which is exactly what makes the NEXT spawn's grant.json absent and the
+        // runner's autonomy gate closed.
+        apply_grant_consume(
+            &db,
+            &json!({ "grant_id": "grant_1", "task_id": "task_g", "fires": 1 }),
+        )
+        .unwrap();
+        assert!(
+            task_grants::effective_grant(&db, "task_g", Utc::now())
+                .unwrap()
+                .is_none(),
+            "grant reads inert once max_fires is reached"
+        );
+    }
+
+    #[test]
+    fn grant_consume_defaults_fires_to_one_and_rejects_missing_grant_id() {
+        use copperclaw_db::tables::task_grants::{self, NewTaskGrant};
+        let (db, sess) = central_ag_session();
+        seed_task_for(&db, &sess, "task_g");
+        task_grants::insert_approved(
+            &db,
+            NewTaskGrant {
+                id: "grant_1".into(),
+                task_id: "task_g".into(),
+                capability_scope: "web_fetch".into(),
+                token_budget: None,
+                max_fires: Some(3),
+                expires_at: None,
+                granted_by: None,
+            },
+        )
+        .unwrap();
+
+        // No explicit `fires` → defaults to 1.
+        apply_grant_consume(&db, &json!({ "grant_id": "grant_1" })).unwrap();
+        let live = task_grants::effective_grant(&db, "task_g", Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.fires_remaining(), Some(2));
+
+        // A payload with no grant_id is a hard error (surfaces as a self-mod
+        // failure, not a silent no-op).
+        assert!(apply_grant_consume(&db, &json!({ "task_id": "task_g" })).is_err());
+    }
+
+    #[test]
+    fn apply_goal_rejects_unknown_op_and_missing_objective() {
+        let (db, sess) = central_ag_session();
+        assert!(apply_goal(&db, &sess, &json!({ "op": "bogus", "payload": {} })).is_err());
+        assert!(
+            apply_goal(&db, &sess, &json!({ "op": "create", "payload": {} })).is_err(),
+            "create without an objective is refused"
+        );
+    }
+
+    #[test]
+    fn apply_goal_update_illegal_transition_errors() {
+        use copperclaw_db::tables::goals::{self, GoalStatus};
+        let (db, sess) = central_ag_session();
+        apply_goal(
+            &db,
+            &sess,
+            &json!({ "op": "create", "payload": { "objective": "x" } }),
+        )
+        .unwrap();
+        let id = goals::list_for_session(&db, sess.id).unwrap()[0].id.clone();
+        goals::set_status(&db, &id, GoalStatus::Completed).unwrap();
+        // Out of a terminal state is illegal → surfaces as an error the agent sees.
+        assert!(
+            apply_goal(
+                &db,
+                &sess,
+                &json!({ "op": "update", "payload": { "id": id, "status": "active" } })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7479,10 +8926,22 @@ mod tests {
     }
 
     impl SplittingMockAdapter {
-        fn new(inner: Arc<MockAdapter>, cap: usize) -> Self {
+        /// `effective_cap` is the chunk size the test wants the splitter to
+        /// actually use. The host shrinks a channel's DECLARED cap by the
+        /// render headroom (`markdown::effective_max`) before chunking, so
+        /// declare the value that grosses back up to `effective_cap` —
+        /// otherwise every test would have to restate the margin.
+        fn new(inner: Arc<MockAdapter>, effective_cap: usize) -> Self {
+            let declared = (effective_cap * 100)
+                .div_ceil(copperclaw_channels_core::markdown::RENDER_HEADROOM_PERCENT);
+            debug_assert_eq!(
+                copperclaw_channels_core::markdown::effective_max(Some(declared)),
+                Some(effective_cap),
+                "declared cap must gross back up to the requested effective cap"
+            );
             Self {
                 inner,
-                cap,
+                cap: declared,
                 call_count: StdMutex::new(0),
                 scheduled_failures: StdMutex::new(vec![]),
             }
@@ -7532,6 +8991,34 @@ mod tests {
                 return Err(err);
             }
             self.inner.deliver(platform_id, thread_id, message).await
+        }
+        /// Forward to the inner mock so `mock.edits()` records edits made
+        /// through the wrapper. Without this the default trait impl reports
+        /// `Unsupported` and the streaming-edit tests would only ever see the
+        /// fall-through path.
+        async fn edit_message(
+            &self,
+            platform_id: &str,
+            thread_id: Option<&str>,
+            external_id: &str,
+            new_text: &str,
+        ) -> Result<(), AdapterError> {
+            self.inner
+                .edit_message(platform_id, thread_id, external_id, new_text)
+                .await
+        }
+        /// Explicitly refuse the native thinking hook so the HOST's
+        /// `Unsupported` -> synthetic-chat fallback runs. The default trait
+        /// impl would instead do its own `to_text_fallback` + `self.deliver`
+        /// inside the adapter, which never reaches `call_adapter` and so is
+        /// not the path these tests are about.
+        async fn deliver_thinking(
+            &self,
+            _platform_id: &str,
+            _thread_id: Option<&str>,
+            _thinking: &ThinkingBlock,
+        ) -> Result<Option<String>, AdapterError> {
+            Err(AdapterError::Unsupported("deliver_thinking".into()))
         }
     }
 
@@ -8271,5 +9758,307 @@ mod tests {
         assert!(!resp.is_error, "got: {}", resp.result);
         assert!(resp.result.contains("http://127.0.0.1:8100/__preview/abc"));
         assert_eq!(calls.lock().unwrap().as_slice(), ["expose:5000:"]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Over-length outbound regressions.
+    //
+    // Each of these covers a path that reached a platform's length limit with
+    // NO split and therefore dropped the reply permanently
+    // (`BadRequest("Bad Request: message is too long")`, `MESSAGE_TOO_LONG`,
+    // `text is too long`). The splitter itself was correct and well tested —
+    // the defect was which paths it was wired into, which is exactly what the
+    // suite could not see.
+    // ----------------------------------------------------------------------
+
+    /// Pre-record `chat` as delivered under `external_id` so a later `edit`
+    /// system action can resolve seq -> message id -> platform id. Returns the
+    /// chat row's seq for the edit payload.
+    fn deliver_anchor(
+        out_pool: &SessionPool,
+        in_pool: &SessionPool,
+        chat: &WriteOutbound,
+        external_id: &str,
+    ) -> i64 {
+        write_row(out_pool, chat);
+        let seq = {
+            let conn = out_pool.connect().unwrap();
+            messages_out::get(&conn, chat.id).unwrap().seq
+        };
+        let in_conn = in_pool.connect().unwrap();
+        delivered::insert(&in_conn, chat.id, Some(external_id), "ok").unwrap();
+        seq
+    }
+
+    /// (a) An `edit` whose text has outgrown the channel cap.
+    ///
+    /// This is the streaming reply path: the runner emits one chat message and
+    /// then a run of `edit` actions each carrying the FULL text so far.
+    /// `editMessageText` enforces the same limit as `sendMessage`, so once the
+    /// stream crossed the cap EVERY remaining edit failed and the reply froze
+    /// at whatever prefix had landed.
+    ///
+    /// The fix must both (1) spill the overflow into follow-up messages and
+    /// (2) keep extending coherently afterwards — a later tick must edit the
+    /// TAIL message with only the text past what earlier messages already
+    /// carry, not re-post the whole stream.
+    #[tokio::test]
+    async fn over_long_streaming_edit_spills_then_extends_the_tail() {
+        let (service, _root, sess, mock) = make_service().await;
+        install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+
+        let chat = make_row(MessageKind::Chat, json!({"text": "start"}));
+        let chat_seq = deliver_anchor(&out_pool, &in_pool, &chat, "anchor");
+
+        // Tick 1: the stream is now 25 chars against an effective cap of 10.
+        let first_tick = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": chat_seq, "text": "x".repeat(25)}}),
+        );
+        write_row(&out_pool, &first_tick);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1, "the edit row must land, not fail");
+        assert_eq!(rpt.failed, 0);
+
+        // The anchor was edited down to the first chunk...
+        let edits = mock.edits();
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].external_id, "anchor");
+        assert_eq!(edits[0].new_text, "x".repeat(10));
+        // ...and the overflow went out as follow-up messages, none over cap.
+        let sent = mock.deliveries();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].message.content["text"], json!("x".repeat(10)));
+        assert_eq!(sent[1].message.content["text"], json!("x".repeat(5)));
+
+        // Tick 2: the stream grew to 30 chars. 20 are already committed to the
+        // anchor + first follow-up, so the tail must be extended with the
+        // remaining 10 — and NOTHING may be re-posted.
+        // MockAdapter hands out ids as "<channel>-<n>", so the second
+        // follow-up — the current tail — is "mock-2".
+        let tail_pid = "mock-2";
+        let second_tick = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": chat_seq, "text": "x".repeat(30)}}),
+        );
+        write_row(&out_pool, &second_tick);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+
+        let edits = mock.edits();
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        assert_eq!(
+            edits[1].external_id, tail_pid,
+            "the second tick must extend the TAIL message, not the anchor"
+        );
+        assert_eq!(
+            edits[1].new_text,
+            "x".repeat(10),
+            "only the text past the committed prefix belongs to the tail"
+        );
+        assert_eq!(
+            mock.deliveries().len(),
+            2,
+            "an in-cap extension must not post any new message"
+        );
+    }
+
+    /// (a2) The same overflow, but the adapter cannot edit at all. Nothing has
+    /// been sent at the point we learn that, so the row must fall through to
+    /// the synthetic-chat path (which is itself split) rather than erroring.
+    #[tokio::test]
+    async fn over_long_edit_on_non_editing_adapter_falls_through() {
+        let (service, _root, sess, mock) = make_service().await;
+        install_splitting_adapter(&service, mock.clone(), 10);
+        mock.set_edit_unsupported(true);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+
+        let chat = make_row(MessageKind::Chat, json!({"text": "start"}));
+        let chat_seq = deliver_anchor(&out_pool, &in_pool, &chat, "anchor");
+        let edit = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": chat_seq, "text": "x".repeat(25)}}),
+        );
+        write_row(&out_pool, &edit);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 0, "an un-editable adapter is not a failure");
+        assert!(mock.edits().is_empty());
+    }
+
+    /// (b) Render expansion past the cap.
+    ///
+    /// The host splits RAW MARKDOWN, but every adapter renders after the split
+    /// (telegram runs `render(.., Flavor::Html)`), and HTML escaping only ever
+    /// grows the string. A chunk cut at exactly the declared cap could
+    /// therefore be over-length by the time it reached the API — the platform
+    /// rejected the whole message and the row dropped.
+    ///
+    /// `effective_max`'s headroom is sized for realistic markdown density (a
+    /// couple of escapable chars per line), not for adversarial input, so this
+    /// asserts the property on prose-shaped text.
+    #[test]
+    fn split_leaves_render_headroom_so_escaped_chunks_still_fit() {
+        fn escape_html(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;")
+        }
+        // ~100 chars per line carrying one `&` (+4 escaped) and one `<` (+3):
+        // about 7% growth, which is the regime the headroom exists to absorb.
+        let line = format!("{} & tail <b {}", "w".repeat(45), "z".repeat(45));
+        let text = std::iter::repeat_n(line, 200)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let declared = 4096;
+
+        let parts =
+            split_chat_content_if_needed(&json!({ "text": text }), Some(declared), None, "test");
+        assert!(parts.len() > 1, "text must split");
+        for (i, p) in parts.iter().enumerate() {
+            let raw = p["text"].as_str().unwrap();
+            assert!(
+                raw.chars().count() < declared,
+                "chunk {i} was cut at the declared cap — no headroom reserved"
+            );
+            assert!(
+                escape_html(raw).chars().count() <= declared,
+                "chunk {i} is {} chars of markdown but {} once escaped, over the {declared} cap",
+                raw.chars().count(),
+                escape_html(raw).chars().count()
+            );
+        }
+    }
+
+    /// (c) An over-long `Unsupported` rich-kind text fallback.
+    ///
+    /// Seven rich kinds degrade to a plain-text `MessageKind::Chat` when the
+    /// adapter reports `Unsupported`. Each synthesised that message and called
+    /// `call_adapter` directly, bypassing the splitter entirely — so a long
+    /// body (a thinking block, a diff, a todo list) blew the cap with no split.
+    /// The splitter now lives inside `call_adapter`, so this holds for all of
+    /// them; `thinking` stands in for the family.
+    #[tokio::test]
+    async fn over_long_unsupported_rich_fallback_is_split() {
+        let (service, _root, sess, mock) = make_service().await;
+        install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+
+        // MockAdapter has no `deliver_thinking` hook, so this takes the
+        // `Unsupported` -> synthetic-chat fallback.
+        let row = make_row(
+            MessageKind::Thinking,
+            json!({"thinking": {"text": "y".repeat(60), "redacted": false}}),
+        );
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+
+        let sent = mock.deliveries();
+        assert!(
+            sent.len() > 1,
+            "the fallback text must be split, got {} message(s): {sent:?}",
+            sent.len()
+        );
+        for (i, d) in sent.iter().enumerate() {
+            let text = d.message.content["text"].as_str().unwrap();
+            assert!(
+                text.chars().count() <= 10,
+                "fallback part {i} is {} chars, over the effective cap",
+                text.chars().count()
+            );
+        }
+    }
+
+    /// (d) A chat row with no deliverable text.
+    ///
+    /// The splitter passed these through untouched, the adapter rejected them
+    /// (`telegram deliver requires text or files` — and every `OutboundMessage`
+    /// this crate builds hardcodes `files: vec![]`, so the "or files" half can
+    /// never rescue one), and the row then burned its whole retry budget before
+    /// the exhaustion arm emitted a user-facing error receipt. An empty agent
+    /// reply is a runner-side condition, not a delivery failure.
+    #[tokio::test]
+    async fn empty_text_chat_row_is_a_delivered_no_op() {
+        for content in [json!({"text": "   \n  "}), json!({"text": ""}), json!({})] {
+            let (service, _root, sess, mock) = make_service().await;
+            let out_pool = service
+                .session_paths
+                .outbound_pool(&sess.agent_group_id, &sess.id)
+                .unwrap();
+            let in_pool = service
+                .session_paths
+                .inbound_pool(&sess.agent_group_id, &sess.id)
+                .unwrap();
+
+            let row = make_row(MessageKind::Chat, content.clone());
+            write_row(&out_pool, &row);
+
+            let rpt = service.process_session_once(&sess).await.unwrap();
+            assert_eq!(rpt.delivered, 1, "content {content}");
+            assert_eq!(rpt.failed, 0, "content {content}");
+            assert_eq!(rpt.deferred, 0, "content {content} must not be retried");
+            assert!(
+                mock.deliveries().is_empty(),
+                "nothing must reach the adapter for {content}"
+            );
+
+            let rows = {
+                let c = in_pool.connect().unwrap();
+                delivered::list(&c).unwrap()
+            };
+            assert_eq!(rows.len(), 1, "content {content}");
+            assert_eq!(rows[0].status, "ok", "content {content}");
+            assert!(
+                rows[0].platform_message_id.is_none(),
+                "a no-op has no platform message to anchor"
+            );
+        }
+    }
+
+    /// The too-long backstop: an adapter that under-declares its cap (or a
+    /// platform that tightened one) rejects a body the host thought was fine.
+    /// Nothing was sent, so re-splitting at a reduced cap is safe — and is what
+    /// turns a permanent drop into a delivered reply.
+    #[test]
+    fn too_long_signatures_are_recognised_and_kept_distinct() {
+        for msg in [
+            "Bad Request: message is too long",
+            "MESSAGE_TOO_LONG",
+            "text is too long",
+            "caption is too long",
+        ] {
+            assert!(is_too_long_bad_request(msg), "{msg}");
+            assert!(
+                !is_formatting_bad_request(msg),
+                "{msg} must not be treated as a formatting error — a plain-text \
+                 retry re-sends the same over-length body"
+            );
+        }
+        for msg in [
+            "can't parse entities",
+            "invalid block_kit",
+            "chat_id required",
+        ] {
+            assert!(!is_too_long_bad_request(msg), "{msg}");
+        }
     }
 }

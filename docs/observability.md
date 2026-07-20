@@ -265,6 +265,57 @@ and helper docs live in `crates/copperclaw-metrics/src/lib.rs`.
 | `copperclaw_operator_alerts_total` | `severity`, `outcome` | An operator-alert decision; `outcome` = `sent\|suppressed_disabled\|suppressed_deduped\|suppressed_rate_limited\|no_carrier\|enqueue_failed` (O4). |
 | `copperclaw_sweep_last_run_timestamp` (gauge) | — | Unix time (seconds) of the last completed sweep pass — alert on `time() - <this>` to catch a wedged sweep loop. |
 
+#### Codebase, autonomy & skills (M22)
+
+Added by the M22 program (Wave 1 coding C1–C6, Wave 2 autonomy A1–A5, Wave 3
+skills S1–S4); the metric definitions and helper docs live in
+`crates/copperclaw-metrics/src/lib.rs`.
+
+**Wave 1 — coding: prototype → codebase**
+
+| Name | Labels | Meaning |
+|---|---|---|
+| `copperclaw_post_edit_verify_total` | `tool`, `outcome` | One post-edit verify over a just-mutated file; `tool` = `eslint\|tsc\|ruff\|none`, `outcome` = `flagged\|clean\|not_available\|unsupported\|disabled\|error` (C1). |
+| `copperclaw_post_edit_verify_findings` (histogram) | — | Error+warning count for a post-edit verify that flagged (C1). |
+| `copperclaw_repo_attach_total` | — | The runner attached an existing repo as the working project (once per genuine attach) (C2). |
+| `copperclaw_repo_attach_verify_stages_inferred` (histogram) | — | Verify stages inferred from a repo's manifests at attach time (C2). |
+| `copperclaw_repo_attach_detected_total` | — | The host's cold start noticed an attachable repo under a session's `/data` (host-side companion to the attach counter) (C2). |
+| `copperclaw_find_symbol_total` | `definition_source` | One `find_symbol` lookup, labelled by the tier that resolved it: `ctags-index\|ctags-ondemand\|grep\|none` (C3). |
+| `copperclaw_symbol_index_builds_total` | `backend` | A symbol-index build over an attached repo; `backend` = `language-server-assisted\|ctags\|none` (C3). |
+| `copperclaw_symbol_index_symbols` (histogram) | — | Symbols written by an index build (0 when none built) (C3). |
+| `copperclaw_visual_regression_flags_total` | `viewport`, `dimensions_changed` | A post-edit screenshot diff flagged a regression; `viewport` = `desktop\|mobile`, `dimensions_changed` = `true\|false` (C4). |
+| `copperclaw_visual_regression_baselines_total` | — | A view's baseline PNG was (re)written after a capture (C4). |
+| `copperclaw_review_batch_reviewers_total` | — | Reviewer workers dispatched in a `delegate_batch` call (incremented by the reviewer count) (C5). |
+| `copperclaw_review_merge_gate_total` | `outcome` | The merge-gate verdict of a reviewer-bearing batch; `outcome` = `blocked\|passed` (C5). |
+| `copperclaw_see_fix_gate_completion_total` | `outcome` | A final/delivery todo crossed the see→fix (post-fix screenshot) gate; `outcome` = `refused_needs_screenshot\|blocked_cycle_cap\|passed` (C6). |
+
+**Wave 2 — autonomy: propose → act, safely**
+
+| Name | Labels | Meaning |
+|---|---|---|
+| `copperclaw_task_grants_total` | `outcome` | A task capability-grant lifecycle event; `outcome` = `approved` (persisted after operator approval). `issued\|revoked\|expired` are reserved for when those sites land (A1). |
+| `copperclaw_autonomous_actions_total` | `outcome` | An autonomous turn's credentialed external action met the grant gate; `outcome` = `taken` (granted, in-scope, fire charged) or `blocked_proposed` (ungranted/out-of-scope → read-then-propose) (A2). |
+| `copperclaw_grants_snapshotted_total` | `outcome` | The host wrote/removed the per-session `grant.json` the runner's gate reads; `outcome` = `written\|removed_no_grant\|removed_no_firing_task\|removed_read_error` (A2 host half). |
+| `copperclaw_grant_fires_consumed_total` | — | Grant fires the host debited after an autonomous action (A2 host half). |
+| `copperclaw_grant_tokens_consumed_total` | — | Grant token budget the host debited after an autonomous action (A2 host half). |
+| `copperclaw_goal_checkins_fired_total` | — | Goal check-in wakes the sweep synthesised (one per due active goal), consumed from the sweep report (A3). |
+| `copperclaw_goals_budget_paused_total` | — | Goals the sweep paused because their grant-backed budget was exhausted (A3). |
+| `copperclaw_goal_status_total` | `status` | A goal reached a terminal status via `update_goal`; `status` = `completed\|abandoned` (A3). |
+| `copperclaw_goal_progress_recorded_total` | — | An `update_goal` call recorded a progress note (A3). |
+| `copperclaw_active_goals` (gauge) | — | Count of `active` goals observed each sweep pass (A3). |
+| `copperclaw_condition_checkins_fired_total` | `kind` | A stored condition fired a check-in wake on its rising edge; `kind` = `pending_inbound\|idle\|flag` (A4). |
+| `copperclaw_recurrence_consolidated_total` | `outcome` | A per-session recurrence series was consolidated into the central `tasks` scheduler; `outcome` = `created\|already_present` (A5). |
+
+**Wave 3 — skills: real capabilities**
+
+| Name | Labels | Meaning |
+|---|---|---|
+| `copperclaw_skills_materialized_total` | `agent_group` | Skill dirs symlinked into a session container's `/data/skills` at cold start (incremented by the count reaching the container) (S1). |
+| `copperclaw_skills_relevance_filtered_total` | — | Skills dropped from the inline prompt by a `Relevant` selector narrowing (registry total − selected), vs `All` (S2). |
+| `copperclaw_skills_listed_total` | `mode` | A `list_skills` call answered; `mode` = `catalogue` (callable) or `inline_empty` (no catalogue on disk) (S3). |
+| `copperclaw_skill_version_saved` (histogram) | — | The effective version persisted by an approval-gated `save_skill` (1 first save, N+1 on re-save) (S3). |
+| `copperclaw_load_skill_inline_scoped_total` | `skill`, `scope` | An inline-mode `load_skill` resolved a skill's tool scope; `scope` = `narrowed` (declared a tool allowlist) or `cleared` (no scope) — sibling of `copperclaw_load_skill_total` (S4). |
+
 ### Recommended alerts
 
 - `rate(copperclaw_containers_crashed_total[5m]) > 0` — runners dying;

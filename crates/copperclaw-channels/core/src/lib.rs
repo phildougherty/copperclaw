@@ -61,6 +61,11 @@
 //!   flavor, and [`markdown::split_into_chunks`] does fence-aware chunking
 //!   of long replies (absorbed from `copperclaw-host-delivery`'s C2
 //!   splitter/`fence.rs`, which now consumes it).
+//! - [`vocab`] — the transcript glyph/layout vocabulary (M22 A1):
+//!   [`Vocabulary`] (+ [`RailGlyphs`], [`TodoGlyphs`], [`Layout`]) and
+//!   [`vocab::for_channel`], the per-surface binding lookup ([`vocab::ASCII`]
+//!   byte-identical to today's renderers, [`vocab::RAIL`] the Claude
+//!   Code-style geometric markers for the new transcript renderers).
 
 mod adapter;
 mod breadcrumb;
@@ -75,6 +80,7 @@ mod registry;
 mod setup;
 mod thinking;
 mod todo_list;
+pub mod vocab;
 
 pub mod inbound_file;
 pub mod markdown;
@@ -123,3 +129,4 @@ pub use todo_list::{
     MAX_ITEMS as TODO_MAX_ITEMS, MAX_TITLE_CHARS as TODO_MAX_TITLE_CHARS, TodoItemStatus, TodoList,
     TodoListError, TodoListItem,
 };
+pub use vocab::{Layout, RailGlyphs, TodoGlyphs, Vocabulary};

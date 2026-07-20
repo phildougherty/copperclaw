@@ -31,7 +31,10 @@
 //! can never escape the group's skills directory.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::SkillError;
 use crate::frontmatter::{self, Frontmatter};
@@ -88,6 +91,16 @@ pub fn validate_skill_content(name: &str, content: &str) -> Result<Frontmatter, 
 /// `SKILL.md` is written (overwriting any prior body for the same name — a
 /// re-save updates the skill), and the skill directory path is returned.
 ///
+/// ## Versioning (M22 S3)
+/// The skill's frontmatter carries a monotonic `version` (default 1). This
+/// function is **version-aware**: a *first* save keeps the content's declared
+/// version (or 1 when the field is absent), while a *re-save* (a `SKILL.md`
+/// already exists for this name) reads the on-disk version and writes
+/// `on_disk + 1`, so re-saving durably bumps the version rather than blindly
+/// overwriting. The version is always (re)written into the persisted
+/// frontmatter regardless of what the caller supplied — the on-disk skill is
+/// the source of truth, and [`list_group_skills`] reports it.
+///
 /// # Errors
 /// - [`SkillError::Frontmatter`] if the frontmatter is missing/malformed or
 ///   omits `name`/`description` — carries the precise parse error.
@@ -104,7 +117,7 @@ pub fn save_group_skill(
 ) -> Result<PathBuf, SkillError> {
     // 1-3. Validate the frontmatter + name against the discovery-time rules
     //    (parse, kebab-case, `name == dir`). Surfaces the precise error.
-    validate_skill_content(name, content)?;
+    let fm = validate_skill_content(name, content)?;
 
     // 4. Ensure the destination parent exists so it can be canonicalized, then
     //    enforce containment against the allowed roots (reusing the same guard
@@ -128,10 +141,149 @@ pub fn save_group_skill(
     // 5. Write the skill. `name` is kebab-case (checked above), so it cannot
     //    contain a path separator or `..` — the join stays inside the parent.
     let skill_dir = group_skills_dir.join(name);
-    fs::create_dir_all(&skill_dir).map_err(|e| SkillError::io(&skill_dir, e))?;
     let skill_md = skill_dir.join("SKILL.md");
-    fs::write(&skill_md, content).map_err(|e| SkillError::io(&skill_md, e))?;
+
+    // 5a. M22 S3 versioning: compute the version to persist BEFORE overwriting.
+    //     A re-save (an existing SKILL.md we can read) bumps the on-disk version
+    //     by one; a first save keeps the incoming content's declared version
+    //     (default 1). An existing file with unparseable frontmatter is treated
+    //     as version 1 so a re-save still advances to 2.
+    let target_version = match fs::read_to_string(&skill_md) {
+        Ok(existing) => {
+            let on_disk = frontmatter::parse(&existing)
+                .map(|f| f.version())
+                .unwrap_or(1);
+            on_disk.saturating_add(1)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fm.version(),
+        Err(e) => return Err(SkillError::io(&skill_md, e)),
+    };
+    let versioned = set_frontmatter_version(content, target_version);
+
+    fs::create_dir_all(&skill_dir).map_err(|e| SkillError::io(&skill_dir, e))?;
+    fs::write(&skill_md, &versioned).map_err(|e| SkillError::io(&skill_md, e))?;
     Ok(skill_dir)
+}
+
+/// A saved skill as surfaced by [`list_group_skills`] (and, in the container,
+/// the `list_skills` MCP tool): the kebab-case name, the effective
+/// [`Frontmatter::version`], and the one-line description. Serializable so the
+/// listing can be handed straight to a JSON tool result (M22 S3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillListing {
+    /// Kebab-case skill name (equal to the on-disk directory slug).
+    pub name: String,
+    /// Effective skill version (frontmatter `version`, default 1).
+    pub version: u32,
+    /// One-line skill description from the frontmatter.
+    pub description: String,
+}
+
+/// M22 S3: enumerate the skills saved in a group's per-group skills override
+/// directory. Scans each `<group_skills_dir>/<slug>/SKILL.md`, parses its
+/// frontmatter, and returns one [`SkillListing`] per valid skill (name +
+/// effective version + description), sorted by name.
+///
+/// This is the host-side / crate-level list surface (the in-container
+/// `list_skills` MCP tool reads the per-session skills catalogue instead). A
+/// missing `group_skills_dir` yields an empty list — a group that has never
+/// saved a skill is not an error. An individual skill whose `SKILL.md` is
+/// missing, has unparseable frontmatter, or whose frontmatter `name` does not
+/// match its directory slug is skipped, so one malformed skill never breaks
+/// the whole listing.
+///
+/// # Errors
+/// - [`SkillError::Io`] if the directory exists but cannot be read.
+pub fn list_group_skills(group_skills_dir: &Path) -> Result<Vec<SkillListing>, SkillError> {
+    let read = match fs::read_dir(group_skills_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(SkillError::io(group_skills_dir, e)),
+    };
+
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|e| SkillError::io(group_skills_dir, e))?;
+        // Skills are directories; skip stray files.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let skill_md = entry.path().join("SKILL.md");
+        let Ok(content) = fs::read_to_string(&skill_md) else {
+            continue; // no SKILL.md (or unreadable) — not a valid skill dir.
+        };
+        let Ok(fm) = frontmatter::parse(&content) else {
+            continue; // malformed frontmatter — skip rather than fail the list.
+        };
+        // Enforce the same `name == dir` invariant discovery applies.
+        if fm.name != slug {
+            continue;
+        }
+        let version = fm.version();
+        out.push(SkillListing {
+            name: fm.name,
+            version,
+            description: fm.description,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// M22 S3: return `content` with its frontmatter `version:` set to `version`.
+///
+/// Replaces any existing top-level `version:` line in the YAML frontmatter and,
+/// when none is present, inserts one just before the closing `---` delimiter.
+/// Every other frontmatter line and the entire markdown body are preserved
+/// verbatim (a leading BOM and CRLF line endings are respected). `content` is
+/// assumed to have already passed [`validate_skill_content`], so it carries a
+/// well-formed opening + closing `---`; if the delimiters are somehow absent
+/// the content is returned unchanged.
+fn set_frontmatter_version(content: &str, version: u32) -> String {
+    let had_bom = content.starts_with('\u{feff}');
+    let work = content.strip_prefix('\u{feff}').unwrap_or(content);
+
+    // Detect the opening delimiter's line ending (`\n` vs `\r\n`).
+    let crlf = work.starts_with("---\r\n");
+    if !crlf && !work.starts_with("---\n") {
+        return content.to_string();
+    }
+    let nl = if crlf { "\r\n" } else { "\n" };
+
+    let lines: Vec<&str> = work.split_inclusive('\n').collect();
+    // Find the closing `---` on its own line (after the opening at index 0).
+    let Some(close_idx) = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, l)| l.trim_end_matches(['\n', '\r']) == "---")
+        .map(|(i, _)| i)
+    else {
+        return content.to_string();
+    };
+
+    let mut out = String::with_capacity(content.len() + 16);
+    if had_bom {
+        out.push('\u{feff}');
+    }
+    out.push_str(lines[0]); // opening `---` line (keeps its newline).
+    // Copy the frontmatter body, dropping any existing TOP-LEVEL `version:`
+    // line (a nested/indented `version:` under some other key is left alone).
+    for line in &lines[1..close_idx] {
+        if line.starts_with("version:") {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out.push_str("version: ");
+    out.push_str(&version.to_string());
+    out.push_str(nl);
+    // Closing delimiter and the entire body, verbatim.
+    for line in &lines[close_idx..] {
+        out.push_str(line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -144,6 +296,9 @@ mod tests {
     const VALID: &str =
         "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\ndo the thing\n";
 
+    const VALID_GREET: &str =
+        "---\nname: greet\ndescription: Say hello nicely\n---\n# Greet\nSay hi.\n";
+
     #[test]
     fn writes_valid_skill_and_returns_dir() {
         let td = TempDir::new().unwrap();
@@ -151,7 +306,13 @@ mod tests {
         let dir = save_group_skill(&dest, &[], "my-skill", VALID).unwrap();
         assert_eq!(dir, dest.join("my-skill"));
         let body = fs::read_to_string(dir.join("SKILL.md")).unwrap();
-        assert_eq!(body, VALID);
+        // M22 S3: the persisted skill carries a version (default 1 on a first
+        // save) and preserves the original name/description/body verbatim.
+        let fm = frontmatter::parse(&body).unwrap();
+        assert_eq!(fm.version(), 1);
+        assert_eq!(fm.name, "my-skill");
+        assert_eq!(fm.description, "A reusable procedure");
+        assert!(body.contains("do the thing"));
     }
 
     #[test]
@@ -180,7 +341,200 @@ mod tests {
         let updated =
             "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\nrevised\n";
         let dir = save_group_skill(&dest, &[], "my-skill", updated).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("SKILL.md")).unwrap(), updated);
+        // The body is updated (re-save overwrites), and the version bumped.
+        let body = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(body.contains("revised"));
+        assert!(!body.contains("do the thing"));
+        assert_eq!(frontmatter::parse(&body).unwrap().version(), 2);
+    }
+
+    // ── M22 S3: versioning + listing ────────────────────────────────────
+
+    #[test]
+    fn first_save_defaults_to_version_one() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        let dir = save_group_skill(&dest, &[], "my-skill", VALID).unwrap();
+        let fm = frontmatter::parse(&fs::read_to_string(dir.join("SKILL.md")).unwrap()).unwrap();
+        assert_eq!(fm.version(), 1);
+    }
+
+    #[test]
+    fn first_save_honours_declared_version() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        let declared = "---\nname: my-skill\ndescription: d\nversion: 5\n---\nbody\n";
+        let dir = save_group_skill(&dest, &[], "my-skill", declared).unwrap();
+        let fm = frontmatter::parse(&fs::read_to_string(dir.join("SKILL.md")).unwrap()).unwrap();
+        assert_eq!(fm.version(), 5);
+    }
+
+    #[test]
+    fn re_save_bumps_version_monotonically() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        for expected in 1..=4 {
+            let dir = save_group_skill(&dest, &[], "my-skill", VALID).unwrap();
+            let fm =
+                frontmatter::parse(&fs::read_to_string(dir.join("SKILL.md")).unwrap()).unwrap();
+            assert_eq!(
+                fm.version(),
+                expected,
+                "save #{expected} should be version {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn re_save_bump_ignores_stale_declared_version() {
+        // The bump is driven by what's ON DISK, not what the caller re-declares
+        // — a caller that keeps sending `version: 1` still advances the skill.
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        let v1 = "---\nname: my-skill\ndescription: d\nversion: 1\n---\nbody\n";
+        save_group_skill(&dest, &[], "my-skill", v1).unwrap();
+        let dir = save_group_skill(&dest, &[], "my-skill", v1).unwrap();
+        let fm = frontmatter::parse(&fs::read_to_string(dir.join("SKILL.md")).unwrap()).unwrap();
+        assert_eq!(fm.version(), 2);
+    }
+
+    #[test]
+    fn set_frontmatter_version_replaces_existing_line() {
+        let input = "---\nname: x\ndescription: y\nversion: 3\n---\nbody\n";
+        let out = set_frontmatter_version(input, 9);
+        assert_eq!(frontmatter::parse(&out).unwrap().version(), 9);
+        // No stale duplicate `version:` line survives.
+        assert_eq!(out.matches("version:").count(), 1);
+        assert!(out.contains("body"));
+    }
+
+    #[test]
+    fn set_frontmatter_version_inserts_when_absent() {
+        let input = "---\nname: x\ndescription: y\n---\nbody\n";
+        let out = set_frontmatter_version(input, 2);
+        assert_eq!(frontmatter::parse(&out).unwrap().version(), 2);
+        assert!(out.contains("name: x"));
+        assert!(out.contains("description: y"));
+    }
+
+    #[test]
+    fn set_frontmatter_version_handles_crlf_and_bom() {
+        let input = "\u{feff}---\r\nname: x\r\ndescription: y\r\n---\r\nbody\r\n";
+        let out = set_frontmatter_version(input, 4);
+        assert!(out.starts_with('\u{feff}'));
+        assert_eq!(frontmatter::parse(&out).unwrap().version(), 4);
+    }
+
+    #[test]
+    fn list_group_skills_missing_dir_is_empty() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("never-created");
+        assert!(list_group_skills(&dest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_group_skills_returns_saved_skills_sorted() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        save_group_skill(
+            &dest,
+            &[],
+            "zed",
+            "---\nname: zed\ndescription: the zed skill\n---\nb\n",
+        )
+        .unwrap();
+        save_group_skill(
+            &dest,
+            &[],
+            "alpha",
+            "---\nname: alpha\ndescription: the alpha skill\n---\nb\n",
+        )
+        .unwrap();
+        // Bump alpha so its version differs from a fresh default.
+        save_group_skill(
+            &dest,
+            &[],
+            "alpha",
+            "---\nname: alpha\ndescription: the alpha skill\n---\nb2\n",
+        )
+        .unwrap();
+
+        let listing = list_group_skills(&dest).unwrap();
+        assert_eq!(
+            listing,
+            vec![
+                SkillListing {
+                    name: "alpha".into(),
+                    version: 2,
+                    description: "the alpha skill".into(),
+                },
+                SkillListing {
+                    name: "zed".into(),
+                    version: 1,
+                    description: "the zed skill".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_group_skills_skips_malformed_and_stray_entries() {
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+        save_group_skill(
+            &dest,
+            &[],
+            "good",
+            "---\nname: good\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        // A directory with a malformed SKILL.md.
+        let bad = dest.join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("SKILL.md"), "no frontmatter here\n").unwrap();
+        // A directory whose frontmatter name mismatches its slug.
+        let mism = dest.join("mismatch");
+        fs::create_dir_all(&mism).unwrap();
+        fs::write(
+            mism.join("SKILL.md"),
+            "---\nname: other\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        // A stray file (not a directory).
+        fs::write(dest.join("loose.txt"), "x").unwrap();
+
+        let listing = list_group_skills(&dest).unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name, "good");
+    }
+
+    #[test]
+    fn author_list_reload_round_trip() {
+        // The S3 integration round-trip: author a skill, list it, reload it
+        // and confirm the persisted version survives + a re-save bumps it in
+        // the listing.
+        let td = TempDir::new().unwrap();
+        let dest = td.path().join("skills");
+
+        // Author.
+        let dir = save_group_skill(&dest, &[], "greet", VALID_GREET).unwrap();
+
+        // List.
+        let listing = list_group_skills(&dest).unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name, "greet");
+        assert_eq!(listing[0].version, 1);
+
+        // Reload (parse the persisted SKILL.md back).
+        let reloaded =
+            frontmatter::parse(&fs::read_to_string(dir.join("SKILL.md")).unwrap()).unwrap();
+        assert_eq!(reloaded.version(), 1);
+        assert_eq!(reloaded.name, "greet");
+
+        // Re-author → the listing reflects the bumped version.
+        save_group_skill(&dest, &[], "greet", VALID_GREET).unwrap();
+        let listing = list_group_skills(&dest).unwrap();
+        assert_eq!(listing[0].version, 2);
     }
 
     #[test]

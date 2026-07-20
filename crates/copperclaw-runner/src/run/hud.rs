@@ -23,6 +23,19 @@
 //! bare channels keep the old behaviour — a periodic "still working"
 //! status row after each long silent stretch.
 //!
+//! M22 D5 adds a third leg between those two: channels whose CLIENT
+//! renders an append-only frame log as an in-place transcript repaint
+//! (`capabilities::renders_client_side_transcript` — today only cli,
+//! whose JSONL `chat.log` is read by `cclaw chat`). Their adapter has
+//! no `edit_message`, so the HUD emits every frame as a fresh
+//! `MessageKind::Breadcrumb` EVENT (never an `update_breadcrumb`
+//! edit), with the exact same frame content + fingerprint suppression
+//! as the live edit path at the batch boundaries and the finalize
+//! collapse; the wall-clock ticker stays edit-only (on an append-only
+//! log every tick would be a permanent line — the client repaints the
+//! elapsed clock itself). The client dedupes repeated frames and
+//! repaints, so the append-only log never reads as spam.
+//!
 //! Surfaces where the platform draws no typing indicator at all
 //! (`capabilities::typing_indicator_visible` — e.g. Slack outside an
 //! assistant thread) force full HUD behaviour and a tighter edit
@@ -31,10 +44,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use copperclaw_channels_core::{
-    Breadcrumb, BreadcrumbStatus, MAX_DETAIL_CHARS, MAX_SUMMARY_CHARS, capabilities,
+    Breadcrumb, BreadcrumbStatus, MAX_DETAIL_CHARS, MAX_SUMMARY_CHARS, MAX_TOOL_NAME_CHARS,
+    capabilities,
 };
 use copperclaw_mcp::ToolContext;
 
@@ -88,6 +103,112 @@ const THINKING_THRESHOLD: Duration = Duration::from_secs(6);
 /// `copperclaw-mcp` (the session dir is bind-mounted at `/data`).
 pub const TODO_STORE_DEFAULT_PATH: &str = "/data/agent_todos.json";
 
+/// M22 B5: bounded window of completed tool steps kept on the HUD's
+/// shared state and attached to every emitted frame via
+/// `Breadcrumb::steps`. Forty matches the renderers' own working
+/// assumption (Telegram's `render_activity_html` folds anything beyond
+/// its length budget into a `+N earlier` note); the producer keeps the
+/// NEWEST forty so the visible transcript stays live on a long run.
+const MAX_TRANSCRIPT_STEPS: usize = 40;
+
+/// M22 B5: char cap on one step's result summary (the italic `— …` tail
+/// in the rendered step line). The Telegram step renderer truncates at
+/// 120 chars anyway; capping at the producer keeps the serialized frame
+/// small and every other surface consistent.
+const STEP_SUMMARY_CHARS: usize = 120;
+
+/// M22 B4: maximum number of ` | `-separated fields in a live-frame
+/// summary. The summary is the collapsed headline on mobile clients, so
+/// beyond four fields it stops being scannable; optional fields are
+/// dropped lowest-value-first (cost, then tokens, then the todo ratio)
+/// and a pending one-shot note always survives.
+const MAX_SUMMARY_FIELDS: usize = 4;
+
+/// M22 B4: char budget for the composed live-frame summary — well under
+/// `MAX_SUMMARY_CHARS` (200) so the collapsed headline never wraps into
+/// noise on a phone. Optional fields are dropped (cost first, then
+/// tokens, then the ratio) until the line fits.
+const MAX_SUMMARY_LINE_CHARS: usize = 100;
+
+/// M22 B4: live spend counters for the CURRENT inbound's provider calls,
+/// shared between the provider-call layer (writer — tokens are in hand
+/// there and nowhere else in-container; the runner cannot reach the
+/// central `agent_turns` table) and the Task HUD (reader — the status
+/// line and the final collapse). Reset by `drive_turn` at the top of
+/// each inbound so the HUD shows per-task spend. All counters are
+/// relaxed atomics: the HUD is a best-effort UX surface, not billing —
+/// `emit_usage_report` remains the audited record.
+#[derive(Debug, Default)]
+pub struct TurnSpend {
+    /// Cumulative input+output tokens billed across this inbound.
+    tokens: AtomicU64,
+    /// Cumulative list-price cost in micro-dollars, summed only over
+    /// calls whose `(provider, model)` had a pricing-table hit.
+    cost_micros: AtomicU64,
+    /// At least one call had a pricing-table hit.
+    priced_any: AtomicBool,
+    /// At least one call had NO pricing-table hit. When set, the cost is
+    /// a known undercount, so surfaces omit the dollar field entirely —
+    /// a confidently wrong figure is worse than an honest blank.
+    unpriced_any: AtomicBool,
+}
+
+impl TurnSpend {
+    /// Fold one completed provider call's billed tokens into the live
+    /// counters, pricing them via the shared table when the model is
+    /// known. A zero-token call (providers that surface no usage) is a
+    /// no-op so it can never flip the priced/unpriced flags.
+    pub fn record(&self, provider: &str, model: &str, input_tokens: u32, output_tokens: u32) {
+        let total = u64::from(input_tokens) + u64::from(output_tokens);
+        if total == 0 {
+            return;
+        }
+        self.tokens.fetch_add(total, Ordering::Relaxed);
+        match copperclaw_types::pricing::price_for(provider, model) {
+            Some(price) => {
+                // u128 multiply-then-divide: u32 tokens * u64 per-MTok
+                // micros overflows u64 in the worst case, never u128.
+                let micros = (u128::from(input_tokens) * u128::from(price.input_per_mtok_micros)
+                    + u128::from(output_tokens) * u128::from(price.output_per_mtok_micros))
+                    / 1_000_000;
+                self.cost_micros
+                    .fetch_add(u64::try_from(micros).unwrap_or(u64::MAX), Ordering::Relaxed);
+                self.priced_any.store(true, Ordering::Relaxed);
+            }
+            None => self.unpriced_any.store(true, Ordering::Relaxed),
+        }
+    }
+
+    /// Zero every counter — called by `drive_turn` at inbound entry so
+    /// the HUD's spend line is per-task.
+    pub fn reset(&self) {
+        self.tokens.store(0, Ordering::Relaxed);
+        self.cost_micros.store(0, Ordering::Relaxed);
+        self.priced_any.store(false, Ordering::Relaxed);
+        self.unpriced_any.store(false, Ordering::Relaxed);
+    }
+
+    /// Consistent-enough snapshot for one frame render.
+    fn view(&self) -> SpendView {
+        SpendView {
+            tokens: self.tokens.load(Ordering::Relaxed),
+            cost_micros: self.cost_micros.load(Ordering::Relaxed),
+            all_priced: self.priced_any.load(Ordering::Relaxed)
+                && !self.unpriced_any.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One frame's read of [`TurnSpend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SpendView {
+    tokens: u64,
+    cost_micros: u64,
+    /// True only when EVERY recorded call was priced — the gate for
+    /// rendering a dollar figure at all (never `$0.00` for unknown).
+    all_priced: bool,
+}
+
 /// How this inbound's HUD behaves, resolved once at `drive_turn` entry
 /// from the configured [`HudMode`] and the originating channel's static
 /// capabilities.
@@ -96,6 +217,16 @@ enum Behavior {
     /// Live self-editing HUD (post at first tool call, edit per batch +
     /// ticker, collapse on finalize).
     Live,
+    /// M22 D5: live HUD frames emitted as fresh `Breadcrumb` EVENTS
+    /// instead of in-place edits, for channels whose CLIENT collapses
+    /// the append-only frame log into a repaint
+    /// (`capabilities::renders_client_side_transcript` — cli's
+    /// `chat.log`, rendered by `cclaw chat`). Same frame content and
+    /// fingerprint suppression as [`Self::Live`] at the batch
+    /// boundaries + the finalize collapse; the wall-clock ticker stays
+    /// Live-only (on an append-only log every clock tick would be a
+    /// permanent line — the client repaints the elapsed clock itself).
+    Transcript,
     /// Only the end-of-task one-line summary (`hud_mode = final` on an
     /// edit-capable channel with a visible typing indicator).
     FinalOnly,
@@ -121,6 +252,13 @@ struct Shared {
     /// True once the final collapse edit went out; later emits (ticker
     /// races) are suppressed.
     finalized: bool,
+    /// M22 B5: this inbound's completed tool steps, newest-last, bounded
+    /// at [`MAX_TRANSCRIPT_STEPS`] (oldest dropped). Attached to every
+    /// emitted frame via `Breadcrumb::steps` so rich renderers (Telegram
+    /// `render_activity_html`) show the live tool-call transcript. Fresh
+    /// per inbound: the HUD (and this state) is constructed at
+    /// `drive_turn` entry.
+    steps: Vec<Breadcrumb>,
     /// Fingerprint of the last HUD frame actually emitted for this
     /// anchor (see [`frame_fingerprint`]). Guards against a redundant
     /// in-place edit whose rendered content is byte-identical to what
@@ -168,6 +306,18 @@ pub(super) struct TaskHud {
     /// [`crate::clock::TestClock`] so the 60s status-row leg and the
     /// 150s softening are reachable without wall-clock waits.
     clock: Arc<dyn Clock>,
+    /// M22 B1: the loop-level notice queue ([`RunnerDeps::notices`]).
+    /// [`Self::new`] drains one queued note into [`Shared::note`] so it
+    /// rides this turn's first frame / status row; [`Self::finalize`]
+    /// pushes an un-rendered note BACK so a fast pure-text turn (which
+    /// posts no frame at all) defers the note to a later turn instead of
+    /// silently dropping it.
+    notices: Arc<super::Notices>,
+    /// M22 B4: the live per-inbound spend counters
+    /// ([`RunnerDeps::spend`]) — written by the provider-call layer,
+    /// read here for the status line's token/cost fields and the final
+    /// collapse.
+    spend: Arc<TurnSpend>,
 }
 
 impl TaskHud {
@@ -183,19 +333,28 @@ impl TaskHud {
             // status-row path.
             (_, HudMode::Off) | (None, _) => Behavior::StatusRows,
             (Some(oc), mode) => {
+                let typing_visible = capabilities::typing_indicator_visible(
+                    &oc.channel_type,
+                    oc.platform_id.as_deref().unwrap_or(""),
+                    oc.thread_id.as_deref(),
+                );
+                // No typing signal on this surface: the HUD is the
+                // only working indicator, so `final` is forced back
+                // to the live HUD. Precedence (M22 D5): a real edit
+                // API wins (in-place edits), then a client-side
+                // transcript renderer (fresh-message frames the
+                // client collapses), then the bare status-row leg.
                 if capabilities::supports_message_edit(&oc.channel_type) {
-                    let typing_visible = capabilities::typing_indicator_visible(
-                        &oc.channel_type,
-                        oc.platform_id.as_deref().unwrap_or(""),
-                        oc.thread_id.as_deref(),
-                    );
-                    // No typing signal on this surface: the HUD is the
-                    // only working indicator, so `final` is forced back
-                    // to the live HUD.
                     if mode == HudMode::Final && typing_visible {
                         Behavior::FinalOnly
                     } else {
                         Behavior::Live
+                    }
+                } else if capabilities::renders_client_side_transcript(&oc.channel_type) {
+                    if mode == HudMode::Final && typing_visible {
+                        Behavior::FinalOnly
+                    } else {
+                        Behavior::Transcript
                     }
                 } else {
                     Behavior::StatusRows
@@ -231,18 +390,61 @@ impl TaskHud {
             copperclaw_metrics::inc_hud_degraded(ct, reason);
         }
         let now = deps.clock.now();
+        // B1: adopt one queued loop-level notice (auto-compaction fired
+        // before this turn) as the turn's pending one-shot note, so it
+        // rides the first live frame / status row through the existing
+        // note machinery. FIFO, one per turn — further queued notices
+        // wait for later turns.
+        let shared = Shared {
+            note: deps.notices.drain_one(),
+            ..Shared::default()
+        };
         Self {
             behavior,
             answer_edit_capable,
             agent_group: deps.agent_group_id.to_string(),
             started_at: now,
-            shared: Arc::new(StdMutex::new(Shared::default())),
+            shared: Arc::new(StdMutex::new(shared)),
             ctx: deps.tool_ctx.clone(),
             todo_path: deps.todo_path.clone(),
             edit_interval,
             ticker: StdMutex::new(None),
             last_status_emit_at: StdMutex::new(now),
             clock: Arc::clone(&deps.clock),
+            notices: Arc::clone(&deps.notices),
+            spend: Arc::clone(&deps.spend),
+        }
+    }
+
+    /// M22 B5: fold one COMPLETED tool call into the transcript window.
+    /// Called from `drive_turn`'s batch-results loop (the one place the
+    /// per-call result text exists) with the model-requested name/input
+    /// and the tool's rendered result. Bounded at
+    /// [`MAX_TRANSCRIPT_STEPS`] newest steps; the next emitted frame
+    /// carries the updated window via `Breadcrumb::steps`.
+    pub(super) fn record_step(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        result: &str,
+        is_error: bool,
+    ) {
+        let step = Breadcrumb {
+            tool_name: cap_chars(name, MAX_TOOL_NAME_CHARS),
+            detail: crate::tools::breadcrumb_detail(name, input),
+            status: if is_error {
+                BreadcrumbStatus::Failed
+            } else {
+                BreadcrumbStatus::Done
+            },
+            summary: step_result_summary(result),
+            steps: Vec::new(),
+        };
+        if let Ok(mut s) = self.shared.lock() {
+            if s.steps.len() >= MAX_TRANSCRIPT_STEPS {
+                s.steps.remove(0);
+            }
+            s.steps.push(step);
         }
     }
 
@@ -259,7 +461,7 @@ impl TaskHud {
     /// Test-only: peek the pending one-shot note without consuming it.
     /// Lets the R5 failover tests assert `add_note` fired on a mid-turn
     /// provider switch even under the `StatusRows` behaviour (where the
-    /// note is never rendered/taken).
+    /// note stays pending until the next 60s status row takes it).
     #[cfg(test)]
     pub(super) fn note_for_test(&self) -> Option<String> {
         self.shared.lock().ok().and_then(|s| s.note.clone())
@@ -286,7 +488,7 @@ impl TaskHud {
     /// edit the HUD to show the running tools. Also records the batch's
     /// lead tool for the activity line.
     pub(super) async fn on_batch_start(&self, calls: &[PendingToolCall]) {
-        if self.behavior != Behavior::Live {
+        if !self.emits_live_frames() {
             return;
         }
         let activity = calls.first().map(|c| {
@@ -319,7 +521,7 @@ impl TaskHud {
         all_ok: bool,
     ) {
         match self.behavior {
-            Behavior::Live => {
+            Behavior::Live | Behavior::Transcript => {
                 if let Ok(mut s) = self.shared.lock() {
                     s.tool_runs = tool_runs;
                     s.activity = last_tool.map(|t| {
@@ -352,14 +554,27 @@ impl TaskHud {
                 handle.abort();
             }
         }
-        let (posted, tool_runs, already_finalized) = match self.shared.lock() {
-            Ok(mut s) => {
-                let snapshot = (s.posted, s.tool_runs, s.finalized);
-                s.finalized = true;
-                snapshot
-            }
-            Err(_) => return,
-        };
+        let (posted, tool_runs, already_finalized, unrendered_note, steps) =
+            match self.shared.lock() {
+                Ok(mut s) => {
+                    let snapshot = (
+                        s.posted,
+                        s.tool_runs,
+                        s.finalized,
+                        s.note.take(),
+                        std::mem::take(&mut s.steps),
+                    );
+                    s.finalized = true;
+                    snapshot
+                }
+                Err(_) => return,
+            };
+        // B1: a note this turn never rendered (fast pure-text turn — no
+        // frame posted, no status row due) goes back to the queue so a
+        // later turn surfaces it instead of dropping it on the floor.
+        if let Some(note) = unrendered_note {
+            self.notices.push(note);
+        }
         if already_finalized || (tool_runs == 0 && !posted) {
             // Double finalize, or a fast turn that never posted a frame:
             // no HUD to collapse and no final line worth posting. (A
@@ -373,12 +588,25 @@ impl TaskHud {
         let plural = if tool_runs == 1 { "" } else { "s" };
         // F5: a pure-reasoning turn collapses its "thinking…" frame to a
         // clean "done in M:SS" (the "0 tool calls" tail would read oddly).
-        let summary = match (ok, tool_runs) {
+        let mut summary = match (ok, tool_runs) {
             (true, 0) => format!("done in {elapsed}"),
             (false, 0) => format!("stopped after {elapsed}"),
             (true, n) => format!("done in {elapsed}, {n} tool call{plural}"),
             (false, n) => format!("stopped after {elapsed}, {n} tool call{plural}"),
         };
+        // B4: append the task's spend, in this line's existing comma
+        // style. Zero recorded tokens (providers that surface no usage)
+        // renders nothing, keeping the pre-B4 bytes; the cost renders
+        // only when EVERY call was priced (never $0.00 for unknown).
+        let spend = self.spend.view();
+        if let Some(t) = fmt_tokens(spend.tokens) {
+            summary.push_str(&format!(", {t}"));
+        }
+        if let Some(c) = fmt_cost(spend.cost_micros, spend.all_priced) {
+            summary.push_str(&format!(", {c}"));
+        }
+        // B5: the collapse keeps the accumulated step transcript attached
+        // so the tool log stays readable in scrollback after the run.
         let breadcrumb = Breadcrumb {
             tool_name: TASK_HUD_TOOL.to_owned(),
             detail: None,
@@ -388,7 +616,7 @@ impl TaskHud {
                 BreadcrumbStatus::Failed
             },
             summary: Some(cap_chars(&summary, MAX_SUMMARY_CHARS)),
-            steps: Vec::new(),
+            steps,
         };
         match self.behavior {
             // Collapse the live HUD in place. Skip if the collapse frame
@@ -398,6 +626,17 @@ impl TaskHud {
                 if record_and_should_emit(&self.shared, &breadcrumb, false) {
                     copperclaw_metrics::inc_hud_edits(&self.agent_group, "finalize");
                     self.ctx.emit_task_hud(&breadcrumb, false).await;
+                }
+            }
+            // D5: the Transcript collapse is the same frame emitted as a
+            // fresh EVENT (no edit anchor exists on an append-only log);
+            // the client folds it over the running frames. The same
+            // fingerprint guard applies so a redundant duplicate of the
+            // last frame is never appended.
+            Behavior::Transcript if posted => {
+                if record_and_should_emit(&self.shared, &breadcrumb, false) {
+                    copperclaw_metrics::inc_hud_edits(&self.agent_group, "finalize");
+                    self.ctx.emit_task_hud(&breadcrumb, true).await;
                 }
             }
             // `final`: the one-liner is the only HUD emission at all.
@@ -424,9 +663,36 @@ impl TaskHud {
         if first {
             copperclaw_metrics::inc_hud_post(&self.agent_group);
         } else {
+            // On the Transcript path this counts re-emitted frames, not
+            // literal edits — same lifecycle position, same counter (the
+            // M22 program adds no new metrics).
             copperclaw_metrics::inc_hud_edits(&self.agent_group, trigger);
         }
-        self.ctx.emit_task_hud(&breadcrumb, first).await;
+        // D5: Transcript frames are always fresh messages — an
+        // append-only log has no edit anchor, so `first` is forced true
+        // at the emit boundary (the client dedupes and repaints).
+        self.ctx
+            .emit_task_hud(&breadcrumb, self.emit_as_new(first))
+            .await;
+    }
+
+    /// True when this inbound emits live HUD frames at all — the
+    /// edit-based [`Behavior::Live`] path or the D5 event-based
+    /// [`Behavior::Transcript`] path. The two share the batch
+    /// start/end emission points, the finalize collapse, and the
+    /// fingerprint suppression; the wall-clock ticker (and its F5
+    /// thinking frame) stays Live-only — see [`Self::arm`].
+    fn emits_live_frames(&self) -> bool {
+        matches!(self.behavior, Behavior::Live | Behavior::Transcript)
+    }
+
+    /// Whether `emit_task_hud` should open a fresh message for this
+    /// frame. `first` frames always do; on [`Behavior::Transcript`]
+    /// EVERY frame does (no edit anchor exists on an append-only log —
+    /// `existing_message_id` stays `None` all the way through
+    /// delivery).
+    fn emit_as_new(&self, first: bool) -> bool {
+        first || self.behavior == Behavior::Transcript
     }
 
     /// Build the Running-state breadcrumb from shared state + the todo
@@ -438,6 +704,7 @@ impl TaskHud {
             self.started_at,
             self.clock.now(),
             &self.todo_path,
+            &self.spend,
         )
     }
 
@@ -454,6 +721,13 @@ impl TaskHud {
     /// so there is never a duplicate HUD message. Idempotent: a second
     /// call is a no-op once the task is spawned.
     pub(super) fn arm(&self) {
+        // D5: the ticker stays LIVE-ONLY by design. On the edit path
+        // its clock refreshes vanish into one edited message; on an
+        // append-only transcript log every tick would be a PERMANENT
+        // frame line (a 10-minute silent run = 20 junk rows replayed
+        // forever), so the Transcript path emits only at batch
+        // boundaries + finalize and leaves the live elapsed-clock
+        // repaint to the client (`cclaw chat` owns a real terminal).
         if self.behavior != Behavior::Live {
             return;
         }
@@ -470,13 +744,14 @@ impl TaskHud {
         let interval = self.edit_interval;
         let agent_group = self.agent_group.clone();
         let clock = Arc::clone(&self.clock);
+        let spend = Arc::clone(&self.spend);
         *guard = Some(tokio::spawn(async move {
             // Pre-first-tool wait: hold off the initial post so fast turns
             // (which finalize before this elapses) never post.
             tokio::time::sleep(THINKING_THRESHOLD).await;
             loop {
                 let Some((frame, first)) =
-                    running_frame(&shared, started_at, clock.now(), &todo_path)
+                    running_frame(&shared, started_at, clock.now(), &todo_path, &spend)
                 else {
                     break;
                 };
@@ -524,7 +799,11 @@ impl TaskHud {
         }
         let elapsed_secs = now.saturating_duration_since(self.started_at).as_secs();
         let todo_step = current_todo_step(&self.todo_path);
-        let status = compose_status_row(elapsed_secs, tool_runs, last_tool, todo_step);
+        // B1: take (one-shot) the pending note so it rides this row and
+        // never a later one — the bare-channel mirror of the live HUD's
+        // render-then-clear in `running_frame`.
+        let note = self.shared.lock().ok().and_then(|mut s| s.note.take());
+        let status = compose_status_row(elapsed_secs, tool_runs, last_tool, todo_step, note);
         self.ctx.emit_status(&status).await;
         if let Ok(mut at) = self.last_status_emit_at.lock() {
             *at = self.clock.now();
@@ -536,13 +815,17 @@ impl TaskHud {
 /// the cumulative tool count, the latest tool, and — when the session's
 /// todo store has one — the current `step N/M: …` detail so bare channels
 /// show real progress. Past [`INTERMEDIATE_STATUS_AFTER`] the closing
-/// reassurance softens to "taking longer than usual, still going". Pure
-/// so the folding + threshold can be unit-tested without wall-clock waits.
+/// reassurance softens to "taking longer than usual, still going". A
+/// pending one-shot note (M22 B1 — e.g. the auto-compaction notice) is
+/// appended after the step clause; the caller takes it from [`Shared`]
+/// so it appears on exactly one row. Pure so the folding + threshold can
+/// be unit-tested without wall-clock waits.
 fn compose_status_row(
     elapsed_secs: u64,
     tool_runs: usize,
     last_tool: Option<&str>,
     todo_step: Option<String>,
+    note: Option<String>,
 ) -> String {
     let last = last_tool.unwrap_or("thinking");
     let plural = if tool_runs == 1 { "" } else { "s" };
@@ -553,6 +836,10 @@ fn compose_status_row(
     if let Some(step) = todo_step {
         status.push_str(" — ");
         status.push_str(&step);
+    }
+    if let Some(n) = note {
+        status.push_str(" — ");
+        status.push_str(&n);
     }
     if elapsed_secs >= INTERMEDIATE_STATUS_AFTER.as_secs() {
         status.push_str(". This is taking longer than usual, but I'm still going.");
@@ -584,34 +871,46 @@ fn running_frame(
     started_at: Instant,
     now: Instant,
     todo_path: &Path,
+    spend: &TurnSpend,
 ) -> Option<(Breadcrumb, bool)> {
-    let (first, tool_runs, activity, note) = {
+    let (first, tool_runs, activity, note, steps) = {
         let mut s = shared.lock().ok()?;
         if s.finalized {
             return None;
         }
         let first = !s.posted;
         s.posted = true;
-        (first, s.tool_runs, s.activity.clone(), s.note.take())
+        (
+            first,
+            s.tool_runs,
+            s.activity.clone(),
+            s.note.take(),
+            s.steps.clone(),
+        )
     };
     let elapsed = fmt_mmss(now.saturating_duration_since(started_at).as_secs());
-    let plural = if tool_runs == 1 { "" } else { "s" };
-    // F5: before the first tool runs the frame is the pre-first-tool
-    // "thinking…" wait (posted by the armed background task after
-    // THINKING_THRESHOLD). Once a tool has run it's the usual tool-count
-    // summary.
-    let mut summary = if tool_runs == 0 && activity.is_none() {
-        format!("thinking… | {elapsed}")
-    } else {
-        format!("{tool_runs} tool call{plural} | {elapsed}")
-    };
-    if let Some(n) = note {
-        summary.push_str(" | ");
-        summary.push_str(&n);
-    }
+    let progress = current_todo_progress(todo_path);
+    // B3: the compact `step N/M` ratio rides the summary (the collapsed
+    // headline on mobile); the full `step N/M: <text>` line stays in
+    // detail as before.
+    let ratio = progress
+        .as_ref()
+        .map(|(step_no, total, _)| format!("step {step_no}/{total}"));
+    let summary = compose_summary(
+        tool_runs,
+        // F5: before the first tool runs the frame is the pre-first-tool
+        // "thinking…" wait (posted by the armed background task after
+        // THINKING_THRESHOLD). Once a tool has run it's the usual
+        // tool-count summary.
+        tool_runs == 0 && activity.is_none(),
+        &elapsed,
+        ratio.as_deref(),
+        spend.view(),
+        note.as_deref(),
+    );
     let mut detail_parts: Vec<String> = Vec::new();
-    if let Some(step) = current_todo_step(todo_path) {
-        detail_parts.push(step);
+    if let Some((step_no, total, text)) = progress {
+        detail_parts.push(format!("step {step_no}/{total}: {text}"));
     }
     if let Some(a) = activity {
         detail_parts.push(a);
@@ -626,9 +925,141 @@ fn running_frame(
         detail,
         status: BreadcrumbStatus::Running,
         summary: Some(cap_chars(&summary, MAX_SUMMARY_CHARS)),
-        steps: Vec::new(),
+        steps,
     };
     Some((breadcrumb, first))
+}
+
+/// Compose one live-frame summary line (M22 B3/B4). Field order keeps
+/// the pre-M22 head (`N tool calls | M:SS` / `thinking… | M:SS`)
+/// byte-identical, then appends the new optional fields — todo ratio,
+/// rounded token count, rounded cost — capped at [`MAX_SUMMARY_FIELDS`]
+/// total. Optional fields are dropped lowest-value-first (cost, then
+/// tokens, then the ratio); a pending one-shot note is never dropped and
+/// keeps its historical tail position. Pure so the field cap, drop
+/// order, and length bound are unit-testable.
+fn compose_summary(
+    tool_runs: usize,
+    thinking: bool,
+    elapsed: &str,
+    ratio: Option<&str>,
+    spend: SpendView,
+    note: Option<&str>,
+) -> String {
+    let plural = if tool_runs == 1 { "" } else { "s" };
+    let head = if thinking {
+        "thinking…".to_owned()
+    } else {
+        format!("{tool_runs} tool call{plural}")
+    };
+    let fields: Vec<String> = vec![head, elapsed.to_owned()];
+    let mut optional: Vec<String> = Vec::new();
+    if let Some(r) = ratio {
+        optional.push(r.to_owned());
+    }
+    if let Some(t) = fmt_tokens(spend.tokens) {
+        optional.push(t);
+    }
+    if let Some(c) = fmt_cost(spend.cost_micros, spend.all_priced) {
+        optional.push(c);
+    }
+    // Truncation drops from the END of the optional list, so the cost
+    // goes first, then tokens, then the ratio — and a pending note
+    // (never dropped) tightens the budget by one.
+    let budget = MAX_SUMMARY_FIELDS.saturating_sub(fields.len() + usize::from(note.is_some()));
+    optional.truncate(budget);
+    // Length backstop on the same drop order: an extreme field (a
+    // pathological token count alongside a pending note) sheds optional
+    // fields until the line fits the mobile budget.
+    let compose = |fields: &[String], optional: &[String], note: Option<&str>| {
+        let mut all: Vec<&str> = fields.iter().map(String::as_str).collect();
+        all.extend(optional.iter().map(String::as_str));
+        if let Some(n) = note {
+            all.push(n);
+        }
+        all.join(" | ")
+    };
+    let mut line = compose(&fields, &optional, note);
+    while line.chars().count() > MAX_SUMMARY_LINE_CHARS && !optional.is_empty() {
+        optional.pop();
+        line = compose(&fields, &optional, note);
+    }
+    line
+}
+
+/// Render a cumulative token count for the status line, rounded to the
+/// nearest 100 so the frame fingerprint doesn't change (and force an
+/// in-place edit) on every LLM call: `3_237` → `3.2k tokens`, `800` →
+/// `800 tokens`, `38_049` → `38k tokens`. `None` when the rounded count
+/// is zero (providers that surface no usage) so those frames stay
+/// byte-identical to the pre-B4 shape.
+fn fmt_tokens(tokens: u64) -> Option<String> {
+    let rounded = tokens.saturating_add(50) / 100 * 100;
+    if rounded == 0 {
+        return None;
+    }
+    if rounded < 1000 {
+        return Some(format!("{rounded} tokens"));
+    }
+    let k = rounded / 1000;
+    let tenths = rounded % 1000 / 100;
+    if tenths == 0 {
+        Some(format!("{k}k tokens"))
+    } else {
+        Some(format!("{k}.{tenths}k tokens"))
+    }
+}
+
+/// Render the cumulative cost for the status line, rounded to the
+/// nearest cent. `None` unless EVERY recorded call was priced (an
+/// unknown model must render as absence, never `$0.00`) and the rounded
+/// amount is at least one cent (a leading `$0.00` is noise, and ollama's
+/// genuinely-zero local cost stays blank by the same rule).
+fn fmt_cost(micros: u64, all_priced: bool) -> Option<String> {
+    if !all_priced {
+        return None;
+    }
+    let cents = micros.saturating_add(5_000) / 10_000;
+    if cents == 0 {
+        return None;
+    }
+    Some(format!("${}.{:02}", cents / 100, cents % 100))
+}
+
+/// One tool call's result, reduced to the step's post-completion
+/// summary (the `— …` tail in the rendered step line): the first
+/// non-empty line of the human-readable content, capped at
+/// [`STEP_SUMMARY_CHARS`]. Many first-party tools return a JSON
+/// envelope (the shell tool's `{command, exit_code, stdout, …}`), so a
+/// JSON-object result surfaces its first populated human field instead
+/// of the literal opening brace. `None` when nothing readable exists so
+/// the renderer omits the tail entirely.
+fn step_result_summary(result: &str) -> Option<String> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(result) {
+        for key in ["stdout", "message", "text", "content", "error", "stderr"] {
+            if let Some(line) = map
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(first_line)
+            {
+                return Some(line);
+            }
+        }
+        // A silent command: fall back to its exit code (deterministic,
+        // unlike the envelope's elapsed_ms) rather than raw JSON.
+        if let Some(code) = map.get("exit_code").and_then(serde_json::Value::as_i64) {
+            return Some(format!("exit {code}"));
+        }
+        return None;
+    }
+    first_line(result)
+}
+
+/// First non-empty trimmed line of `s`, capped at
+/// [`STEP_SUMMARY_CHARS`].
+fn first_line(s: &str) -> Option<String> {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(cap_chars(line, STEP_SUMMARY_CHARS))
 }
 
 /// Fingerprint one composed HUD frame for no-op-edit suppression. Two
@@ -701,6 +1132,14 @@ struct TodoEntry {
 /// store is missing, unparseable, or empty — the HUD simply omits the
 /// segment.
 fn current_todo_step(path: &Path) -> Option<String> {
+    let (step_no, total, text) = current_todo_progress(path)?;
+    Some(format!("step {step_no}/{total}: {text}"))
+}
+
+/// Structured variant of [`current_todo_step`]: `(step_no, total,
+/// current item text)`. M22 B3 renders the compact `step N/M` ratio in
+/// the frame SUMMARY and the full line in detail from one store read.
+fn current_todo_progress(path: &Path) -> Option<(usize, usize, String)> {
     let bytes = std::fs::read(path).ok()?;
     let items: Vec<TodoEntry> = serde_json::from_slice(&bytes).ok()?;
     if items.is_empty() {
@@ -720,7 +1159,7 @@ fn current_todo_step(path: &Path) -> Option<String> {
         .or_else(|| items.iter().find(|i| i.status == "pending"))?;
     // Step number = completed + 1 (the one being worked), clamped to total.
     let step_no = (completed + 1).min(total);
-    Some(format!("step {step_no}/{total}: {}", current.text))
+    Some((step_no, total, current.text.clone()))
 }
 
 #[cfg(test)]
@@ -739,7 +1178,13 @@ mod tests {
 
     #[test]
     fn status_row_carries_todo_step_when_present() {
-        let with = compose_status_row(65, 3, Some("shell"), Some("step 2/5: build the UI".into()));
+        let with = compose_status_row(
+            65,
+            3,
+            Some("shell"),
+            Some("step 2/5: build the UI".into()),
+            None,
+        );
         assert!(
             with.contains("step 2/5: build the UI"),
             "bare status must fold in the current todo step: {with}"
@@ -747,7 +1192,7 @@ mod tests {
         assert!(with.contains("3 tool calls"));
         assert!(with.contains("latest: shell"));
         // No todo store → no step segment, and it stays a clean sentence.
-        let without = compose_status_row(65, 1, Some("read_file"), None);
+        let without = compose_status_row(65, 1, Some("read_file"), None, None);
         assert!(
             !without.contains("step "),
             "no step clause when absent: {without}"
@@ -761,7 +1206,7 @@ mod tests {
     #[test]
     fn intermediate_message_fires_past_threshold_not_before() {
         // Before the threshold: the plain "I'll keep going." tail.
-        let before = compose_status_row(120, 4, Some("shell"), None);
+        let before = compose_status_row(120, 4, Some("shell"), None, None);
         assert!(before.ends_with("I'll keep going."), "got: {before}");
         assert!(!before.contains("taking longer"), "premature: {before}");
         // At/past the threshold (the ~180s row): the softened reassurance.
@@ -770,6 +1215,7 @@ mod tests {
             9,
             Some("cargo"),
             Some("step 3/6: wire it up".into()),
+            None,
         );
         assert!(
             after.contains("This is taking longer than usual, but I'm still going."),
@@ -778,6 +1224,38 @@ mod tests {
         assert!(
             after.contains("step 3/6: wire it up"),
             "the todo step still rides the intermediate row: {after}"
+        );
+    }
+
+    #[test]
+    fn status_row_appends_note_after_step_clause() {
+        // B1: a pending one-shot note (auto-compaction) rides the bare
+        // status row, after the todo-step clause and before the closing
+        // reassurance sentence.
+        let note = "history auto-compacted (14 msgs -> 5, ~180k tokens)";
+        let with = compose_status_row(
+            65,
+            3,
+            Some("shell"),
+            Some("step 2/5: build the UI".into()),
+            Some(note.into()),
+        );
+        assert!(
+            with.contains(&format!("step 2/5: build the UI — {note}. ")),
+            "note must follow the step clause and precede the tail: {with}"
+        );
+        assert!(with.ends_with("I'll keep going."), "tail intact: {with}");
+        // No note → byte-identical to the pre-B1 row.
+        let without = compose_status_row(
+            65,
+            3,
+            Some("shell"),
+            Some("step 2/5: build the UI".into()),
+            None,
+        );
+        assert!(
+            !without.contains("auto-compacted"),
+            "no note clause when absent: {without}"
         );
     }
 
@@ -872,11 +1350,12 @@ mod tests {
             activity: Some("last: shell ok".into()),
             note: Some("steering noted".into()),
             posted: true,
-            finalized: false,
-            last_emitted: None,
+            ..Shared::default()
         });
+        let spend = TurnSpend::default();
         let started = Instant::now();
-        let (frame, first) = running_frame(&shared, started, Instant::now(), &todo_path).unwrap();
+        let (frame, first) =
+            running_frame(&shared, started, Instant::now(), &todo_path, &spend).unwrap();
         assert!(!first, "HUD was already posted");
         let summary = frame.summary.as_deref().unwrap();
         assert!(
@@ -884,7 +1363,8 @@ mod tests {
             "note must ride the next edit; got: {summary}"
         );
         // Next frame: the note is one-shot.
-        let (frame2, _) = running_frame(&shared, started, Instant::now(), &todo_path).unwrap();
+        let (frame2, _) =
+            running_frame(&shared, started, Instant::now(), &todo_path, &spend).unwrap();
         assert!(
             !frame2
                 .summary
@@ -901,14 +1381,13 @@ mod tests {
         let todo_path = tmp.path().join("agent_todos.json");
         let shared = StdMutex::new(Shared {
             tool_runs: 1,
-            activity: None,
-            note: None,
             posted: true,
             finalized: true,
-            last_emitted: None,
+            ..Shared::default()
         });
+        let spend = TurnSpend::default();
         assert!(
-            running_frame(&shared, Instant::now(), Instant::now(), &todo_path).is_none(),
+            running_frame(&shared, Instant::now(), Instant::now(), &todo_path, &spend).is_none(),
             "no frame may be composed after the final collapse"
         );
     }
@@ -1170,13 +1649,20 @@ mod tests {
 
     #[tokio::test]
     async fn status_rows_60s_first_fire_and_150s_softening_pinned_by_test_clock() {
-        // cli has no message-edit API, so the HUD degrades to the
-        // bare-channel StatusRows behaviour under the default hud_mode.
-        let (_tmp, outbound, mut deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        // webhooks has no message-edit API and no client-side transcript
+        // renderer, so the HUD degrades to the bare-channel StatusRows
+        // behaviour under the default hud_mode. (Before M22 D5 this test
+        // rode cli, which now takes the Transcript path.)
+        let (_tmp, outbound, mut deps) =
+            deps_for_channel("webhooks", crate::config::HudMode::default());
         let clock = TestClock::new();
         deps.clock = Arc::new(clock.clone());
         let hud = TaskHud::new(&deps);
-        assert_eq!(hud.behavior, Behavior::StatusRows, "cli is a bare channel");
+        assert_eq!(
+            hud.behavior,
+            Behavior::StatusRows,
+            "webhooks is a bare channel"
+        );
 
         // 30s in: a finishing batch is under the 60s cadence — silence.
         clock.advance(Duration::from_secs(30));
@@ -1261,5 +1747,601 @@ mod tests {
             hud_rows(&outbound).await.is_empty(),
             "hud_mode=off must never post a thinking frame"
         );
+    }
+
+    // ── M22 B1: loop-level notices drain into the one-shot note slot ────
+
+    #[test]
+    fn new_drains_one_queued_notice_into_pending_note() {
+        // TaskHud::new adopts exactly ONE queued notice (FIFO) as the
+        // turn's pending note; further notices wait for later turns.
+        let (_tmp, _outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        deps.notices
+            .push("history auto-compacted (14 msgs -> 5, ~180k tokens)");
+        deps.notices.push("second notice");
+        let hud = TaskHud::new(&deps);
+        assert_eq!(
+            hud.note_for_test().as_deref(),
+            Some("history auto-compacted (14 msgs -> 5, ~180k tokens)"),
+            "the oldest queued notice becomes the pending one-shot note"
+        );
+        assert_eq!(
+            deps.notices.drain_one().as_deref(),
+            Some("second notice"),
+            "only one notice may be drained per turn"
+        );
+    }
+
+    #[test]
+    fn queued_notice_renders_on_next_frame_only() {
+        // The drained notice rides the existing one-shot machinery:
+        // exactly one live frame carries it, then it clears (the mirror
+        // of pending_note_renders_on_next_frame_only for the B1 path).
+        let tmp = tempfile::tempdir().unwrap();
+        let todo_path = tmp.path().join("agent_todos.json");
+        let (_t, _outbound, deps) = deps_for_channel("telegram", crate::config::HudMode::default());
+        deps.notices
+            .push("history auto-compacted (14 msgs -> 5, ~180k tokens)");
+        let hud = TaskHud::new(&deps);
+        let started = Instant::now();
+        let (frame, first) =
+            running_frame(&hud.shared, started, Instant::now(), &todo_path, &hud.spend)
+                .expect("live frame composes");
+        assert!(first, "nothing posted yet");
+        assert!(
+            frame
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("history auto-compacted (14 msgs -> 5, ~180k tokens)"),
+            "the drained notice must ride the first frame; got {:?}",
+            frame.summary
+        );
+        // Next frame: one-shot, cleared.
+        let (frame2, _) =
+            running_frame(&hud.shared, started, Instant::now(), &todo_path, &hud.spend).unwrap();
+        assert!(
+            !frame2
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("auto-compacted"),
+            "the notice must clear after one render; got {:?}",
+            frame2.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_requeues_a_notice_the_turn_never_rendered() {
+        // A fast pure-text turn posts no frame at all — the drained
+        // notice must go BACK to the queue for a later turn instead of
+        // being dropped on the floor.
+        let (_tmp, outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        deps.notices
+            .push("history auto-compacted (14 msgs -> 5, ~180k tokens)");
+        let hud = TaskHud::new(&deps);
+        hud.finalize(true).await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "a zero-tool unposted turn emits nothing"
+        );
+        assert_eq!(
+            deps.notices.drain_one().as_deref(),
+            Some("history auto-compacted (14 msgs -> 5, ~180k tokens)"),
+            "an unrendered notice must be requeued at finalize"
+        );
+    }
+
+    // ── M22 B3/B4: summary fields, rounding, and the four-field cap ─────
+
+    #[test]
+    fn summary_orders_head_ratio_tokens_cost() {
+        // Head (tools + clock) keeps its pre-M22 bytes; ratio, tokens
+        // and cost append in that order, ` | `-joined.
+        let spend = SpendView {
+            tokens: 3_237,
+            cost_micros: 120_000, // $0.12
+            all_priced: true,
+        };
+        let s = compose_summary(6, false, "1:47", Some("step 2/5"), spend, None);
+        assert_eq!(s, "6 tool calls | 1:47 | step 2/5 | 3.2k tokens");
+        // Without a ratio the cost fits inside the four-field cap.
+        let s = compose_summary(6, false, "1:47", None, spend, None);
+        assert_eq!(s, "6 tool calls | 1:47 | 3.2k tokens | $0.12");
+        // No new fields at all: byte-identical to the pre-M22 summary.
+        let s = compose_summary(3, false, "0:42", None, SpendView::default(), None);
+        assert_eq!(s, "3 tool calls | 0:42");
+        let s = compose_summary(0, true, "0:07", None, SpendView::default(), None);
+        assert_eq!(s, "thinking… | 0:07");
+    }
+
+    #[test]
+    fn summary_caps_at_four_fields_dropping_cost_then_tokens() {
+        let spend = SpendView {
+            tokens: 3_237,
+            cost_micros: 120_000,
+            all_priced: true,
+        };
+        // All five candidates: cost is dropped first.
+        let s = compose_summary(6, false, "1:47", Some("step 2/5"), spend, None);
+        assert!(!s.contains('$'), "cost must drop first at the cap: {s}");
+        assert_eq!(s.split(" | ").count(), 4, "capped at four fields: {s}");
+        // A pending note is never dropped and tightens the budget by
+        // one: tokens go next, the ratio survives.
+        let s = compose_summary(
+            6,
+            false,
+            "1:47",
+            Some("step 2/5"),
+            spend,
+            Some("extended tool budget (4/8 turns)"),
+        );
+        assert_eq!(
+            s,
+            "6 tool calls | 1:47 | step 2/5 | extended tool budget (4/8 turns)"
+        );
+        assert_eq!(s.split(" | ").count(), 4, "note counts toward the cap: {s}");
+        assert!(!s.contains("tokens"), "tokens drop after cost: {s}");
+    }
+
+    #[test]
+    fn summary_length_bounded_across_matrix() {
+        // Every combination in the matrix stays comfortably scannable on
+        // mobile: <= 100 chars, well under MAX_SUMMARY_CHARS (200).
+        let spends = [
+            SpendView::default(),
+            SpendView {
+                tokens: 850,
+                cost_micros: 9_800,
+                all_priced: true,
+            },
+            SpendView {
+                tokens: u64::MAX,
+                cost_micros: u64::MAX,
+                all_priced: true,
+            },
+        ];
+        let notes = [
+            None,
+            Some("extended tool budget (900/900 turns)"),
+            Some("history auto-compacted (14 msgs -> 5, ~180k tokens)"),
+        ];
+        let ratios = [None, Some("step 2/5"), Some("step 99/99")];
+        for tool_runs in [0usize, 1, 9_999] {
+            for spend in spends {
+                for note in notes {
+                    for ratio in ratios {
+                        let s = compose_summary(
+                            tool_runs,
+                            tool_runs == 0,
+                            "999:59",
+                            ratio,
+                            spend,
+                            note,
+                        );
+                        assert!(
+                            s.chars().count() <= 100,
+                            "summary must stay <= 100 chars ({} for {s:?})",
+                            s.chars().count()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tokens_round_to_nearest_hundred() {
+        assert_eq!(fmt_tokens(0), None, "zero recorded tokens render nothing");
+        assert_eq!(fmt_tokens(49), None, "sub-50 rounds to zero -> omitted");
+        assert_eq!(fmt_tokens(50), Some("100 tokens".into()));
+        assert_eq!(fmt_tokens(800), Some("800 tokens".into()));
+        assert_eq!(fmt_tokens(3_237), Some("3.2k tokens".into()));
+        assert_eq!(fmt_tokens(3_160), Some("3.2k tokens".into()));
+        assert_eq!(fmt_tokens(38_049), Some("38k tokens".into()));
+        assert_eq!(fmt_tokens(1_000), Some("1k tokens".into()));
+    }
+
+    #[test]
+    fn cost_renders_only_when_all_calls_priced_and_nonzero() {
+        assert_eq!(fmt_cost(120_000, true), Some("$0.12".into()));
+        assert_eq!(fmt_cost(1_234_999, true), Some("$1.23".into()));
+        // Unknown model somewhere in the run: omit entirely, never $0.00.
+        assert_eq!(fmt_cost(120_000, false), None);
+        // Sub-half-cent (and ollama's genuinely-zero cost): omitted.
+        assert_eq!(fmt_cost(4_000, true), None);
+        assert_eq!(fmt_cost(0, true), None);
+    }
+
+    #[test]
+    fn turn_spend_prices_known_models_and_flags_unknown() {
+        let spend = TurnSpend::default();
+        // Sonnet list price $3/$15 per MTok: 900 in + 100 out = 4200 micros.
+        spend.record("anthropic", "claude-sonnet-4-6", 900, 100);
+        let v = spend.view();
+        assert_eq!(v.tokens, 1_000);
+        assert_eq!(v.cost_micros, 4_200);
+        assert!(v.all_priced, "a priced-only run renders cost");
+        // An unpriced call poisons the cost (a known undercount) but
+        // still counts its tokens.
+        spend.record("openrouter", "some-unknown-model", 100, 0);
+        let v = spend.view();
+        assert_eq!(v.tokens, 1_100);
+        assert!(!v.all_priced, "any unpriced call must suppress the cost");
+        // Zero-token calls (no usage surfaced) are complete no-ops.
+        let clean = TurnSpend::default();
+        clean.record("openrouter", "some-unknown-model", 0, 0);
+        assert_eq!(clean.view(), SpendView::default());
+        // reset() restores the pristine state.
+        spend.reset();
+        assert_eq!(spend.view(), SpendView::default());
+    }
+
+    // ── M22 fingerprint stability (the binding Verification gates) ──────
+
+    #[test]
+    fn old_shape_frame_fingerprints_identically_to_pre_m22() {
+        // (a) A frame with `steps` empty and every new field absent must
+        // serialize byte-identically to the pre-M22 shape — serde's
+        // skip_serializing_if defaults keep old frames byte-stable, so
+        // no spurious in-place edit fires on upgrade.
+        let tmp = tempfile::tempdir().unwrap();
+        let todo_path = tmp.path().join("agent_todos.json");
+        let shared = StdMutex::new(Shared {
+            tool_runs: 3,
+            activity: Some("last: shell ok".into()),
+            posted: true,
+            ..Shared::default()
+        });
+        let spend = TurnSpend::default();
+        let now = Instant::now();
+        let (frame, _) = running_frame(&shared, now, now, &todo_path, &spend).unwrap();
+        assert_eq!(
+            frame_fingerprint(&frame),
+            r#"{"tool_name":"task","detail":"last: shell ok","status":"running","summary":"3 tool calls | 0:00"}"#,
+            "old-shape frames must fingerprint exactly as before M22"
+        );
+    }
+
+    #[test]
+    fn sub_rounding_token_changes_fingerprint_identically() {
+        // (b) Two frames differing only in sub-rounding token counts
+        // (3,160 vs 3,240 -> both "3.2k") must fingerprint identically,
+        // so B4's rounding suppresses the no-op edit that
+        // record_and_should_emit would otherwise let through.
+        let tmp = tempfile::tempdir().unwrap();
+        let todo_path = tmp.path().join("agent_todos.json");
+        let now = Instant::now();
+        let frame_for = |tokens: u64, micros: u64| {
+            let shared = StdMutex::new(Shared {
+                tool_runs: 3,
+                activity: Some("last: shell ok".into()),
+                posted: true,
+                ..Shared::default()
+            });
+            let spend = TurnSpend::default();
+            spend.tokens.store(tokens, Ordering::Relaxed);
+            spend.cost_micros.store(micros, Ordering::Relaxed);
+            spend.priced_any.store(true, Ordering::Relaxed);
+            let (frame, _) = running_frame(&shared, now, now, &todo_path, &spend).unwrap();
+            frame_fingerprint(&frame)
+        };
+        // Both cost figures round to the same cent as well.
+        assert_eq!(
+            frame_for(3_160, 9_480),
+            frame_for(3_240, 9_720),
+            "sub-rounding token deltas must not change the fingerprint"
+        );
+    }
+
+    // ── M22 B5: the bounded step transcript ─────────────────────────────
+
+    #[test]
+    fn record_step_captures_detail_status_and_result_summary() {
+        let (_tmp, _outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        hud.record_step(
+            "shell",
+            &serde_json::json!({"command": "echo step one"}),
+            "step one\nsecond line ignored",
+            false,
+        );
+        hud.record_step(
+            "read_file",
+            &serde_json::json!({"path": "/data/missing.txt"}),
+            "no such file: /data/missing.txt",
+            true,
+        );
+        let s = hud.shared.lock().unwrap();
+        assert_eq!(s.steps.len(), 2);
+        assert_eq!(s.steps[0].tool_name, "shell");
+        assert_eq!(s.steps[0].detail.as_deref(), Some("echo step one"));
+        assert_eq!(s.steps[0].status, BreadcrumbStatus::Done);
+        assert_eq!(
+            s.steps[0].summary.as_deref(),
+            Some("step one"),
+            "the step summary is the result's first non-empty line"
+        );
+        assert_eq!(s.steps[1].status, BreadcrumbStatus::Failed);
+        assert!(s.steps[1].steps.is_empty(), "steps never nest");
+    }
+
+    #[test]
+    fn step_result_summary_unwraps_json_envelopes() {
+        // The shell tool's JSON envelope surfaces stdout, not "{".
+        let shell = r#"{"command":"echo step one","exit_code":0,"stdout":"step one\n","stderr":"","elapsed_ms":4}"#;
+        assert_eq!(step_result_summary(shell).as_deref(), Some("step one"));
+        // Silent command: deterministic exit code, never elapsed_ms.
+        let silent = r#"{"command":"true","exit_code":0,"stdout":"","stderr":"","elapsed_ms":9}"#;
+        assert_eq!(step_result_summary(silent).as_deref(), Some("exit 0"));
+        // Failed command with only stderr populated.
+        let failed = r#"{"command":"x","exit_code":1,"stdout":"","stderr":"x: not found\n"}"#;
+        assert_eq!(step_result_summary(failed).as_deref(), Some("x: not found"));
+        // Plain-text result: first non-empty line, capped.
+        assert_eq!(
+            step_result_summary("\n  hello world  \nsecond").as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(step_result_summary(""), None);
+        let long = "a".repeat(400);
+        let capped = step_result_summary(&long).unwrap();
+        assert_eq!(capped.chars().count(), STEP_SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn record_step_keeps_newest_forty() {
+        let (_tmp, _outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        for i in 0..45 {
+            hud.record_step(
+                "shell",
+                &serde_json::json!({"command": format!("echo {i}")}),
+                &format!("{i}"),
+                false,
+            );
+        }
+        let s = hud.shared.lock().unwrap();
+        assert_eq!(s.steps.len(), MAX_TRANSCRIPT_STEPS);
+        assert_eq!(
+            s.steps[0].detail.as_deref(),
+            Some("echo 5"),
+            "the oldest steps are dropped, keeping the newest window"
+        );
+        assert_eq!(s.steps.last().unwrap().detail.as_deref(), Some("echo 44"));
+    }
+
+    #[test]
+    fn running_frame_attaches_accumulated_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let todo_path = tmp.path().join("agent_todos.json");
+        let (_t, _outbound, deps) = deps_for_channel("telegram", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        hud.record_step(
+            "shell",
+            &serde_json::json!({"command": "cargo check"}),
+            "ok",
+            false,
+        );
+        let now = Instant::now();
+        let (frame, _) = running_frame(&hud.shared, now, now, &todo_path, &hud.spend).unwrap();
+        assert_eq!(frame.steps.len(), 1, "frames carry the step transcript");
+        assert_eq!(frame.steps[0].tool_name, "shell");
+        assert_eq!(frame.steps[0].detail.as_deref(), Some("cargo check"));
+    }
+
+    #[tokio::test]
+    async fn finalize_collapse_keeps_steps_and_appends_spend() {
+        // The done-collapse keeps the step transcript attached and
+        // appends the task's spend in the line's comma style.
+        let (_tmp, outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        deps.spend
+            .record("anthropic", "claude-sonnet-4-6", 37_000, 1_049);
+        let hud = TaskHud::new(&deps);
+        hud.record_step(
+            "shell",
+            &serde_json::json!({"command": "cargo check"}),
+            "ok",
+            false,
+        );
+        hud.on_batch_start(&[]).await;
+        hud.on_batch_end(1, Some("shell"), true).await;
+        hud.finalize(true).await;
+        let rows = hud_rows(&outbound).await;
+        let collapse = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::System)
+            .filter_map(|r| {
+                serde_json::from_value::<Breadcrumb>(
+                    r.content["update_breadcrumb"]["breadcrumb"].clone(),
+                )
+                .ok()
+            })
+            .find(|b| b.status == BreadcrumbStatus::Done)
+            .expect("finalize collapse row");
+        assert_eq!(collapse.steps.len(), 1, "the collapse keeps the transcript");
+        let summary = collapse.summary.as_deref().unwrap();
+        assert!(
+            summary.contains("1 tool call, 38k tokens, $0.13"),
+            "the collapse carries rounded spend: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_row_carries_queued_notice_exactly_once() {
+        // Bare channels: the drained notice rides the first due status
+        // row and never a later one. (webhooks, not cli — M22 D5 moved
+        // cli onto the Transcript path.)
+        let (_tmp, outbound, mut deps) =
+            deps_for_channel("webhooks", crate::config::HudMode::default());
+        let clock = TestClock::new();
+        deps.clock = Arc::new(clock.clone());
+        deps.notices
+            .push("history auto-compacted (14 msgs -> 5, ~180k tokens)");
+        let hud = TaskHud::new(&deps);
+        assert_eq!(
+            hud.behavior,
+            Behavior::StatusRows,
+            "webhooks is a bare channel"
+        );
+
+        clock.advance(Duration::from_secs(61));
+        hud.on_batch_end(1, Some("shell"), true).await;
+        let rows = hud_rows(&outbound).await;
+        assert_eq!(rows.len(), 1, "first due status row fires");
+        let text = rows[0].content["text"].as_str().unwrap();
+        assert!(
+            text.contains("history auto-compacted (14 msgs -> 5, ~180k tokens)"),
+            "the notice rides the first status row: {text}"
+        );
+
+        clock.advance(Duration::from_secs(61));
+        hud.on_batch_end(2, Some("shell"), true).await;
+        let rows = hud_rows(&outbound).await;
+        assert_eq!(rows.len(), 2, "second status row fires on cadence");
+        let text = rows[1].content["text"].as_str().unwrap();
+        assert!(
+            !text.contains("auto-compacted"),
+            "the notice is one-shot — it must not repeat: {text}"
+        );
+    }
+
+    // ── M22 D5: the cli Transcript path (frames as events) ──────────────
+
+    #[test]
+    fn behavior_routes_edit_capable_transcript_and_bare_channels() {
+        // The D5 precedence: a real edit API wins (Live), then a
+        // client-side transcript renderer (Transcript), then the bare
+        // status-row fallback.
+        let (_t1, _o1, deps) = deps_for_channel("telegram", crate::config::HudMode::default());
+        assert_eq!(TaskHud::new(&deps).behavior, Behavior::Live);
+        let (_t2, _o2, deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        assert_eq!(TaskHud::new(&deps).behavior, Behavior::Transcript);
+        let (_t3, _o3, deps) = deps_for_channel("webhooks", crate::config::HudMode::default());
+        assert_eq!(TaskHud::new(&deps).behavior, Behavior::StatusRows);
+        // hud_mode still governs the transcript leg like the edit leg:
+        // `final` collapses to the one-liner, `off` degrades fully.
+        let (_t4, _o4, deps) = deps_for_channel("cli", crate::config::HudMode::Final);
+        assert_eq!(TaskHud::new(&deps).behavior, Behavior::FinalOnly);
+        let (_t5, _o5, deps) = deps_for_channel("cli", crate::config::HudMode::Off);
+        assert_eq!(TaskHud::new(&deps).behavior, Behavior::StatusRows);
+    }
+
+    #[tokio::test]
+    async fn transcript_emits_fresh_breadcrumb_events_never_edits() {
+        // Every Transcript frame is a fresh MessageKind::Breadcrumb row
+        // (an event the client dedupes); no update_breadcrumb System
+        // row — the edit transport — may ever appear for cli.
+        let (_tmp, outbound, deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        hud.record_step(
+            "shell",
+            &serde_json::json!({"command": "cargo check"}),
+            "ok",
+            false,
+        );
+        hud.on_batch_end(1, Some("shell"), true).await;
+        hud.on_batch_end(2, Some("read_file"), true).await;
+        let rows = hud_rows(&outbound).await;
+        assert_eq!(rows.len(), 2, "one event per changed frame");
+        for row in &rows {
+            assert_eq!(
+                row.kind,
+                MessageKind::Breadcrumb,
+                "transcript frames are fresh Breadcrumb events, never System edits"
+            );
+        }
+        let bc: Breadcrumb = serde_json::from_value(rows[1].content["breadcrumb"].clone()).unwrap();
+        assert_eq!(
+            bc.steps.len(),
+            1,
+            "frames carry the cumulative step transcript"
+        );
+        assert!(
+            bc.summary.as_deref().unwrap().starts_with("2 tool calls"),
+            "frames carry the cumulative summary: {:?}",
+            bc.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_cadence_suppresses_byte_identical_frames() {
+        // The record_and_should_emit discipline holds on the Transcript
+        // path: a frame byte-identical to the last one emitted is NOT
+        // appended again (a chatty run must not flood the log), while a
+        // changed frame still emits. The clock is frozen so the elapsed
+        // field cannot differ between the two emits.
+        let (_tmp, outbound, mut deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        deps.clock = Arc::new(TestClock::new());
+        let hud = TaskHud::new(&deps);
+        hud.on_batch_end(1, Some("shell"), true).await;
+        assert_eq!(hud_rows(&outbound).await.len(), 1, "first frame emits");
+        // Identical state, identical clock: suppressed.
+        hud.on_batch_end(1, Some("shell"), true).await;
+        assert_eq!(
+            hud_rows(&outbound).await.len(),
+            1,
+            "a byte-identical transcript frame must be suppressed"
+        );
+        // Changed state still emits.
+        hud.on_batch_end(2, Some("shell"), true).await;
+        assert_eq!(
+            hud_rows(&outbound).await.len(),
+            2,
+            "a changed transcript frame must still emit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transcript_arm_posts_no_ticker_thinking_frame() {
+        // The wall-clock ticker (and its F5 thinking frame) stays
+        // Live-only: on an append-only log every tick would be a
+        // permanent line, so arming the HUD on cli must post nothing
+        // however long the turn reasons — the client repaints the
+        // elapsed clock itself.
+        let (_tmp, outbound, deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        assert_eq!(hud.behavior, Behavior::Transcript);
+        hud.arm();
+        tokio::time::advance(THINKING_THRESHOLD + Duration::from_secs(60)).await;
+        settle().await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "no ticker frames may post on the transcript path"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_finalize_appends_the_collapse_event() {
+        // finalize on the Transcript path appends the done-collapse as a
+        // fresh Breadcrumb event (steps attached), never a System edit.
+        let (_tmp, outbound, deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        hud.record_step(
+            "shell",
+            &serde_json::json!({"command": "cargo check"}),
+            "ok",
+            false,
+        );
+        hud.on_batch_end(1, Some("shell"), true).await;
+        hud.finalize(true).await;
+        let rows = hud_rows(&outbound).await;
+        assert!(
+            rows.iter().all(|r| r.kind == MessageKind::Breadcrumb),
+            "no System (edit) row may appear on the transcript path"
+        );
+        let collapse: Breadcrumb =
+            serde_json::from_value(rows.last().unwrap().content["breadcrumb"].clone()).unwrap();
+        assert_eq!(collapse.status, BreadcrumbStatus::Done);
+        assert!(
+            collapse.summary.as_deref().unwrap().starts_with("done in"),
+            "the collapse event carries the final line: {:?}",
+            collapse.summary
+        );
+        assert_eq!(collapse.steps.len(), 1, "the collapse keeps the transcript");
     }
 }

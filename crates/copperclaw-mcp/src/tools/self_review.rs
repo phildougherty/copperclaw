@@ -411,6 +411,245 @@ pub(crate) async fn scan_projects_needing_review() -> Vec<PathBuf> {
     out
 }
 
+// ── C6: see→fix (screenshot) gate ───────────────────────────────────────
+//
+// The screenshot → critique → fix → re-screenshot loop (M20 D4) was a
+// prompt-level habit with "no runtime marker", so completion gates and the
+// HUD could neither require nor observe it. C6 gives it a runtime state,
+// modelled on the verify + self_review gates above so `todo.rs`'s completion
+// gate observes all three uniformly.
+//
+// "Is this a UI task" reuses the one durable signal the codebase already
+// emits for UI work: `ui_screenshot` (M20 D1) saves captures under a
+// project's `.copperclaw/screenshots/`. A project with ≥1 capture there has
+// demonstrably got a UI the agent has looked at, so it is subject to the
+// loop; a project that never screenshotted is not a UI task and is never
+// gated (fails open, exactly like [`ReviewState::NotApplicable`]).
+//
+// The marker is a presence flag under the same state dir the other gates
+// use: `.copperclaw/needs_screenshot`. It is SET when a UI edit lands
+// (`computer_use::write_file`, plus the edit-family tools via the runner's
+// `tool_dispatch` hook) and CLEARED when a fresh `ui_screenshot` is taken
+// (the dispatch hook again — the screenshot tool itself is out of C6's
+// scope, and the runner's dispatch layer is the one place that observes
+// every tool call). Completion of the final todo refuses while any UI
+// project's marker is set, up to [`SEE_FIX_CYCLE_CAP`], then auto-blocks —
+// the same "refuse then block" shape as the verify and review gates.
+
+/// Hard cap on see→fix cycles per todo before the completion gate
+/// auto-transitions the todo to `blocked` instead of refusing forever.
+/// Mirrors [`REVIEW_CYCLE_CAP`] and [`crate::tools::verify_gate::FIX_CYCLE_CAP`].
+pub const SEE_FIX_CYCLE_CAP: u32 = 2;
+
+const NEEDS_SCREENSHOT_FILE: &str = "needs_screenshot";
+const SCREENSHOT_CYCLES_FILE: &str = "screenshot_cycles";
+/// Subdirectory of a project's `.copperclaw/` state dir where
+/// `ui_screenshot` saves captures. The presence of ≥1 capture is the
+/// "this is a UI task" signal (see the section docs).
+const SCREENSHOTS_DIR: &str = "screenshots";
+
+/// A project's see→fix gate status. Mirrors [`ReviewState`] so `todo.rs`
+/// (and any HUD) can observe verify / review / see→fix uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeeFixState {
+    /// No `.copperclaw/screenshots/` capture exists — the project has no
+    /// looked-at UI, so the loop does not apply. Fails open.
+    NotUiTask,
+    /// A UI task whose latest UI edit has no post-fix screenshot yet
+    /// (`.copperclaw/needs_screenshot` present) — blocks completion.
+    NeedsScreenshot,
+    /// A UI task with no pending post-fix screenshot — nothing to gate.
+    Satisfied,
+}
+
+fn needs_screenshot_path(project_root: &Path) -> PathBuf {
+    project_root.join(STATE_DIR).join(NEEDS_SCREENSHOT_FILE)
+}
+
+fn screenshot_cycles_path(project_root: &Path) -> PathBuf {
+    project_root.join(STATE_DIR).join(SCREENSHOT_CYCLES_FILE)
+}
+
+async fn remove_marker_if_present(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "see_fix: failed to remove marker file"
+            );
+        }
+    }
+}
+
+/// True iff `project_root` has taken at least one `ui_screenshot` (a
+/// capture exists under `.copperclaw/screenshots/`) — the durable signal
+/// that this is a UI task the loop applies to.
+pub async fn is_ui_task(project_root: &Path) -> bool {
+    let dir = project_root.join(STATE_DIR).join(SCREENSHOTS_DIR);
+    match tokio::fs::read_dir(&dir).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(Some(_))),
+        Err(_) => false,
+    }
+}
+
+/// Mark `project_root` as needing a post-fix screenshot after a UI edit.
+/// No-op unless the project is a UI task (has screenshotted at least once)
+/// — a project with no looked-at UI is never gated. Best-effort: a write
+/// failure degrades to "not gated" rather than erroring the edit.
+pub async fn mark_needs_screenshot(project_root: &Path) {
+    if !is_ui_task(project_root).await {
+        return;
+    }
+    let dir = project_root.join(STATE_DIR);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "see_fix: failed to create state dir"
+        );
+        return;
+    }
+    if let Err(e) = tokio::fs::write(dir.join(NEEDS_SCREENSHOT_FILE), b"").await {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "see_fix: failed to write needs_screenshot marker"
+        );
+    }
+}
+
+/// Clear `project_root`'s pending-post-fix-screenshot marker (a fresh
+/// `ui_screenshot` satisfied the loop) and reset its cycle count — engaging
+/// with the loop at all earns a fresh budget, mirroring
+/// [`reset_review_cycles`].
+pub async fn clear_needs_screenshot(project_root: &Path) {
+    remove_marker_if_present(&needs_screenshot_path(project_root)).await;
+    reset_screenshot_cycles(project_root).await;
+}
+
+/// Current see→fix state for `project_root`.
+pub async fn see_fix_state(project_root: &Path) -> SeeFixState {
+    if !is_ui_task(project_root).await {
+        return SeeFixState::NotUiTask;
+    }
+    if tokio::fs::try_exists(needs_screenshot_path(project_root))
+        .await
+        .unwrap_or(false)
+    {
+        SeeFixState::NeedsScreenshot
+    } else {
+        SeeFixState::Satisfied
+    }
+}
+
+async fn read_screenshot_cycles(project_root: &Path) -> u32 {
+    match tokio::fs::read_to_string(screenshot_cycles_path(project_root)).await {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Current see→fix-cycle count for `project_root`. Absent / unparseable
+/// state resolves to `0`, mirroring [`review_cycles`].
+pub async fn screenshot_cycles(project_root: &Path) -> u32 {
+    read_screenshot_cycles(project_root).await
+}
+
+/// Record one refused completion attempt against the see→fix gate:
+/// increments the cycle count and returns the new value. Mirrors
+/// [`record_review_refusal`].
+pub async fn record_screenshot_refusal(project_root: &Path) -> u32 {
+    let new_count = read_screenshot_cycles(project_root).await.saturating_add(1);
+    let dir = project_root.join(STATE_DIR);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "see_fix: failed to create state dir"
+        );
+        return new_count;
+    }
+    if let Err(e) = tokio::fs::write(
+        dir.join(SCREENSHOT_CYCLES_FILE),
+        new_count.to_string().as_bytes(),
+    )
+    .await
+    {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "see_fix: failed to write screenshot-cycles marker"
+        );
+    }
+    new_count
+}
+
+/// Reset the see→fix-cycle count to 0. Mirrors [`reset_review_cycles`].
+pub async fn reset_screenshot_cycles(project_root: &Path) {
+    remove_marker_if_present(&screenshot_cycles_path(project_root)).await;
+}
+
+/// Session-wide scan (mirrors [`scan_projects_needing_review`]): every
+/// top-level project directory under the data root whose see→fix state is
+/// [`SeeFixState::NeedsScreenshot`]. Sorted for determinism. Consumed by
+/// the `todo.rs` completion gate.
+pub(crate) async fn scan_projects_needing_screenshot() -> Vec<PathBuf> {
+    let root = super::verify_gate::data_root();
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() && matches!(see_fix_state(&path).await, SeeFixState::NeedsScreenshot) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every top-level UI-task project under the data root (has ≥1 capture),
+/// regardless of marker state. Backs [`mark_all_ui_tasks_need_screenshot`].
+async fn scan_ui_task_projects() -> Vec<PathBuf> {
+    let root = super::verify_gate::data_root();
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() && is_ui_task(&path).await {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Dispatch-hook helper: a UI edit landed via one of the edit-family tools,
+/// so re-open the see→fix loop for every UI task in the session. Keyed off
+/// the tool NAME at dispatch (not per-tool arg parsing), and the runner
+/// session is single-project in practice, so "mark all UI tasks" ≈ "mark
+/// the project." Called by the runner's `tool_dispatch` after a successful
+/// edit-family tool call. See the section docs.
+pub async fn mark_all_ui_tasks_need_screenshot() {
+    for project_root in scan_ui_task_projects().await {
+        mark_needs_screenshot(&project_root).await;
+    }
+}
+
+/// Dispatch-hook helper: a fresh `ui_screenshot` satisfied the loop, so
+/// clear every pending post-fix-screenshot marker in the session. Called by
+/// the runner's `tool_dispatch` after a successful `ui_screenshot` call —
+/// the screenshot tool is out of C6's scope, so its clear lives here.
+pub async fn clear_all_needs_screenshot() {
+    for project_root in scan_projects_needing_screenshot().await {
+        clear_needs_screenshot(&project_root).await;
+    }
+}
+
 // ── the tool itself ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1055,5 +1294,124 @@ mod tests {
         assert!(desc.contains("READ"));
         assert!(desc.contains("SUBMIT"));
         assert!(desc.contains("code-review"));
+    }
+
+    // ── C6: see→fix (screenshot) gate ─────────────────────────────────────
+
+    /// Make `project_root` a UI task by writing one `ui_screenshot`-style
+    /// capture under `.copperclaw/screenshots/` — the durable signal the
+    /// gate keys off. Mirrors what `ui_screenshot` does at runtime.
+    fn make_ui_task(project_root: &Path) {
+        let shots = project_root.join(STATE_DIR).join(SCREENSHOTS_DIR);
+        std::fs::create_dir_all(&shots).unwrap();
+        std::fs::write(shots.join("shot-1.png"), b"png-bytes").unwrap();
+    }
+
+    #[tokio::test]
+    async fn is_ui_task_false_without_a_capture_true_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_ui_task(dir.path()).await, "no screenshots dir yet");
+        // An empty screenshots dir is still not a UI task (no capture taken).
+        std::fs::create_dir_all(dir.path().join(STATE_DIR).join(SCREENSHOTS_DIR)).unwrap();
+        assert!(!is_ui_task(dir.path()).await, "empty screenshots dir");
+        make_ui_task(dir.path());
+        assert!(is_ui_task(dir.path()).await, "one capture present");
+    }
+
+    #[tokio::test]
+    async fn mark_needs_screenshot_is_a_noop_for_non_ui_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        // No capture ever taken → not a UI task → marking is inert.
+        mark_needs_screenshot(dir.path()).await;
+        assert_eq!(see_fix_state(dir.path()).await, SeeFixState::NotUiTask);
+    }
+
+    #[tokio::test]
+    async fn see_fix_state_cycles_satisfied_needs_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        make_ui_task(dir.path());
+        // Fresh UI task, no edit yet → nothing to gate.
+        assert_eq!(see_fix_state(dir.path()).await, SeeFixState::Satisfied);
+        // A UI edit re-opens the loop.
+        mark_needs_screenshot(dir.path()).await;
+        assert_eq!(
+            see_fix_state(dir.path()).await,
+            SeeFixState::NeedsScreenshot
+        );
+        // A fresh screenshot satisfies it again.
+        clear_needs_screenshot(dir.path()).await;
+        assert_eq!(see_fix_state(dir.path()).await, SeeFixState::Satisfied);
+    }
+
+    #[tokio::test]
+    async fn screenshot_cycles_default_zero_increment_and_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        assert_eq!(screenshot_cycles(dir.path()).await, 0);
+        assert_eq!(record_screenshot_refusal(dir.path()).await, 1);
+        assert_eq!(record_screenshot_refusal(dir.path()).await, 2);
+        assert_eq!(screenshot_cycles(dir.path()).await, 2);
+        reset_screenshot_cycles(dir.path()).await;
+        assert_eq!(screenshot_cycles(dir.path()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_needs_screenshot_also_resets_the_cycle_count() {
+        let dir = tempfile::tempdir().unwrap();
+        make_ui_task(dir.path());
+        mark_needs_screenshot(dir.path()).await;
+        record_screenshot_refusal(dir.path()).await;
+        assert_eq!(screenshot_cycles(dir.path()).await, 1);
+        clear_needs_screenshot(dir.path()).await;
+        assert_eq!(screenshot_cycles(dir.path()).await, 0);
+        assert_eq!(see_fix_state(dir.path()).await, SeeFixState::Satisfied);
+    }
+
+    #[tokio::test]
+    async fn scan_finds_only_ui_tasks_with_a_pending_screenshot() {
+        let g = DataRootTestGuard::new();
+        let root = g.path();
+
+        // UI task with a pending post-fix screenshot → in the scan.
+        let pending = root.join("pending");
+        make_ui_task(&pending);
+        mark_needs_screenshot(&pending).await;
+
+        // UI task that has been re-screenshotted → satisfied, not in scan.
+        let satisfied = root.join("satisfied");
+        make_ui_task(&satisfied);
+        mark_needs_screenshot(&satisfied).await;
+        clear_needs_screenshot(&satisfied).await;
+
+        // Non-UI project (no capture) → never gated.
+        let non_ui = root.join("non-ui");
+        std::fs::create_dir_all(&non_ui).unwrap();
+
+        let found = scan_projects_needing_screenshot().await;
+        assert_eq!(found, vec![pending]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_helpers_set_then_clear_the_ui_task_marker() {
+        // The runner's tool_dispatch hook drives these two helpers: an edit-
+        // family tool marks every UI task as needing a post-fix screenshot,
+        // and a fresh ui_screenshot clears every pending marker. This is the
+        // "marker set→cleared" integration through the exact functions the
+        // dispatch layer calls (data-root override is mcp-crate-private, so
+        // this lives here rather than in the runner crate).
+        let g = DataRootTestGuard::new();
+        let proj = g.path().join("app");
+        make_ui_task(&proj);
+        assert_eq!(see_fix_state(&proj).await, SeeFixState::Satisfied);
+
+        // A UI edit at dispatch re-opens the loop.
+        mark_all_ui_tasks_need_screenshot().await;
+        assert_eq!(see_fix_state(&proj).await, SeeFixState::NeedsScreenshot);
+        assert_eq!(scan_projects_needing_screenshot().await, vec![proj.clone()]);
+
+        // A fresh ui_screenshot at dispatch satisfies it.
+        clear_all_needs_screenshot().await;
+        assert_eq!(see_fix_state(&proj).await, SeeFixState::Satisfied);
+        assert!(scan_projects_needing_screenshot().await.is_empty());
     }
 }

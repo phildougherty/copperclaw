@@ -67,6 +67,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Scheduling — every op (create / list / cancel / pause / resume /
         // update) emits the same top-level "schedule" key with an inner `op`.
         "schedule",
+        // M22 A1: agent-authored task capability grant (apply_author_task_grant).
+        // Emitted alongside a `schedule` create when `schedule_task` carried a
+        // `grant`. Intercepted inline (see `inline_handler_set`): the delivery
+        // service resolves the task id, raises an approval, and persists the
+        // grant only on operator approval.
+        "task_grant",
         // M18 Task HUD in-place edits. `RunnerToolCtx::emit_task_hud`
         // (via `insert_update_breadcrumb_row` in tools.rs) writes a
         // System row carrying this action; the host's delivery service
@@ -74,6 +80,29 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // in-place edit of the prior HUD message via
         // `deliver_breadcrumb(..., existing_message_id)`.
         "update_breadcrumb",
+        // M22 A3: long-running goal authoring/reporting (apply_goal_create /
+        // apply_goal_update). Both `create_goal` / `update_goal` emit the same
+        // top-level "goal" key with an inner `op`. Intercepted inline (see
+        // `inline_handler_set`): a goal is internal state, so the delivery
+        // service persists it immediately into the central `goals` table.
+        "goal",
+        // M22 A4: condition/event-trigger registration + flag latch
+        // (apply_register_condition / apply_set_condition_flag). Both
+        // `register_condition` / `set_condition_flag` emit the same top-level
+        // "condition" key with an inner `op`. Intercepted inline (see
+        // `inline_handler_set`): a condition is internal state, so the delivery
+        // service persists it immediately into the central `conditions` /
+        // `condition_flags` tables.
+        "condition",
+        // M22 A2H: granted-autonomous-fire budget writeback
+        // (`charge_grant_fire_once` in `run/tool_dispatch.rs`, NOT an `apply_*`
+        // in tools.rs — see the extra scanned file in
+        // `runner_emit_set_matches_source`). The runner emits this when a
+        // grant-authorized action actually fires; the host debits the central
+        // `task_grants` row so `max_fires` / token budgets deplete across fires.
+        // Intercepted inline (see `inline_handler_set`) — internal accounting,
+        // not approval-gated.
+        "grant_consume",
     ]
     .into_iter()
     .collect()
@@ -92,6 +121,11 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // can raise a pending approval (with `self.central`) and dispatch the
         // approval card, then write the skill only on operator approval.
         "save_skill",
+        // M22 A1: `task_grant` is intercepted inline so the delivery service
+        // can resolve the concrete task id (with `self.central`), raise a
+        // pending approval, and dispatch the approval card — persisting the
+        // grant only on operator approval.
+        "task_grant",
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. Intercepted inline (rather than
         // via the module registry) so the host can resolve the prior
@@ -103,6 +137,20 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // the module-registered handler when the adapter is `Unsupported`.
         "edit",
         "reaction",
+        // M22 A3: `goal` is intercepted inline so the delivery service can
+        // persist the goal immediately into the central `goals` table (with
+        // `self.central`) — a goal is internal state, not approval-gated.
+        "goal",
+        // M22 A4: `condition` is intercepted inline so the delivery service can
+        // persist the condition / flag immediately into the central
+        // `conditions` / `condition_flags` tables (with `self.central`) — a
+        // condition is internal state, not approval-gated.
+        "condition",
+        // M22 A2H: `grant_consume` is intercepted inline so the delivery service
+        // can debit the central `task_grants` row (with `self.central`) via
+        // `consume_fire` / `consume_tokens` — internal accounting, not
+        // approval-gated.
+        "grant_consume",
     ]
     .into_iter()
     .collect()
@@ -222,6 +270,14 @@ fn runner_emit_set_matches_source() {
     // contains its body.
     let run_src = std::fs::read_to_string(runner_path("run/mod.rs"))
         .expect("read crates/copperclaw-runner/src/run/mod.rs");
+    // M22 A2H: the `grant_consume` System row is emitted by
+    // `charge_grant_fire_once` in `run/tool_dispatch.rs` (a granted autonomous
+    // fire's budget writeback), NOT by an `apply_*` in tools.rs. Scan that file
+    // too, but ONLY for that one function's body so the many `json!(...)` calls
+    // in this file's own unit tests (and `fn apply_see_fix_hooks`) don't pollute
+    // the derived set.
+    let tool_dispatch_src = std::fs::read_to_string(runner_path("run/tool_dispatch.rs"))
+        .expect("read crates/copperclaw-runner/src/run/tool_dispatch.rs");
 
     // Match `serde_json::json!({ "<name>": ...` where <name> is the
     // first key inside the top-level object. This is the pattern every
@@ -255,6 +311,13 @@ fn runner_emit_set_matches_source() {
             for cap in re.captures_iter(&fn_body) {
                 derived.insert(cap[1].to_string());
             }
+        }
+    }
+    // M22 A2H: scan only `charge_grant_fire_once` in tool_dispatch.rs for the
+    // `grant_consume` emit.
+    for fn_body in extract_fn_bodies(&tool_dispatch_src, &["fn charge_grant_fire_once"]) {
+        for cap in re.captures_iter(&fn_body) {
+            derived.insert(cap[1].to_string());
         }
     }
     // Strip noise: nested keys inside payload values we don't care about.

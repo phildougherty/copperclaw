@@ -11,9 +11,10 @@
 //! through verbatim; only structural scaffolding (titles, field labels,
 //! glyphs, fences) is added here.
 
+use crate::factory::CHANNEL_TYPE_STR;
 use copperclaw_channels_core::{
     Breadcrumb, BreadcrumbStatus, Card, DiffCard, ErrorCard, ThinkingBlock, TodoItemStatus,
-    TodoList,
+    TodoList, vocab,
 };
 
 /// Render a [`Breadcrumb`] as a compact Mattermost Markdown chip. The
@@ -95,14 +96,13 @@ fn render_breadcrumb_aggregate(b: &Breadcrumb) -> String {
     out
 }
 
-/// ASCII-only status marker (no-emoji rule): Mattermost renders bare
-/// Unicode check/cross glyphs as coloured emoji on mobile.
+/// ASCII-only status marker (no-emoji rule: Mattermost renders bare
+/// Unicode check/cross glyphs as coloured emoji on mobile), looked up
+/// through the transcript vocabulary ([`vocab::for_channel`] binds
+/// `mattermost` to [`vocab::ASCII`], byte-identical to the literals
+/// this renderer hardcoded before M22 A4).
 fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// A Mattermost inline-code span terminates on the next backtick, so a
@@ -248,22 +248,32 @@ pub fn render_todo_list(list: &TodoList) -> String {
     out.push_str("**");
     out.push_str(list.title_or_default());
     out.push_str(&format!("** ({done}/{total})"));
+    // ASCII checkbox glyphs via the vocab binding, per the project's
+    // no-emoji rule. Deliberate divergence for `InProgress`: Markdown
+    // task lists have no half-checked box, so the active item reuses
+    // the *pending* glyph (`[ ]`) plus the `_(in progress)_` suffix —
+    // byte-identical to the pre-vocab output.
+    let todo = vocab::for_channel(CHANNEL_TYPE_STR).todo;
     for item in &list.items {
         out.push('\n');
+        out.push_str("- ");
         let text = item.text.trim();
         match item.status {
             TodoItemStatus::Completed => {
-                out.push_str("- [x] ~~");
+                out.push_str(todo.completed);
+                out.push_str(" ~~");
                 out.push_str(text);
                 out.push_str("~~");
             }
             TodoItemStatus::InProgress => {
-                out.push_str("- [ ] ");
+                out.push_str(todo.pending);
+                out.push(' ');
                 out.push_str(text);
                 out.push_str(" _(in progress)_");
             }
             TodoItemStatus::Blocked => {
-                out.push_str("- [!] ");
+                out.push_str(todo.blocked);
+                out.push(' ');
                 out.push_str(text);
                 match item.blocked_reason_text() {
                     Some(reason) => {
@@ -275,7 +285,8 @@ pub fn render_todo_list(list: &TodoList) -> String {
                 }
             }
             TodoItemStatus::Pending => {
-                out.push_str("- [ ] ");
+                out.push_str(todo.pending);
+                out.push(' ');
                 out.push_str(text);
             }
         }
@@ -490,6 +501,61 @@ mod tests {
         assert!(out.contains("- [x] ~~Scaffold~~"));
         assert!(out.contains("- [ ] Wire routes _(in progress)_"));
         assert!(out.contains("- [ ] Deploy"));
+    }
+
+    #[test]
+    fn todo_list_is_byte_identical_to_pre_vocab_literals() {
+        // M22 A4 byte-identity gate for the vocab rerouting: the
+        // expected string is a hardcoded literal of the exact pre-vocab
+        // output (all four statuses) — deliberately NOT read through
+        // vocab constants, which would be circular. Note in-progress
+        // deliberately reuses the unchecked box.
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on API key".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        assert_eq!(
+            render_todo_list(&list),
+            "**Plan** (1/4)\n\
+             - [x] ~~done item~~\n\
+             - [ ] active item _(in progress)_\n\
+             - [!] stuck item _(blocked: waiting on API key)_\n\
+             - [ ] later item"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_marker_is_byte_identical_to_pre_vocab_literals() {
+        // Same M22 A4 byte-identity gate for the breadcrumb rail
+        // markers: hardcoded literal expectations, not vocab constants.
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Running), "[~]");
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Done), "[ok]");
+        assert_eq!(breadcrumb_marker(BreadcrumbStatus::Failed), "[x]");
     }
 
     #[test]

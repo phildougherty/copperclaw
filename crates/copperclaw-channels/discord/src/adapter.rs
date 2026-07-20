@@ -26,7 +26,7 @@ use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter,
     ContainerContribution, DiffCard, DmHandle as CoreDmHandle, ErrorCard, ErrorCardKind,
-    ThinkingBlock, TodoItemStatus, TodoList,
+    ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 use copperclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use serde_json::{Value, json};
@@ -850,14 +850,11 @@ pub(crate) fn render_breadcrumb_content(b: &Breadcrumb) -> String {
     if !b.steps.is_empty() {
         return render_activity_content(b);
     }
-    // ASCII-only markers. Even non-emoji Unicode symbols (U+23F3,
-    // U+2713, U+2717) render as colourful emoji on Discord's mobile
-    // clients, which violates the project's no-emoji rule.
-    let glyph = match b.status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    };
+    // ASCII-only markers via the vocab binding (see [`breadcrumb_glyph`]).
+    // Even non-emoji Unicode symbols (U+23F3, U+2713, U+2717) render as
+    // colourful emoji on Discord's mobile clients, which violates the
+    // project's no-emoji rule.
+    let glyph = breadcrumb_glyph(b.status);
     let mut out = String::with_capacity(64);
     out.push_str(glyph);
     out.push(' ');
@@ -894,15 +891,14 @@ fn escape_backticks(s: &str) -> String {
     s.replace('`', "'")
 }
 
-/// ASCII-only status marker per the project's no-emoji rule. Mirrors the
-/// inline `match` in [`render_breadcrumb_content`] so the rolling-aggregate
-/// step lines render identical markers.
+/// ASCII-only status marker per the project's no-emoji rule, looked up
+/// through the transcript vocabulary ([`vocab::for_channel`] binds
+/// `discord` to [`vocab::ASCII`], byte-identical to the literals this
+/// adapter hardcoded before M22 A3). Used by both the single-tool chip
+/// ([`render_breadcrumb_content`]) and the rolling-aggregate step lines
+/// so all breadcrumb surfaces render identical markers.
 fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// Cap on steps rendered inside the spoiler — keeps the whole `content`
@@ -1347,10 +1343,10 @@ pub fn build_thinking_payload(t: &ThinkingBlock) -> Value {
 /// ```json
 /// {
 ///   "embeds": [{
-///     "title": "<title> (3/5)",
-///     "description": "✅ ~~item 1~~\n▶️ item 2\n⬜ item 3\n…",
+///     "title": "<title> (1/3)",
+///     "description": "[x] ~~item 1~~\n[~] item 2\n[ ] item 3\n",
 ///     "color": <green | yellow | blurple>,
-///     "footer": {"text": "3 done · 1 in progress · 1 pending"}
+///     "footer": {"text": "1 done · 1 in progress · 1 pending"}
 ///   }]
 /// }
 /// ```
@@ -1362,12 +1358,16 @@ pub fn build_thinking_payload(t: &ThinkingBlock) -> Value {
 /// - `0xFEE75C` (yellow) when at least one item is `InProgress`.
 /// - `0x5865F2` (blurple) otherwise (pending / mixed pending+done).
 ///
-/// Item lines use unicode glyphs — `✅` for completed (Discord
-/// renders as the standard checkmark emoji), `▶️` for in-progress,
-/// `⬜` for pending. Completed items are wrapped in
-/// `~~strikethrough~~` so the eye can scan the still-to-do work.
-/// The description is capped at Discord's 4096-char limit; overflow
-/// gets a `…` suffix and a `(+N more)` footer hint.
+/// Item lines use the ASCII checkbox glyphs from the vocab binding
+/// ([`vocab::for_channel`] resolves `discord` to [`vocab::ASCII`]):
+/// `[x]` completed, `[~]` in progress, `[!]` blocked (with the reason
+/// as an italic `*(blocked: …)*` suffix), `[ ]` pending — never emoji
+/// or symbol codepoints, which Discord mobile promotes to colourful
+/// emoji. Completed items are wrapped in `~~strikethrough~~` so the
+/// eye can scan the still-to-do work. Item lines are budgeted at
+/// ~3900 chars (headroom under Discord's 4096-char description cap);
+/// items past the budget are dropped and summarised as a trailing
+/// `…(+N more)` line, and a final hard cap truncates at 4096 chars.
 pub(crate) fn build_todo_list_payload(list: &TodoList) -> Value {
     const DESC_BUDGET: usize = 3900;
     const COLOR_GREEN: u32 = 0x0057_F287;
@@ -1389,15 +1389,10 @@ pub(crate) fn build_todo_list_payload(list: &TodoList) -> Value {
     let mut description = String::with_capacity(list.items.len() * 64);
     let mut included = 0usize;
     for item in &list.items {
-        // ASCII-only glyphs per the project's no-emoji rule. Discord
-        // mobile renders the symbol forms (✅ / ▶️ / ⬜) as colourful
-        // emoji.
-        let glyph = match item.status {
-            TodoItemStatus::Completed => "[x]",
-            TodoItemStatus::InProgress => "[~]",
-            TodoItemStatus::Blocked => "[!]",
-            TodoItemStatus::Pending => "[ ]",
-        };
+        // ASCII-only glyphs via the vocab binding, per the project's
+        // no-emoji rule. Discord mobile renders symbol codepoints
+        // (U+2705 / U+25B6+U+FE0F / U+2B1C) as colourful emoji.
+        let glyph = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
         // Strip any backticks in user text so a value can't break out
         // of the embed; embed descriptions are not in a code fence
         // but defensive sanitisation keeps the rendering predictable.
@@ -2247,6 +2242,60 @@ mod tests {
         assert_eq!(content.matches('`').count(), 2);
     }
 
+    #[test]
+    fn render_breadcrumb_content_is_byte_identical_to_pre_vocab_literals() {
+        // M22 A3 byte-identity gate for the vocab rerouting: the expected
+        // strings are hardcoded literals of the exact pre-vocab output —
+        // deliberately NOT read through vocab constants, which would be
+        // circular.
+        use copperclaw_channels_core::Breadcrumb;
+        let running = Breadcrumb::running("shell").with_detail("cargo check");
+        assert_eq!(
+            super::render_breadcrumb_content(&running),
+            "[~] `shell` · cargo check"
+        );
+        let done = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        assert_eq!(
+            super::render_breadcrumb_content(&done),
+            "[ok] `shell` · cargo check — passed (0.4s)"
+        );
+        let failed = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(false, Some("exit 1".into()));
+        assert_eq!(
+            super::render_breadcrumb_content(&failed),
+            "[x] `shell` · cargo check — failed: exit 1"
+        );
+    }
+
+    #[test]
+    fn render_step_line_content_is_byte_identical_to_pre_vocab_literals() {
+        // Same byte-identity gate for the rolling-aggregate step lines:
+        // hardcoded literal expectations, not vocab constants.
+        use copperclaw_channels_core::Breadcrumb;
+        let done = Breadcrumb::running("read_file")
+            .with_detail("src/App.tsx")
+            .finished(true, Some("120 lines".into()));
+        assert_eq!(
+            super::render_step_line_content(&done),
+            "[ok] **read_file** `src/App.tsx` — 120 lines"
+        );
+        let running = Breadcrumb::running("shell").with_detail("npm run build");
+        assert_eq!(
+            super::render_step_line_content(&running),
+            "[~] **shell** `npm run build`"
+        );
+        let failed = Breadcrumb::running("shell")
+            .with_detail("npm test")
+            .finished(false, Some("2 failing".into()));
+        assert_eq!(
+            super::render_step_line_content(&failed),
+            "[x] **shell** `npm test` — failed: 2 failing"
+        );
+    }
+
     #[tokio::test]
     async fn deliver_breadcrumb_running_posts_inline_code_content() {
         let server = MockServer::start().await;
@@ -2869,6 +2918,50 @@ mod tests {
         assert!(footer.contains("1 done"));
         assert!(footer.contains("1 in progress"));
         assert!(footer.contains("1 pending"));
+    }
+
+    #[test]
+    fn build_todo_list_payload_description_is_byte_identical_to_pre_vocab_literals() {
+        // M22 A3 byte-identity gate for the todo-glyph vocab rerouting:
+        // the expected description is a hardcoded literal of the exact
+        // pre-vocab output (all four statuses), NOT read through vocab
+        // constants.
+        use copperclaw_channels_core::{TodoItemStatus, TodoListItem};
+        let list = copperclaw_channels_core::TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on review".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        let payload = super::build_todo_list_payload(&list);
+        let desc = payload["embeds"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            "[x] ~~done item~~\n[~] active item\n[!] stuck item *(blocked: waiting on review)*\n[ ] later item\n"
+        );
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "name": "cli-goal-progress",
+  "channel": "cli",
+  "description": "M22 A3. A long-running goal, due a check-in and re-arming every 5 minutes, is driven across two controlled sweep passes (the sweep MockClock seam) that straddle the re-armed next_checkin. Each pass fires a kind:task check-in wake; the woken agent calls update_goal to record progress, so the goal accrues two check-ins and two progress reports across the wakes. Registered as a bespoke test in tests/replay.rs (run_goal_sweep_at) — not the default trigger_sweep path.",
+  "schema": 1,
+  "max_tool_turns": 5,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

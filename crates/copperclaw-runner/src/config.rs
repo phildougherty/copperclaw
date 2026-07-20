@@ -174,6 +174,17 @@ pub struct RunnerConfigFile {
     /// groups).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_chain: Option<Vec<FailoverEntryFile>>,
+    /// F2 safe-mode respawn: when the host has seen this session's container
+    /// crash `N` (default 5) times in a row, it sets this flag so the runner
+    /// aggressively truncates its persisted `state.history` to a small recent
+    /// window at startup — bypassing normal compaction — so a persistent
+    /// history/context problem self-heals instead of crash-looping forever.
+    /// Absent / `false` (the overwhelming healthy case) means "no recovery
+    /// truncation": startup behaviour is byte-identical to before F2. The
+    /// flag is transient — the host clears it as soon as the crash streak
+    /// resets after a spawn survives.
+    #[serde(default)]
+    pub recovery_mode: Option<bool>,
 }
 
 /// On-disk shape of one alternate provider in
@@ -341,6 +352,13 @@ pub struct RunnerConfig {
     /// the historical single-provider behaviour. See
     /// [`RunnerConfigFile::failover_chain`].
     pub failover_chain: Vec<FailoverProviderConfig>,
+    /// F2 safe-mode respawn: when `true`, the runner truncates its loaded
+    /// `state.history` to a small recent window at startup (see
+    /// [`crate::compaction::truncate_to_recent`]) before entering the poll
+    /// loop, so a persistent history/context problem self-heals instead of
+    /// crash-looping. Defaults to `false` (healthy path — no truncation).
+    /// See [`RunnerConfigFile::recovery_mode`].
+    pub recovery_mode: bool,
 }
 
 /// Normalise a raw provider kind string to one of the four the runner
@@ -495,6 +513,7 @@ impl RunnerConfig {
             check_command_override: file.check_command,
             verify_gate: file.verify_gate.unwrap_or(true),
             failover_chain,
+            recovery_mode: file.recovery_mode.unwrap_or(false),
         })
     }
 
@@ -604,6 +623,7 @@ mod tests {
             check_command: None,
             verify_gate: None,
             failover_chain: None,
+            recovery_mode: None,
         }
     }
 
@@ -1179,6 +1199,39 @@ mod tests {
         };
         assert!(e.to_string().contains("session_id"));
         assert!(e.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn recovery_mode_defaults_to_false_when_unset() {
+        // Healthy path: an unset `recovery_mode` resolves to `false`, so
+        // startup truncation never fires for a non-crashing session.
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert!(!cfg.recovery_mode);
+    }
+
+    #[test]
+    fn recovery_mode_true_resolves_when_set() {
+        let mut file = good_file();
+        file.recovery_mode = Some(true);
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert!(cfg.recovery_mode);
+    }
+
+    #[test]
+    fn recovery_mode_absent_field_parses_for_backcompat() {
+        // An old `runner.json` written before F2 has no `recovery_mode`
+        // key; `#[serde(default)]` must still parse it (to `None` → false).
+        let json = r#"{"session_id":"00000000-0000-0000-0000-000000000000",
+            "agent_group_id":"00000000-0000-0000-0000-000000000000",
+            "session_dir":"/tmp/s","model":"claude-sonnet-4-6",
+            "system":"hi","api_key_env":"ANTHROPIC_API_KEY"}"#;
+        let file: RunnerConfigFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.recovery_mode, None);
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert!(!cfg.recovery_mode);
     }
 
     #[test]

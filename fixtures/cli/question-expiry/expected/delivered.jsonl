@@ -1,3 +1,6 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"[task] running: ask_user_question"},"files":0}
 {"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"card":{"type":"question","question_id":"q_<UUID>","title":"Tabs or spaces?","options":["tabs","spaces"]}},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"last: ask_user_question ok · 1 tool call | 0:00\n  [ask_user_question] (done)"},"files":0}
 {"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"I've asked which indentation you want. Pick one and I'll continue."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"working · done in 0:00, 1 tool call\n  [ask_user_question] (done)"},"files":0}
 {"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Spaces it is. Setting up the config with space indentation now."},"files":0}

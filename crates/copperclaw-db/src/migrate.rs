@@ -113,6 +113,28 @@ const CENTRAL: &[Migration] = &[
         name: "028_tasks_fire_lifecycle",
         sql: include_str!("../migrations/028_tasks_fire_lifecycle.sql"),
     },
+    // M22 A1: task capability grants — the child table that records a durable,
+    // human-approved, bounded authorization for an autonomous task fire to act.
+    Migration {
+        name: "030_task_grants",
+        sql: include_str!("../migrations/030_task_grants.sql"),
+    },
+    // M22 A3: first-class long-running goals — the durable objective the sweep
+    // drives against (`goals`), plus its append-only progress log
+    // (`goal_progress`). Indexes over the tasks scheduler + memory store; does
+    // not replace them (decision (d)).
+    Migration {
+        name: "031_goals",
+        sql: include_str!("../migrations/031_goals.sql"),
+    },
+    // M22 A4: durable HEARTBEAT-style condition/event check-ins + settable
+    // per-session flags. Revives the dormant `checks::condition_checkin` sweep
+    // by giving `IdleForAtLeastSecs` / `FlagSet` / `PendingInboundAtLeast`
+    // conditions a persistent home the sweep reloads each pass.
+    Migration {
+        name: "032_conditions",
+        sql: include_str!("../migrations/032_conditions.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -128,6 +150,14 @@ const SESSION_INBOUND: &[Migration] = &[
     Migration {
         name: "024_session_mcp_call_responses",
         sql: include_str!("../migrations/024_session_mcp_call_responses.sql"),
+    },
+    // F2: per-message crash accounting for poison-message quarantine. The
+    // host's crash-restart path increments `messages_in.crash_attempts` per
+    // in-flight message per crash and quarantines (terminal `status='failed'`)
+    // a message that crashes the runner K times.
+    Migration {
+        name: "033_messages_in_crash_attempts",
+        sql: include_str!("../migrations/033_messages_in_crash_attempts.sql"),
     },
 ];
 
@@ -303,6 +333,9 @@ mod tests {
             "outbound_dropped_messages",
             "container_configs",
             "tasks",
+            "task_grants",
+            "goals",
+            "goal_progress",
             "provider_profiles",
             "provider_health",
             "mcp_oauth_tokens",

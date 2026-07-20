@@ -40,6 +40,15 @@ use tokio::time::{Duration, Instant};
 /// "keeps running out of memory" `ErrorCard`.
 pub const OOM_CARD_THRESHOLD: u32 = 3;
 
+/// F2 safe-mode respawn: consecutive crashes in the current episode before
+/// the host spawns the runner in recovery mode (forcing aggressive
+/// history truncation at startup — see the runner's `recovery_mode`). Set
+/// higher than the first couple of backoff steps so a transient double-crash
+/// doesn't trip it, but low enough that a genuinely stuck session self-heals
+/// within a few minutes of backoff rather than looping on a flat curve
+/// forever (the 2026-07-18 incident, where the streak climbed past 15).
+pub const RECOVERY_MODE_STREAK: u32 = 5;
+
 /// Why a container crash-restarted, as classified from the runtime's
 /// exit-status inspection at capture time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +58,16 @@ pub enum CrashCause {
     /// memory-limited session container almost always means the OOM
     /// killer even when the flag is unset, e.g. cgroup-v2 child kills).
     OomKill,
+    /// The *host* was out of resources when the container died — the disk
+    /// probe reported free space below the failure floor at crash time.
+    ///
+    /// Added after 2026-07-18, where 235 crash-restarts were logged as
+    /// `cause="generic"` while the real cause was a full disk sitting
+    /// right there in a different log line (`StorageFull`, `SQLite` `disk
+    /// I/O error`). An operator reading the crash lines had no thread back
+    /// to the disk. This variant is that thread. It is never *guessed*:
+    /// it is set only when the probe actually read a full filesystem.
+    ResourceExhausted,
     /// Any other crash: stale heartbeat with a nonzero exit, an
     /// uninspectable/already-gone container, a runner panic, etc.
     Generic,
@@ -66,11 +85,31 @@ impl CrashCause {
         }
     }
 
+    /// Refine this cause with what the host's disk probe saw at crash
+    /// time. A [`Self::Generic`] crash on a box whose filesystem is below
+    /// the failure floor is almost certainly dying *of* the full disk, so
+    /// it is relabelled [`Self::ResourceExhausted`].
+    ///
+    /// [`Self::OomKill`] is deliberately NOT overridden: the memory
+    /// ceiling is both more specific and more actionable (raise
+    /// `memory_mb`), and a full disk does not make an OOM kill any less of
+    /// an OOM kill. And an exhausted disk is never *guessed* — this only
+    /// ever fires when a probe actually read a full filesystem.
+    #[must_use]
+    pub fn with_host_disk(self, disk_exhausted: bool) -> Self {
+        if disk_exhausted && self == Self::Generic {
+            Self::ResourceExhausted
+        } else {
+            self
+        }
+    }
+
     /// Stable lowercase token for logs (and the M1 metrics rider).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OomKill => "oom_kill",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::Generic => "generic",
         }
     }
@@ -177,6 +216,27 @@ impl CrashLoopTracker {
         }
     }
 
+    /// The current consecutive-crash streak for `session`, reset-aware:
+    /// returns `0` when the session has never crashed OR when the last crash
+    /// is older than [`HEALTHY_RESET_WINDOW`] (the episode has ended and a
+    /// fresh spawn earned its clean slate). Read at spawn time by the host's
+    /// runner-config assembly to decide whether to flip `recovery_mode` on
+    /// (F2 safe-mode respawn). Never mutates state — the actual reset is
+    /// applied lazily by the next [`Self::record_crash`].
+    #[must_use]
+    pub fn current_streak(&self, session: SessionId, now: Instant) -> u32 {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.get(&session) {
+            Some(entry) if now.duration_since(entry.last_crash) < HEALTHY_RESET_WINDOW => {
+                entry.streak
+            }
+            _ => 0,
+        }
+    }
+
     /// How much longer `session`'s respawn is deferred, or `None` when
     /// a spawn is allowed (never crashed, or the backoff elapsed).
     #[must_use]
@@ -244,6 +304,38 @@ mod tests {
         assert_eq!(
             tracker.spawn_delay_remaining(s, now + Duration::from_secs(5)),
             None
+        );
+    }
+
+    #[test]
+    fn current_streak_tracks_record_crash_and_resets_with_window() {
+        // F2: the recovery-mode decision reads this at spawn time.
+        let tracker = CrashLoopTracker::new();
+        let s = SessionId::new();
+        let now = t0();
+        // Never crashed: streak 0 → recovery mode stays off.
+        assert_eq!(tracker.current_streak(s, now), 0);
+        // Walk the streak up to the recovery threshold; each crash lands
+        // right when the previous backoff elapsed (inside the healthy
+        // window), so the streak accumulates.
+        let mut when = now;
+        for expect in 1..=RECOVERY_MODE_STREAK {
+            let rec = tracker.record_crash(s, CrashCause::Generic, when);
+            assert_eq!(tracker.current_streak(s, when), expect);
+            assert_eq!(rec.streak, expect);
+            when += rec.delay;
+        }
+        assert!(
+            tracker.current_streak(s, when) >= RECOVERY_MODE_STREAK,
+            "streak reached the recovery threshold"
+        );
+        // After the healthy window with no crash, the read reports 0 even
+        // though the entry still holds the old streak (reset is lazy).
+        let later = when + HEALTHY_RESET_WINDOW;
+        assert_eq!(
+            tracker.current_streak(s, later),
+            0,
+            "a healthy window ends the episode from the reader's view"
         );
     }
 
@@ -383,6 +475,34 @@ mod tests {
     #[test]
     fn crash_cause_tokens_are_stable() {
         assert_eq!(CrashCause::OomKill.as_str(), "oom_kill");
+        assert_eq!(CrashCause::ResourceExhausted.as_str(), "resource_exhausted");
         assert_eq!(CrashCause::Generic.as_str(), "generic");
+    }
+
+    #[test]
+    fn a_full_disk_relabels_generic_crashes_but_not_oom_kills() {
+        // The 2026-07-18 shape: 235 crashes logged `cause="generic"` while
+        // the box was out of disk. A generic crash on a full filesystem
+        // now names the disk.
+        assert_eq!(
+            CrashCause::Generic.with_host_disk(true),
+            CrashCause::ResourceExhausted
+        );
+        // Healthy disk: untouched. Exhaustion is never guessed.
+        assert_eq!(
+            CrashCause::Generic.with_host_disk(false),
+            CrashCause::Generic
+        );
+        // An OOM kill keeps its own (more specific, more actionable)
+        // classification even when the disk is also full.
+        assert_eq!(
+            CrashCause::OomKill.with_host_disk(true),
+            CrashCause::OomKill
+        );
+        // Idempotent — a second pass cannot re-label it into something else.
+        assert_eq!(
+            CrashCause::ResourceExhausted.with_host_disk(true),
+            CrashCause::ResourceExhausted
+        );
     }
 }

@@ -36,6 +36,7 @@
 //! - Item `id`s must be unique within the list (the validator rejects
 //!   duplicates so the renderer can use the id as a stable handle).
 
+use crate::vocab::{self, Vocabulary};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -95,14 +96,11 @@ impl TodoItemStatus {
 
     /// Plain-text glyph used by [`TodoList::to_text_fallback`].
     /// ASCII so it survives every channel's encoding without
-    /// substitution surprises.
+    /// substitution surprises. The literals live in the transcript
+    /// vocabulary ([`vocab::ASCII`]) — the single source of truth for
+    /// these strings (M22 A2); this delegates so the bytes cannot drift.
     pub fn glyph(self) -> &'static str {
-        match self {
-            Self::Pending => "[ ]",
-            Self::InProgress => "[~]",
-            Self::Blocked => "[!]",
-            Self::Completed => "[x]",
-        }
+        vocab::ASCII.todo.get(self)
     }
 }
 
@@ -321,11 +319,25 @@ impl TodoList {
     /// (1/3 done, 1 in progress, 1 pending)
     /// ```
     pub fn to_text_fallback(&self) -> String {
+        self.to_text_fallback_with(&vocab::ASCII)
+    }
+
+    /// [`Self::to_text_fallback`] parameterised over a transcript
+    /// [`Vocabulary`] (M22 A2). With [`vocab::ASCII`] the output is
+    /// byte-identical to the historical renderer; other bindings swap
+    /// the per-item status checkboxes.
+    ///
+    /// The `" — "` blocked-reason join stays hardcoded: `Layout`'s
+    /// `separator` is the status-line *field* joiner (`" | "` on ASCII),
+    /// not this em-dash reason join, so routing it through the vocabulary
+    /// would change bytes. It can move once `Layout` grows a slot with
+    /// the right granularity.
+    pub fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
         let mut out = String::with_capacity(64 + self.items.len() * 32);
         out.push_str(self.title_or_default());
         for item in &self.items {
             out.push('\n');
-            out.push_str(item.status.glyph());
+            out.push_str(vocab.todo.get(item.status));
             out.push(' ');
             out.push_str(item.text.trim());
             // Surface the one-line block reason inline so a stuck step is
@@ -674,6 +686,52 @@ mod tests {
         };
         let s = serde_json::to_string(&list).unwrap();
         assert!(!s.contains("title"), "title=None should not appear: {s}");
+    }
+
+    #[test]
+    fn glyph_literals_are_byte_identical_to_pre_vocab_output() {
+        // Hardcoded expected literals (NOT read through vocab — that
+        // would be circular) pinning `glyph()` after its M22 A2 rerouting
+        // through `vocab::ASCII.todo`.
+        assert_eq!(TodoItemStatus::Pending.glyph(), "[ ]");
+        assert_eq!(TodoItemStatus::InProgress.glyph(), "[~]");
+        assert_eq!(TodoItemStatus::Blocked.glyph(), "[!]");
+        assert_eq!(TodoItemStatus::Completed.glyph(), "[x]");
+    }
+
+    #[test]
+    fn text_fallback_with_ascii_is_byte_identical_to_pre_vocab_output() {
+        // The full expected string is a hardcoded literal of the exact
+        // pre-A2 output — byte-identity proof for the vocab rerouting.
+        let expected = "Kitchen\n\
+                        [x] Wash dishes\n\
+                        [~] Dry dishes\n\
+                        [ ] Put dishes away\n\
+                        (1/3 done, 1 in progress, 1 pending)";
+        assert_eq!(sample().to_text_fallback(), expected);
+        assert_eq!(
+            sample().to_text_fallback_with(&crate::vocab::ASCII),
+            expected
+        );
+    }
+
+    #[test]
+    fn text_fallback_with_ascii_blocked_is_byte_identical_to_pre_vocab_output() {
+        let list = TodoList {
+            items: vec![
+                item(1, "Wash dishes", TodoItemStatus::Completed),
+                blocked_item(2, "Deploy", "verify failed"),
+            ],
+            title: Some("Chores".into()),
+        };
+        // Pins the hardcoded " — " reason join alongside the vocab-driven
+        // glyphs (the em dash has no Layout slot; see to_text_fallback_with).
+        let expected = "Chores\n\
+                        [x] Wash dishes\n\
+                        [!] Deploy — verify failed\n\
+                        (1/2 done, 0 in progress, 1 blocked, 0 pending)";
+        assert_eq!(list.to_text_fallback(), expected);
+        assert_eq!(list.to_text_fallback_with(&crate::vocab::ASCII), expected);
     }
 
     #[test]

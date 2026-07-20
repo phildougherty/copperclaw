@@ -268,6 +268,48 @@ impl ToolLoopGuard {
     }
 }
 
+/// The smart auto-continue decision taken when one full budget "block" of
+/// soft-cap tool turns completes WITHOUT an earlier bail (the loop-breaker,
+/// per-task token ceiling, and parse-error cap all `return` out of the loop
+/// before we get here). Extracted as a pure function so the extend-vs-stop
+/// logic is exhaustively unit-testable independently of the async tool loop.
+///
+/// See [`budget_decision`] for the exact rule. The three variants map 1:1 to
+/// the three surfaced outcomes in [`drive_turn_inner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetDecision {
+    /// The block made real progress and the run is still below the hard
+    /// ceiling — extend the budget by another block, no operator interruption.
+    Continue,
+    /// The block completed a full soft-cap of turns with NO visible progress
+    /// (only reads/greps/globs or only errored calls) — stop and ask.
+    BailNoProgress,
+    /// The cumulative turn count reached the hard ceiling — stop and ask, even
+    /// if the block was making progress. The runaway backstop.
+    BailHardCeiling,
+}
+
+/// The extend-vs-stop rule for the smart auto-continue budget, evaluated once
+/// per completed block. `total` is the cumulative tool-turn count so far,
+/// `soft` the per-block cap, `hard` the absolute ceiling (`hard >= soft`
+/// always — the caller clamps), and `made_progress` whether THIS block ran at
+/// least one successful non-read-only tool call.
+///
+/// Order matters: the hard ceiling is checked FIRST so that reaching it stops
+/// the run even on a progressing block (bounding the worst-case total tool
+/// turns to exactly `hard`). Only below the ceiling does progress decide
+/// between extending and stopping.
+fn budget_decision(total: usize, soft: usize, hard: usize, made_progress: bool) -> BudgetDecision {
+    debug_assert!(hard >= soft, "hard ceiling must be >= soft cap");
+    if total >= hard {
+        BudgetDecision::BailHardCeiling
+    } else if made_progress {
+        BudgetDecision::Continue
+    } else {
+        BudgetDecision::BailNoProgress
+    }
+}
+
 /// Drive one inbound through to a final assistant response. Loops
 /// LLM-turn → execute-tools → LLM-turn until the model produces a
 /// turn with no `tool_use` blocks (or we hit `max_tool_turns`).
@@ -307,6 +349,10 @@ pub(super) async fn drive_turn_with_health(
     context_block: Option<&str>,
     health: &FailoverHealth,
 ) -> Result<TurnResult> {
+    // M22 B4: zero the live spend counters at inbound entry so the HUD's
+    // token/cost fields are per-task (the provider-call layer bumps them
+    // with every billed call from here on).
+    deps.spend.reset();
     // One Task HUD per inbound: posted at the first tool call, edited
     // in place around every tool batch (plus a wall-clock ticker), then
     // collapsed to a one-line summary here — on the failure paths too,
@@ -419,367 +465,486 @@ async fn drive_turn_inner(
         messages_in::max_seq(&g).unwrap_or(i64::MAX)
     };
 
-    for tool_turn in 0..deps.max_tool_turns.max(1) {
-        let output = run_llm_turn(
-            deps,
-            history,
-            continuation.as_deref(),
-            context_block,
-            hud,
-            health,
-        )
-        .await?;
-        continuation = output.continuation.or(continuation);
-        // Accumulate this round-trip's billed tokens before any
-        // early-return below so the per-task total reflects every call
-        // the provider charged for (including the turn that trips the
-        // ceiling). `failed` turns report 0 tokens, so this is a no-op
-        // on the error path.
-        task_tokens_spent = task_tokens_spent
-            .saturating_add(u64::from(output.input_tokens) + u64::from(output.output_tokens));
+    // Smart auto-continue budget. The SOFT cap (`deps.max_tool_turns`) is one
+    // "block". We keep looping block-by-block while the agent makes real
+    // progress, up to the HARD ceiling (`deps.max_tool_turns_hard`) — the
+    // runaway backstop that bounds the worst-case total tool turns for this
+    // inbound to EXACTLY `hard`, progress or not. `hard == soft` disables
+    // extension (the historical flat cap). The early bails inside the block
+    // (loop-breaker, per-task token ceiling, parse-error cap, provider failure,
+    // and the model's own final no-tool turn) all `return` out of BOTH loops
+    // unchanged — this budget only governs what happens when a FULL block of
+    // tool turns completes without any of those firing.
+    let soft = deps.max_tool_turns.max(1);
+    // Defensive floor: `resolve_max_tool_turns_hard` guarantees `hard >= soft`,
+    // but `minimal` and test literals set the field directly, so clamp here too
+    // — a `hard` below `soft` would otherwise bail before even one block
+    // completes.
+    let hard = deps.max_tool_turns_hard.max(soft);
+    let mut total_turns: usize = 0;
+    'blocks: loop {
+        // Per-block progress latch. Set true by the batch-results loop below
+        // when a successful non-read-only tool call runs (real work, as opposed
+        // to a block of only reads/greps/globs or only errored calls). Reset
+        // fresh at the top of every block.
+        let mut made_progress = false;
+        // Never run past the hard ceiling: the final (possibly short) block is
+        // clamped so `total_turns` reaches AT MOST `hard`. This is what bounds
+        // the absolute worst-case tool-turn count for the inbound.
+        let block_end = total_turns.saturating_add(soft).min(hard);
+        while total_turns < block_end {
+            // 0-based cumulative tool-turn index (across blocks) — preserves the
+            // historical `tool_turn` log-field / mid-message-persist semantics.
+            let tool_turn = total_turns;
+            total_turns += 1;
+            let output = run_llm_turn(
+                deps,
+                history,
+                continuation.as_deref(),
+                context_block,
+                hud,
+                health,
+            )
+            .await?;
+            continuation = output.continuation.or(continuation);
+            // Accumulate this round-trip's billed tokens before any
+            // early-return below so the per-task total reflects every call
+            // the provider charged for (including the turn that trips the
+            // ceiling). `failed` turns report 0 tokens, so this is a no-op
+            // on the error path.
+            task_tokens_spent = task_tokens_spent
+                .saturating_add(u64::from(output.input_tokens) + u64::from(output.output_tokens));
 
-        if output.failed {
-            // Preserve the site-specific reason from provider_call if
-            // it filled one in; otherwise fall back to the generic
-            // wording. Only the generic path reaches the user-visible
-            // apology when no inner detail was available.
-            let reason = if output.failure_reason.is_empty() {
-                "the model's provider call did not return a complete response".into()
-            } else {
-                output.failure_reason
-            };
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed(reason),
-                blocker: None,
-            });
-        }
-
-        // Append the model's assistant turn (text + tool_use blocks)
-        // to history before deciding what to do next. Anthropic's
-        // serializer coalesces consecutive same-role entries, so
-        // Assistant{text} + ToolUse{...} round-trip as one
-        // multi-block assistant message.
-        if !output.text.is_empty() {
-            history.push(HistoryMessage::Assistant {
-                content: output.text.clone(),
-            });
-        }
-        for call in &output.tool_calls {
-            history.push(HistoryMessage::ToolUse {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                input: call.input.clone(),
-            });
-        }
-
-        // No tools requested → this is the final answer for the
-        // inbound. Surface the text to the channel and return.
-        if output.tool_calls.is_empty() {
-            // Empty-reply guard: model returned NO tool calls AND NO
-            // text. Without this guard the runner exits silently and
-            // the user sees no response at all — caught live on
-            // 2026-05-24 with `deepseek/deepseek-v4-flash` + effort=high,
-            // where the model returned an HTTP 200 with zero output
-            // tokens. Flip to Failed so `emit_terminal_failure_apologies`
-            // surfaces an ErrorCard to the originating channel instead.
-            if output.text.is_empty() {
-                tracing::warn!(
-                    target: "copperclaw_runner",
-                    provider = %deps.provider.name(),
-                    model = %deps.model,
-                    "model returned empty reply (no text, no tool call); \
-                     surfacing as terminal failure"
-                );
+            if output.failed {
+                // Preserve the site-specific reason from provider_call if
+                // it filled one in; otherwise fall back to the generic
+                // wording. Only the generic path reaches the user-visible
+                // apology when no inner detail was available.
+                let reason = if output.failure_reason.is_empty() {
+                    "the model's provider call did not return a complete response".into()
+                } else {
+                    output.failure_reason
+                };
                 return Ok(TurnResult {
                     continuation,
-                    outcome: TurnOutcome::Failed(
-                        "the model returned an empty reply — no text and no \
+                    outcome: TurnOutcome::Failed(reason),
+                    blocker: None,
+                });
+            }
+
+            // Append the model's assistant turn (text + tool_use blocks)
+            // to history before deciding what to do next. Anthropic's
+            // serializer coalesces consecutive same-role entries, so
+            // Assistant{text} + ToolUse{...} round-trip as one
+            // multi-block assistant message.
+            if !output.text.is_empty() {
+                history.push(HistoryMessage::Assistant {
+                    content: output.text.clone(),
+                });
+            }
+            for call in &output.tool_calls {
+                history.push(HistoryMessage::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                });
+            }
+
+            // No tools requested → this is the final answer for the
+            // inbound. Surface the text to the channel and return.
+            if output.tool_calls.is_empty() {
+                // Empty-reply guard: model returned NO tool calls AND NO
+                // text. Without this guard the runner exits silently and
+                // the user sees no response at all — caught live on
+                // 2026-05-24 with `deepseek/deepseek-v4-flash` + effort=high,
+                // where the model returned an HTTP 200 with zero output
+                // tokens. Flip to Failed so `emit_terminal_failure_apologies`
+                // surfaces an ErrorCard to the originating channel instead.
+                if output.text.is_empty() {
+                    tracing::warn!(
+                        target: "copperclaw_runner",
+                        provider = %deps.provider.name(),
+                        model = %deps.model,
+                        "model returned empty reply (no text, no tool call); \
+                         surfacing as terminal failure"
+                    );
+                    return Ok(TurnResult {
+                        continuation,
+                        outcome: TurnOutcome::Failed(
+                            "the model returned an empty reply — no text and no \
                          tool call. This usually means the model id is \
                          wrong, the provider's response was malformed, or a \
                          reasoning model produced only thinking tokens. Try \
                          a different model or lower the reasoning effort."
-                            .to_string(),
-                    ),
-                    blocker: None,
-                });
-            }
-            // M18 R6: progressive final answers. On a rich (edit-capable)
-            // channel, for a turn that already ran long (>30s), reveal a
-            // long final answer by growing the message via in-place edits
-            // instead of one terminal emit — the H1 HUD covers "something
-            // is happening" during the build; this relieves the wait for
-            // the *answer* itself. `answer` is the reasoning-stripped text
-            // the user actually sees (what `apply_send_message` would
-            // produce), so the gate measures the real length. Every other
-            // case (bare adapter, sub-30s turn, short/huge answer) falls
-            // through to today's single terminal emit, byte-identical.
-            let answer = crate::tools::strip_reasoning_blocks(&output.text);
-            let progressive_ag = deps.agent_group_id.to_string();
-            if super::progressive::should_grow(hud.answer_edit_capable(), hud.elapsed(), &answer) {
-                copperclaw_metrics::inc_progressive_final(&progressive_ag, "grown");
-                copperclaw_metrics::observe_progressive_final_answer_chars(
-                    answer.chars().count() as u64
-                );
-                super::progressive::grow_final_answer(
-                    deps,
-                    answer,
-                    super::progressive::STEP_INTERVAL,
-                )
-                .await?;
+                                .to_string(),
+                        ),
+                        blocker: None,
+                    });
+                }
+                // M18 R6: progressive final answers. On a rich (edit-capable)
+                // channel, for a turn that already ran long (>30s), reveal a
+                // long final answer by growing the message via in-place edits
+                // instead of one terminal emit — the H1 HUD covers "something
+                // is happening" during the build; this relieves the wait for
+                // the *answer* itself. `answer` is the reasoning-stripped text
+                // the user actually sees (what `apply_send_message` would
+                // produce), so the gate measures the real length. Every other
+                // case (bare adapter, sub-30s turn, short/huge answer) falls
+                // through to today's single terminal emit, byte-identical.
+                let answer = crate::tools::strip_reasoning_blocks(&output.text);
+                let progressive_ag = deps.agent_group_id.to_string();
+                if super::progressive::should_grow(
+                    hud.answer_edit_capable(),
+                    hud.elapsed(),
+                    &answer,
+                ) {
+                    copperclaw_metrics::inc_progressive_final(&progressive_ag, "grown");
+                    copperclaw_metrics::observe_progressive_final_answer_chars(
+                        answer.chars().count() as u64,
+                    );
+                    super::progressive::grow_final_answer(
+                        deps,
+                        answer,
+                        super::progressive::STEP_INTERVAL,
+                    )
+                    .await?;
+                    return Ok(TurnResult {
+                        continuation,
+                        outcome: TurnOutcome::Done,
+                        blocker: None,
+                    });
+                }
+                copperclaw_metrics::inc_progressive_final(&progressive_ag, "single_emit");
+                if let Some(reason) = super::progressive::grow_skip_reason(
+                    hud.answer_edit_capable(),
+                    hud.elapsed(),
+                    &answer,
+                ) {
+                    copperclaw_metrics::inc_progressive_final_skipped(reason);
+                }
+                let spec = copperclaw_mcp::SendMessageSpec {
+                    to: None,
+                    text: output.text,
+                };
+                let _ack = deps
+                    .tool_ctx
+                    .emit_outbound(copperclaw_mcp::OutboundToolEffect::SendMessage(spec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send_message failed: {e}"))?;
                 return Ok(TurnResult {
                     continuation,
                     outcome: TurnOutcome::Done,
                     blocker: None,
                 });
             }
-            copperclaw_metrics::inc_progressive_final(&progressive_ag, "single_emit");
-            if let Some(reason) = super::progressive::grow_skip_reason(
-                hud.answer_edit_capable(),
-                hud.elapsed(),
-                &answer,
-            ) {
-                copperclaw_metrics::inc_progressive_final_skipped(reason);
+
+            // Track whether THIS turn included any synthetic
+            // parse-error tool calls. We bump the counter now but defer
+            // the cap check until after pushing tool_results into history
+            // so the audit trail captures all attempts (the model never
+            // sees the third turn's results, but the persisted history
+            // shows three full parse-error cycles for ops review).
+            let turn_had_parse_error = output.tool_calls.iter().any(|c| c.parse_error.is_some());
+            if turn_had_parse_error {
+                consecutive_parse_error_turns += 1;
+            } else {
+                consecutive_parse_error_turns = 0;
             }
-            let spec = copperclaw_mcp::SendMessageSpec {
-                to: None,
-                text: output.text,
-            };
-            let _ack = deps
-                .tool_ctx
-                .emit_outbound(copperclaw_mcp::OutboundToolEffect::SendMessage(spec))
-                .await
-                .map_err(|e| anyhow::anyhow!("send_message failed: {e}"))?;
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Done,
-                blocker: None,
-            });
-        }
 
-        // Track whether THIS turn included any synthetic
-        // parse-error tool calls. We bump the counter now but defer
-        // the cap check until after pushing tool_results into history
-        // so the audit trail captures all attempts (the model never
-        // sees the third turn's results, but the persisted history
-        // shows three full parse-error cycles for ops review).
-        let turn_had_parse_error = output.tool_calls.iter().any(|c| c.parse_error.is_some());
-        if turn_had_parse_error {
-            consecutive_parse_error_turns += 1;
-        } else {
-            consecutive_parse_error_turns = 0;
-        }
-
-        // Tools requested → execute each, push the result as a
-        // user-role tool_result history entry, and loop into
-        // another LLM turn.
-        tracing::info!(
-            tool_turn,
-            n = output.tool_calls.len(),
-            "executing tool calls"
-        );
-        // Content-loop guard runs against the whole batch BEFORE spawning
-        // — it is a purely sequential, ordering-sensitive check on the
-        // model-requested `(name, args)` fingerprints and must not race
-        // with tool execution. Preserve the original semantics exactly:
-        // observe each non-parse-error call in original order and keep the
-        // FIRST pattern that trips; stop observing once tripped so the
-        // trailing window isn't polluted by calls past the trip point.
-        // Parse-error synthetic calls (input is Null) are skipped here and
-        // bounded instead by the parse-error cap below.
-        //
-        // Set when the content-loop breaker trips: we still execute +
-        // persist the current batch (so the audit history is complete)
-        // before bailing.
-        let mut tripped_loop: Option<LoopPattern> = None;
-        for call in &output.tool_calls {
-            if call.parse_error.is_none() && tripped_loop.is_none() {
-                tripped_loop = loop_guard.observe(&call.name, &call.input);
-            }
-        }
-
-        // Task HUD: show the batch as Running before it executes (this
-        // posts the HUD on the first tool call of the inbound).
-        hud.on_batch_start(&output.tool_calls).await;
-
-        // Execute the batch concurrently, then append results to history
-        // in the ORIGINAL call order. Independent calls (e.g. N read_file)
-        // finish in ~max(latency) instead of ~sum. Ordering-preserving
-        // append keeps transcripts deterministic and tool_use/tool_result
-        // pairing intact regardless of completion order. `shell` calls and
-        // same-path edit-family calls are serialised inside the batch (see
-        // `execute_tool_batch`) because they mutate shared state.
-        let batch = execute_tool_batch(deps, &output.tool_calls).await;
-        let mut batch_all_ok = true;
-        for (call, (content, images, is_error)) in output.tool_calls.iter().zip(batch) {
-            cumulative_tool_runs += 1;
-            last_tool_name = Some(call.name.clone());
-            if call.name == "ui_screenshot" {
-                *ui_screenshot_calls += 1;
-            }
-            batch_all_ok &= !is_error;
-            if is_error {
-                // The error text otherwise lives only in the model-facing
-                // tool_result (gone after compaction) — the HUD breadcrumb
-                // renders "last: <tool> failed" with no reason, so this is
-                // the one operator-visible record of WHY a tool failed.
-                let reason: String = content.chars().take(240).collect();
-                tracing::warn!(tool_turn, tool = %call.name, reason, "tool call failed");
-            }
-            // F2: fold this result into the tail-run tracker in call
-            // order — a run of same-blocker denials at the tail of a
-            // silent turn surfaces one curated wall card at finalize.
-            blocker_run.observe(&call.name, is_error, &content);
-            history.push(HistoryMessage::Tool {
-                tool_use_id: call.id.clone(),
-                content,
-                is_error,
-            });
-            // A tool that returned image content (e.g. `view_image`)
-            // surfaces it as follow-on Image entries so vision models see
-            // the pixels. The anthropic serializer puts each in its own
-            // user message, so it never mixes with the tool_result block.
-            for (media_type, data) in images {
-                history.push(HistoryMessage::Image { media_type, data });
-            }
-        }
-
-        // Persisted mid-message so a crash here (OOM, panic, container
-        // kill) doesn't lose the prior tool turns: without this the
-        // respawned runner would re-pick the same inbound and start
-        // from the pre-message history, repeating every tool call.
-        // Failure to save is warn-and-continue — the next iteration or
-        // the end-of-message save_state in run_loop will retry.
-        persist_mid_message(deps, history, continuation.as_deref(), tool_turn).await;
-
-        // Task HUD: fold the finished batch into the one self-editing
-        // status message (edit-capable channels), or surface the legacy
-        // periodic "still working" status row when the silent stretch
-        // exceeds its 60s budget (bare channels / hud_mode=off).
-        hud.on_batch_end(
-            cumulative_tool_runs,
-            last_tool_name.as_deref(),
-            batch_all_ok,
-        )
-        .await;
-
-        // M18 R2: mid-turn interruption + steering. This is the natural
-        // cooperative point between tool batches — checked before the
-        // loop-breaker / parse-error / budget bails below so an explicit
-        // user `/stop` always wins even if the model also happened to
-        // spin in the same batch. A `/stop` control row ends the turn
-        // right here; a new human Chat row is folded into the transcript
-        // as an interjection and the loop continues. Anything else
-        // peeked (a scheduled Task fire, another agent's dispatch) is
-        // left untouched — it stays `pending` and the next `run_loop`
-        // poll picks it up normally once this inbound resolves.
-        if let Some(stopped) =
-            check_mid_turn_steering(deps, history, known_seq_ceiling, cumulative_tool_runs, hud)
-                .await?
-        {
-            return Ok(TurnResult {
-                continuation,
-                outcome: stopped,
-                blocker: None,
-            });
-        }
-
-        // Content-loop circuit breaker. After persisting this turn's
-        // tool_results (so the audit history shows the full degenerate
-        // run), bail if the model has spun on the same call or
-        // oscillated between two. Emits a metric + an audit-grade
-        // tracing::error! and surfaces a clear apology reason.
-        if let Some(pattern) = tripped_loop {
-            copperclaw_metrics::inc_tool_loop_breaker(
-                &deps.agent_group_id.as_uuid().to_string(),
-                pattern.metric_label(),
-            );
-            tracing::error!(
-                target: "copperclaw_runner",
-                agent_group_id = %deps.agent_group_id,
-                session_id = %deps.session_id,
-                pattern = pattern.metric_label(),
-                threshold = TOOL_LOOP_BREAKER_THRESHOLD,
-                last_tool = last_tool_name.as_deref().unwrap_or("?"),
-                "tool-call loop breaker tripped; terminating inbound",
-            );
-            let reason = match pattern {
-                LoopPattern::Identical => format!(
-                    "the agent got stuck repeating the same `{}` tool call {TOOL_LOOP_BREAKER_THRESHOLD} times in a row without making progress",
-                    last_tool_name.as_deref().unwrap_or("tool"),
-                ),
-                LoopPattern::PingPong => format!(
-                    "the agent got stuck alternating between two tool calls {TOOL_LOOP_BREAKER_THRESHOLD} times without making progress"
-                ),
-            };
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed(reason),
-                blocker: None,
-            });
-        }
-
-        // After pushing the tool_results, enforce the parse-error cap.
-        // Three consecutive turns of malformed tool_use JSON means
-        // the model is stuck — fall through to the existing terminal
-        // failure path so the user sees the apology row.
-        if consecutive_parse_error_turns >= MAX_TOOL_PARSE_ERROR_ATTEMPTS {
-            tracing::error!(
-                attempts = consecutive_parse_error_turns,
-                "{MAX_TOOL_PARSE_ERROR_ATTEMPTS} consecutive tool_use parse failures; bailing",
-            );
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed(format!(
-                    "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
-                )),
-                blocker: None,
-            });
-        }
-
-        // Per-task cost ceiling. We only reach here when the turn
-        // produced tool calls and is about to loop again, so the check
-        // sits on the runaway path: a token-heavy loop that re-reads a
-        // big context burns the budget here even when it would never hit
-        // `max_tool_turns`. `0` disables the ceiling. Fires a metrics
-        // trip + ERROR log (the audit narrative) and falls through to
-        // the existing terminal-failure path so `finalize_messages`
-        // marks the inbound failed and the user sees the surfaced
-        // "task budget reached" reason on the apology row. Independent
-        // of the per-day group cap (spawn-time gate) and the parse-error
-        // / max-turns breakers above.
-        if deps.max_task_tokens > 0 && task_tokens_spent >= deps.max_task_tokens {
-            tracing::error!(
-                agent_group_id = %deps.agent_group_id,
-                session_id = %deps.session_id,
-                tokens_spent = task_tokens_spent,
-                ceiling = deps.max_task_tokens,
+            // Tools requested → execute each, push the result as a
+            // user-role tool_result history entry, and loop into
+            // another LLM turn.
+            tracing::info!(
                 tool_turn,
-                "per-task token budget reached; aborting tool loop"
+                n = output.tool_calls.len(),
+                "executing tool calls"
             );
-            copperclaw_metrics::inc_task_budget_exhausted(&deps.agent_group_id.to_string());
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed(format!(
-                    "task budget reached: {task_tokens_spent} tokens; stopping"
-                )),
-                blocker: None,
-            });
+            // Content-loop guard runs against the whole batch BEFORE spawning
+            // — it is a purely sequential, ordering-sensitive check on the
+            // model-requested `(name, args)` fingerprints and must not race
+            // with tool execution. Preserve the original semantics exactly:
+            // observe each non-parse-error call in original order and keep the
+            // FIRST pattern that trips; stop observing once tripped so the
+            // trailing window isn't polluted by calls past the trip point.
+            // Parse-error synthetic calls (input is Null) are skipped here and
+            // bounded instead by the parse-error cap below.
+            //
+            // Set when the content-loop breaker trips: we still execute +
+            // persist the current batch (so the audit history is complete)
+            // before bailing.
+            let mut tripped_loop: Option<LoopPattern> = None;
+            for call in &output.tool_calls {
+                if call.parse_error.is_none() && tripped_loop.is_none() {
+                    tripped_loop = loop_guard.observe(&call.name, &call.input);
+                }
+            }
+
+            // Task HUD: show the batch as Running before it executes (this
+            // posts the HUD on the first tool call of the inbound).
+            hud.on_batch_start(&output.tool_calls).await;
+
+            // Execute the batch concurrently, then append results to history
+            // in the ORIGINAL call order. Independent calls (e.g. N read_file)
+            // finish in ~max(latency) instead of ~sum. Ordering-preserving
+            // append keeps transcripts deterministic and tool_use/tool_result
+            // pairing intact regardless of completion order. `shell` calls and
+            // same-path edit-family calls are serialised inside the batch (see
+            // `execute_tool_batch`) because they mutate shared state.
+            let batch = execute_tool_batch(deps, &output.tool_calls).await;
+            let mut batch_all_ok = true;
+            for (call, (content, images, is_error)) in output.tool_calls.iter().zip(batch) {
+                cumulative_tool_runs += 1;
+                last_tool_name = Some(call.name.clone());
+                if call.name == "ui_screenshot" {
+                    *ui_screenshot_calls += 1;
+                }
+                batch_all_ok &= !is_error;
+                // Smart auto-continue progress signal: a SUCCESSFUL, non-read-only
+                // tool call is real work (an edit / write / shell / todo update /
+                // …), so it earns this block a budget extension past the soft cap.
+                // Read-only calls (read_file / grep / glob / git inspect / list
+                // verbs — see `crate::policy::READONLY_TOOLS`) and errored calls do
+                // NOT count: a block of only those is "no visible progress" and
+                // stops-and-asks at the soft cap. Parse-error synthetic calls report
+                // `is_error == true`, so they're excluded here and bounded by the
+                // parse-error cap instead.
+                if !is_error && !crate::policy::is_readonly_tool(&call.name) {
+                    made_progress = true;
+                }
+                if is_error {
+                    // The error text otherwise lives only in the model-facing
+                    // tool_result (gone after compaction) — the HUD breadcrumb
+                    // renders "last: <tool> failed" with no reason, so this is
+                    // the one operator-visible record of WHY a tool failed.
+                    let reason: String = content.chars().take(240).collect();
+                    tracing::warn!(tool_turn, tool = %call.name, reason, "tool call failed");
+                }
+                // M22 B5: fold the completed call into the HUD's bounded
+                // step transcript (tool name, arg summary, result line,
+                // done/failed) so the next frame's `steps` carry it.
+                hud.record_step(&call.name, &call.input, &content, is_error);
+                // F2: fold this result into the tail-run tracker in call
+                // order — a run of same-blocker denials at the tail of a
+                // silent turn surfaces one curated wall card at finalize.
+                blocker_run.observe(&call.name, is_error, &content);
+                history.push(HistoryMessage::Tool {
+                    tool_use_id: call.id.clone(),
+                    content,
+                    is_error,
+                });
+                // A tool that returned image content (e.g. `view_image`)
+                // surfaces it as follow-on Image entries so vision models see
+                // the pixels. The anthropic serializer puts each in its own
+                // user message, so it never mixes with the tool_result block.
+                for (media_type, data) in images {
+                    history.push(HistoryMessage::Image { media_type, data });
+                }
+            }
+
+            // Persisted mid-message so a crash here (OOM, panic, container
+            // kill) doesn't lose the prior tool turns: without this the
+            // respawned runner would re-pick the same inbound and start
+            // from the pre-message history, repeating every tool call.
+            // Failure to save is warn-and-continue — the next iteration or
+            // the end-of-message save_state in run_loop will retry.
+            persist_mid_message(deps, history, continuation.as_deref(), tool_turn).await;
+
+            // Task HUD: fold the finished batch into the one self-editing
+            // status message (edit-capable channels), or surface the legacy
+            // periodic "still working" status row when the silent stretch
+            // exceeds its 60s budget (bare channels / hud_mode=off).
+            hud.on_batch_end(
+                cumulative_tool_runs,
+                last_tool_name.as_deref(),
+                batch_all_ok,
+            )
+            .await;
+
+            // M18 R2: mid-turn interruption + steering. This is the natural
+            // cooperative point between tool batches — checked before the
+            // loop-breaker / parse-error / budget bails below so an explicit
+            // user `/stop` always wins even if the model also happened to
+            // spin in the same batch. A `/stop` control row ends the turn
+            // right here; a new human Chat row is folded into the transcript
+            // as an interjection and the loop continues. Anything else
+            // peeked (a scheduled Task fire, another agent's dispatch) is
+            // left untouched — it stays `pending` and the next `run_loop`
+            // poll picks it up normally once this inbound resolves.
+            if let Some(stopped) =
+                check_mid_turn_steering(deps, history, known_seq_ceiling, cumulative_tool_runs, hud)
+                    .await?
+            {
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: stopped,
+                    blocker: None,
+                });
+            }
+
+            // Content-loop circuit breaker. After persisting this turn's
+            // tool_results (so the audit history shows the full degenerate
+            // run), bail if the model has spun on the same call or
+            // oscillated between two. Emits a metric + an audit-grade
+            // tracing::error! and surfaces a clear apology reason.
+            if let Some(pattern) = tripped_loop {
+                copperclaw_metrics::inc_tool_loop_breaker(
+                    &deps.agent_group_id.as_uuid().to_string(),
+                    pattern.metric_label(),
+                );
+                tracing::error!(
+                    target: "copperclaw_runner",
+                    agent_group_id = %deps.agent_group_id,
+                    session_id = %deps.session_id,
+                    pattern = pattern.metric_label(),
+                    threshold = TOOL_LOOP_BREAKER_THRESHOLD,
+                    last_tool = last_tool_name.as_deref().unwrap_or("?"),
+                    "tool-call loop breaker tripped; terminating inbound",
+                );
+                let reason = match pattern {
+                    LoopPattern::Identical => format!(
+                        "the agent got stuck repeating the same `{}` tool call {TOOL_LOOP_BREAKER_THRESHOLD} times in a row without making progress",
+                        last_tool_name.as_deref().unwrap_or("tool"),
+                    ),
+                    LoopPattern::PingPong => format!(
+                        "the agent got stuck alternating between two tool calls {TOOL_LOOP_BREAKER_THRESHOLD} times without making progress"
+                    ),
+                };
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Failed(reason),
+                    blocker: None,
+                });
+            }
+
+            // After pushing the tool_results, enforce the parse-error cap.
+            // Three consecutive turns of malformed tool_use JSON means
+            // the model is stuck — fall through to the existing terminal
+            // failure path so the user sees the apology row.
+            if consecutive_parse_error_turns >= MAX_TOOL_PARSE_ERROR_ATTEMPTS {
+                tracing::error!(
+                    attempts = consecutive_parse_error_turns,
+                    "{MAX_TOOL_PARSE_ERROR_ATTEMPTS} consecutive tool_use parse failures; bailing",
+                );
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Failed(format!(
+                        "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
+                    )),
+                    blocker: None,
+                });
+            }
+
+            // Per-task cost ceiling. We only reach here when the turn
+            // produced tool calls and is about to loop again, so the check
+            // sits on the runaway path: a token-heavy loop that re-reads a
+            // big context burns the budget here even when it would never hit
+            // `max_tool_turns`. `0` disables the ceiling. Fires a metrics
+            // trip + ERROR log (the audit narrative) and falls through to
+            // the existing terminal-failure path so `finalize_messages`
+            // marks the inbound failed and the user sees the surfaced
+            // "task budget reached" reason on the apology row. Independent
+            // of the per-day group cap (spawn-time gate) and the parse-error
+            // / max-turns breakers above.
+            if deps.max_task_tokens > 0 && task_tokens_spent >= deps.max_task_tokens {
+                tracing::error!(
+                    agent_group_id = %deps.agent_group_id,
+                    session_id = %deps.session_id,
+                    tokens_spent = task_tokens_spent,
+                    ceiling = deps.max_task_tokens,
+                    tool_turn,
+                    "per-task token budget reached; aborting tool loop"
+                );
+                copperclaw_metrics::inc_task_budget_exhausted(&deps.agent_group_id.to_string());
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Failed(format!(
+                        "task budget reached: {task_tokens_spent} tokens; stopping"
+                    )),
+                    blocker: None,
+                });
+            }
+        }
+
+        // A full block (or the hard-clamped tail block) completed without any
+        // earlier bail. Decide whether to extend the budget or stop and ask —
+        // see `budget_decision`. This is the ONLY place the smart auto-continue
+        // logic governs the run; every genuine tight-loop / cost / stuck-parsing
+        // bail already returned out of the loop above, before this point.
+        match budget_decision(total_turns, soft, hard, made_progress) {
+            BudgetDecision::BailHardCeiling => {
+                // Runaway backstop. Distinct from the no-progress stop: the
+                // agent may well be productive, but the absolute ceiling is the
+                // hard cost/duration bound for a single inbound, so we
+                // checkpoint and hand control back to the operator. ERROR
+                // because hitting this is notable and worth an audit line.
+                tracing::error!(
+                    target: "copperclaw_runner",
+                    agent_group_id = %deps.agent_group_id,
+                    session_id = %deps.session_id,
+                    total_turns,
+                    soft,
+                    hard,
+                    "tool-turn hard ceiling reached; stopping and asking to continue"
+                );
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Failed(format!(
+                        "stopped after {total_turns} tool turns (hit the {hard} hard ceiling) — send 'continue' to keep going"
+                    )),
+                    blocker: None,
+                });
+            }
+            BudgetDecision::Continue => {
+                // The agent made real progress this block and is under the hard
+                // ceiling — extend by another block silently (no operator
+                // interruption). `made_progress` resets at the top of the next
+                // iteration.
+                //
+                // M22 B2: surface the extension as a one-shot HUD note (the
+                // next live frame renders it once), NOT a chat row — a chat
+                // row here would be a periodic "still working" message under
+                // another name. Gated on `total_turns >= soft` (always true
+                // at this point, kept explicit) so the common short run —
+                // which returns out of the block before ever reaching this
+                // arm — stays byte-stable.
+                if total_turns >= soft {
+                    hud.add_note(&format!(
+                        "extended tool budget ({total_turns}/{hard} turns)"
+                    ));
+                }
+                tracing::debug!(
+                    target: "copperclaw_runner",
+                    total_turns,
+                    soft,
+                    hard,
+                    "extending tool-turn budget; agent is making progress"
+                );
+                continue 'blocks;
+            }
+            BudgetDecision::BailNoProgress => {
+                // A full block ran with no successful mutating/action tool call
+                // — the agent is spinning on reads or erroring out. Stop and ask
+                // rather than burn more budget. WARN (not ERROR): an ordinary
+                // "it got stuck, nudge it" checkpoint, not a runaway.
+                tracing::warn!(
+                    target: "copperclaw_runner",
+                    agent_group_id = %deps.agent_group_id,
+                    session_id = %deps.session_id,
+                    total_turns,
+                    soft,
+                    hard,
+                    "tool-turn block completed with no visible progress; stopping and asking to continue"
+                );
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Failed(format!(
+                        "stopped after {total_turns} tool turns with no visible progress — send 'continue' or a smaller step"
+                    )),
+                    blocker: None,
+                });
+            }
         }
     }
-
-    // Exhausted the cap. Push a synthetic system message so the
-    // model can see what happened on the next inbound, return
-    // Failed so finalize_messages marks the inbound that way too.
-    let cap = deps.max_tool_turns;
-    tracing::warn!(max = cap, "tool-use cycle exceeded max turns; bailing");
-    Ok(TurnResult {
-        continuation,
-        outcome: TurnOutcome::Failed(format!(
-            "the agent ran out of turns after {cap} tool calls without finishing the task"
-        )),
-        blocker: None,
-    })
 }
 
 /// M18 R2: peek `inbound.db` for rows that arrived strictly after
@@ -1608,6 +1773,206 @@ mod execute_tool_batch_tests {
         assert_eq!(log.lock().unwrap().len(), 2, "1 start + 1 end");
     }
 
+    // ----- smart auto-continue (progress-gated tool-turn budget) -----------
+
+    /// N scripted turns, each requesting ONE call to `tool` with DISTINCT args
+    /// (so the content-loop breaker never trips). No final text turn — callers
+    /// append one when they want the run to finish, or omit it to drive the
+    /// budget to a stop.
+    fn budget_turns(tool: &str, n: usize) -> Vec<Vec<ProviderEvent>> {
+        (0..n)
+            .map(|i| {
+                vec![ProviderEvent::ToolCall {
+                    id: format!("tu_{i}"),
+                    name: tool.into(),
+                    input: serde_json::json!({"id": format!("c{i}"), "delay_ms": 0}),
+                }]
+            })
+            .collect()
+    }
+
+    fn count_tool_results(history: &[HistoryMessage]) -> usize {
+        history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::Tool { .. }))
+            .count()
+    }
+
+    /// Test (a): a run that makes progress every block EXTENDS past the soft
+    /// cap and runs until it finishes (soft=3, hard=12; 7 progressing turns +
+    /// a final text turn). `write_file` is non-read-only, so every block scores
+    /// progress and the budget extends silently — the old flat cap of 3 would
+    /// have bailed after 3 turns.
+    #[tokio::test]
+    async fn progress_every_block_extends_past_soft_cap_until_done() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut scripts = budget_turns("write_file", 7);
+        scripts.push(vec![ProviderEvent::Result {
+            text: Some("all done".into()),
+        }]);
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("write_file", Box::new(SlowEcho { tracker, log }))],
+            scripts,
+        );
+        deps.max_tool_turns = 3;
+        deps.max_tool_turns_hard = 12;
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(
+            matches!(result.outcome, TurnOutcome::Done),
+            "a progressing run must finish, not bail: {result:?}"
+        );
+        assert_eq!(
+            count_tool_results(&history),
+            7,
+            "the run must extend past the soft cap of 3 and complete all 7 progressing turns"
+        );
+    }
+
+    /// Test (b): a block with NO progress (only successful read-only calls)
+    /// bails at the soft cap with the no-progress message (soft=3, hard=12).
+    /// Distinct args keep the loop-breaker quiet, so the ONLY thing that stops
+    /// the run is the no-progress budget decision after one full block.
+    #[tokio::test]
+    async fn no_progress_block_bails_at_soft_cap() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        // read_file is read-only → no progress. Supply more turns than the
+        // soft cap to prove the bail (not a script exhaustion) ends the run.
+        let scripts = budget_turns("read_file", 8);
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("read_file", Box::new(SlowEcho { tracker, log }))],
+            scripts,
+        );
+        deps.max_tool_turns = 3;
+        deps.max_tool_turns_hard = 12;
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        let TurnOutcome::Failed(reason) = result.outcome else {
+            panic!("a no-progress block must bail: {result:?}");
+        };
+        assert!(
+            reason.contains("no visible progress"),
+            "no-progress bail must surface the distinct message; got: {reason}"
+        );
+        assert_eq!(
+            count_tool_results(&history),
+            3,
+            "must bail at exactly the soft cap of 3, not extend on read-only turns"
+        );
+    }
+
+    /// Test (c): reaching the hard ceiling bails with the hard-ceiling message
+    /// EVEN while progressing (soft=3, hard=6; every turn writes). Block 1 (3
+    /// turns) extends, block 2 hits total==6==hard and stops — the runaway
+    /// backstop firing on a productive-looking run.
+    #[tokio::test]
+    async fn hard_ceiling_bails_even_while_progressing() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        // Plenty of progressing turns and NO final: only the hard ceiling ends
+        // this run.
+        let scripts = budget_turns("write_file", 50);
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("write_file", Box::new(SlowEcho { tracker, log }))],
+            scripts,
+        );
+        deps.max_tool_turns = 3;
+        deps.max_tool_turns_hard = 6;
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        let TurnOutcome::Failed(reason) = result.outcome else {
+            panic!("hitting the hard ceiling must bail: {result:?}");
+        };
+        assert!(
+            reason.contains("hard ceiling"),
+            "hard-ceiling bail must surface the distinct message; got: {reason}"
+        );
+        assert!(
+            reason.contains("6 tool turns"),
+            "message must report the total; got: {reason}"
+        );
+        assert_eq!(
+            count_tool_results(&history),
+            6,
+            "the worst-case total tool turns must be bounded EXACTLY by the hard ceiling"
+        );
+    }
+
+    /// Test (d): `hard == soft` reproduces the OLD flat-cap behaviour — the run
+    /// stops at exactly the soft cap and does NOT extend, even though every turn
+    /// made progress (soft=4, hard=4). This is the back-compat path.
+    #[tokio::test]
+    async fn hard_equal_to_soft_reproduces_flat_cap() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        // Progressing turns with no final: with extension DISABLED the flat cap
+        // must stop the run at the soft cap regardless of progress.
+        let scripts = budget_turns("write_file", 50);
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("write_file", Box::new(SlowEcho { tracker, log }))],
+            scripts,
+        );
+        deps.max_tool_turns = 4;
+        deps.max_tool_turns_hard = 4;
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(
+            matches!(result.outcome, TurnOutcome::Failed(_)),
+            "flat cap must bail: {result:?}"
+        );
+        assert_eq!(
+            count_tool_results(&history),
+            4,
+            "hard==soft must stop at exactly the soft cap with no extension (byte-for-byte flat cap)"
+        );
+    }
+
+    /// Test (e): the content-loop breaker still fires MID-block, unchanged, even
+    /// with a generous extension budget (soft=10, hard=60). A duplicate-heavy
+    /// batch on the very first turn trips the breaker before the budget logic is
+    /// ever consulted — proving the early bail path is untouched.
+    #[tokio::test]
+    async fn loop_breaker_fires_mid_block_even_with_extension_budget() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let identical = || ProviderEvent::ToolCall {
+            id: "tu_dup".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({"id": "same", "delay_ms": 0}),
+        };
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("write_file", Box::new(SlowEcho { tracker, log }))],
+            vec![
+                vec![identical(), identical(), identical(), identical()],
+                vec![ProviderEvent::Result {
+                    text: Some("must never be reached".into()),
+                }],
+            ],
+        );
+        // Extension budget is wide open — the breaker must still win.
+        deps.max_tool_turns = 10;
+        deps.max_tool_turns_hard = 60;
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        let TurnOutcome::Failed(reason) = result.outcome else {
+            panic!("the loop-breaker must still fire: {result:?}");
+        };
+        assert!(
+            reason.contains("repeating the same"),
+            "loop-breaker reason must be unchanged; got: {reason}"
+        );
+        // The whole batch executed (audit trail complete) and the run ended on
+        // the first turn — the budget never extended.
+        assert_eq!(count_tool_results(&history), 4);
+    }
+
     // ----- M18 Task HUD acceptance (card H1) -------------------------------
 
     /// Scripted N-tool run: each turn requests one `mock_read` with
@@ -1734,9 +2099,11 @@ mod execute_tool_batch_tests {
         );
     }
 
-    /// A bare adapter (cli: no `edit_message`) must get the old
-    /// behaviour — no HUD rows at all in a fast run (the periodic
-    /// status row only fires after a 60s silent stretch).
+    /// A bare adapter (webhooks: no `edit_message`, no client-side
+    /// transcript renderer) must get the old behaviour — no HUD rows at
+    /// all in a fast run (the periodic status row only fires after a
+    /// 60s silent stretch). Rode cli before M22 D5 promoted cli onto
+    /// the Transcript path.
     #[tokio::test]
     async fn hud_bare_adapter_emits_no_hud_rows() {
         let tracker = Arc::new(ConcurrencyTracker::default());
@@ -1746,7 +2113,7 @@ mod execute_tool_batch_tests {
             hud_scripts(3, "done"),
         );
         deps.tool_ctx
-            .set_originating(Some("cli"), Some("stdin"), None, None);
+            .set_originating(Some("webhooks"), Some("hook-1"), None, None);
 
         let mut history: Vec<HistoryMessage> = Vec::new();
         let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
@@ -2433,5 +2800,64 @@ mod tool_loop_guard_tests {
         // Window is now all-A; the most recent observation reported
         // Identical (verified in `identical_calls_trip_at_threshold`).
         assert_eq!(g.observe("t", &a), Some(LoopPattern::Identical));
+    }
+}
+
+#[cfg(test)]
+mod budget_decision_tests {
+    use super::{BudgetDecision, budget_decision};
+
+    /// Below the hard ceiling, a block that made progress extends.
+    #[test]
+    fn under_ceiling_with_progress_continues() {
+        assert_eq!(
+            budget_decision(3, 3, 12, true),
+            BudgetDecision::Continue,
+            "a progressing block under the ceiling must extend"
+        );
+    }
+
+    /// Below the hard ceiling, a block with no progress stops-and-asks.
+    #[test]
+    fn under_ceiling_no_progress_bails() {
+        assert_eq!(
+            budget_decision(3, 3, 12, false),
+            BudgetDecision::BailNoProgress
+        );
+    }
+
+    /// The hard ceiling wins over progress: at (or past) `hard` the run stops
+    /// with the hard-ceiling decision regardless of `made_progress`. This is
+    /// the property that bounds the worst-case total tool turns.
+    #[test]
+    fn at_or_past_ceiling_bails_hard_regardless_of_progress() {
+        assert_eq!(
+            budget_decision(6, 3, 6, true),
+            BudgetDecision::BailHardCeiling
+        );
+        assert_eq!(
+            budget_decision(6, 3, 6, false),
+            BudgetDecision::BailHardCeiling
+        );
+        // Defensive: even if total somehow overshoots, still a hard bail.
+        assert_eq!(
+            budget_decision(9, 3, 6, true),
+            BudgetDecision::BailHardCeiling
+        );
+    }
+
+    /// `hard == soft` (extension disabled): a completed block reaches
+    /// `total == soft == hard`, so it always lands on the hard-ceiling
+    /// decision — the flat-cap behaviour, independent of progress.
+    #[test]
+    fn hard_equals_soft_is_always_hard_ceiling_at_block_end() {
+        assert_eq!(
+            budget_decision(4, 4, 4, true),
+            BudgetDecision::BailHardCeiling
+        );
+        assert_eq!(
+            budget_decision(4, 4, 4, false),
+            BudgetDecision::BailHardCeiling
+        );
     }
 }

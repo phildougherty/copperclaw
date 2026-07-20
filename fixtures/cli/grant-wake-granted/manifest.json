@@ -1,0 +1,18 @@
+{
+  "name": "cli-grant-wake-granted",
+  "channel": "cli",
+  "description": "M22 A2 (marquee). A scheduled task fires an autonomous turn whose firing task carries a live, human-approved capability grant; the runner's autonomy gate OPENS for the granted action (web_fetch), dispatches it, and charges exactly one fire (a grant_consume System row the delivery loop applies back to central). Driven end-to-end via the M21 sweep test-clock seam + the A2H grant.json writer folded into write_tasks_snapshot.",
+  "schema": 1,
+  "trigger_sweep": true,
+  "max_tool_turns": 5,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

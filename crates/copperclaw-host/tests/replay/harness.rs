@@ -43,6 +43,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use copperclaw_channels_core::{
     AdapterError, Card, ChannelAdapter, DmHandle, testing::MockAdapter,
 };
@@ -688,7 +689,7 @@ impl ReplayHarness {
     /// tempdir. `open_inbound` runs the schema migrations on first
     /// touch, so DDL referenced by the SQL (e.g. `messages_in`)
     /// always exists by the time the seed runs.
-    fn apply_inbound_sql(&mut self) -> Result<()> {
+    pub fn apply_inbound_sql(&mut self) -> Result<()> {
         use copperclaw_db::session::open_inbound;
         let sessions_active = sessions::list_active(&self.central)
             .context("list_active sessions for inbound.sql seed")?;
@@ -722,6 +723,57 @@ impl ReplayHarness {
             self.deliver_session(session.agent_group_id, sid).await?;
         }
         Ok(())
+    }
+
+    /// M22 AX (goal-progress fixture): run ONE goal / scheduling sweep pass at
+    /// a caller-controlled instant, then run + deliver a turn for every session
+    /// a goal check-in fired into this pass. Additive companion to
+    /// [`Self::trigger_sweep_pass`] (which runs on the wall clock and only
+    /// picks up pre-seeded due inbound): the M22-A3 goal check-in fan-out
+    /// re-arms `next_checkin` from a croner expression, so proving progress
+    /// across ≥2 wakes needs the sweep driven at successive controlled instants
+    /// that cross the re-armed boundary. Uses the sweep's own `MockClock` seam
+    /// (`SweepService::with_clock`) for that croner timing — `run_once` reads
+    /// `self.clock.now()`, which the A3 goal check reads through.
+    ///
+    /// A goal wake fires into a session `run_one_turn` may have left `running`,
+    /// so this drives turns off `report.goal_checkins_fired` (each resolved to
+    /// the goal's session) rather than `woken_sessions`, which the per-pass
+    /// wake check skips for an already-running session.
+    pub async fn run_goal_sweep_at(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<copperclaw_host_sweep::service::SweepReport> {
+        let sweep_root: Arc<dyn SweepSessionRoot> =
+            Arc::new(SweepRoot::new(self.tempdir.path().to_path_buf()));
+        let clock: Arc<dyn copperclaw_host_sweep::Clock> =
+            Arc::new(copperclaw_host_sweep::clock::MockClock::new(now));
+        let sweep = SweepService::with_clock(self.central.clone(), sweep_root, clock);
+        let report = sweep.run_once().context("goal sweep.run_once")?;
+        let mut driven: HashSet<SessionId> = HashSet::new();
+        for fan in &report.goal_checkins_fired {
+            let Some(goal) = copperclaw_db::tables::goals::get(&self.central, &fan.series_id)
+                .context("resolve goal for check-in fan-out")?
+            else {
+                continue;
+            };
+            if !driven.insert(goal.session_id) {
+                continue;
+            }
+            if !self
+                .touched_sessions
+                .iter()
+                .any(|(_, s)| *s == goal.session_id)
+            {
+                self.touched_sessions
+                    .push((goal.agent_group_id, goal.session_id));
+            }
+            self.run_one_turn(goal.agent_group_id, goal.session_id)
+                .await?;
+            self.deliver_session(goal.agent_group_id, goal.session_id)
+                .await?;
+        }
+        Ok(report)
     }
 
     async fn run_budget_gate(&self, ag: AgentGroupId) -> Result<()> {
@@ -786,6 +838,22 @@ impl ReplayHarness {
     async fn run_one_turn(&self, ag: AgentGroupId, sess: SessionId) -> Result<()> {
         let paths = SessionPaths::new(self.tempdir.path(), ag, sess);
         paths.ensure_dirs().context("ensure session dirs")?;
+        // M22 AX: mirror the container manager's spawn-time snapshot write
+        // (`container_manager::runner_config_for` → `write_tasks_snapshot`) so
+        // the runner's M22 A2 autonomy gate reads the SAME host-produced
+        // `<data_root>/grant.json` production writes at spawn. A2H folded the
+        // grant writer into `write_tasks_snapshot`: it renders `grant.json`
+        // ONLY when the firing `kind:task` inbound's task carries a live,
+        // approved `task_grants` row (otherwise it removes any stale file), so
+        // this is byte-neutral for every fixture without a seeded grant — the
+        // autonomy brake stays closed exactly as before. Runs BEFORE the rw
+        // inbound handle below opens so the snapshot's read-only inbound probe
+        // never contends with it.
+        copperclaw_host::container_manager::tasks_snapshot::write_tasks_snapshot(
+            &self.central,
+            sess,
+            &paths.root,
+        );
         let inbound = open_inbound_rw_no_mmap(&paths).context("open inbound (rw)")?;
         let outbound = open_outbound(&paths).context("open outbound (rw)")?;
         let inbound = Arc::new(Mutex::new(inbound));
@@ -868,7 +936,15 @@ impl ReplayHarness {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
                 output_reserve_tokens: 4_096,
-                soft_target_tokens: 0,
+                // M22 Wave 0: default 0 (soft trigger disabled) — only the
+                // `auto-compaction` fixture sets the manifest knob, so every
+                // other fixture keeps the unreachable hard-ceiling threshold
+                // and its byte-identical no-compaction behaviour.
+                soft_target_tokens: self
+                    .fixture
+                    .manifest
+                    .compaction_soft_target_tokens
+                    .unwrap_or(0),
                 summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
@@ -898,6 +974,17 @@ impl ReplayHarness {
             // count fits under it); `max_tool_turns` in the manifest
             // raises it for scripted sequences with more tool rounds.
             max_tool_turns: self.fixture.manifest.max_tool_turns.unwrap_or(5),
+            // Hard ceiling defaults to the soft cap: smart auto-continue
+            // extension is OFF for replay fixtures unless the manifest
+            // explicitly raises `max_tool_turns_hard` (M22 Wave 0:
+            // `telegram/budget-extension` pins the progress-gated Continue
+            // path with soft=2, hard=8). Every fixture that doesn't set the
+            // knob keeps its deterministic flat-cap behaviour byte-for-byte.
+            max_tool_turns_hard: self
+                .fixture
+                .manifest
+                .max_tool_turns_hard
+                .unwrap_or_else(|| self.fixture.manifest.max_tool_turns.unwrap_or(5)),
             // Replay fixtures bound the run via the tool-turn cap; the
             // per-task token ceiling is disabled (0) so deterministic
             // replays never trip the cost backstop.
@@ -933,6 +1020,23 @@ impl ReplayHarness {
             // cadence and softening) without real waits. `Arc<TestClock>`
             // unsizes to the `Arc<dyn Clock>` the deps carry.
             clock: self.clock.clone(),
+            // M22 A2: the autonomy-gate grant state. The replay harness can
+            // seed this (or the `<data_root>/grant.json` snapshot the runner
+            // loads) once the AX X-rider wires the grant-wake fixtures; default
+            // empty keeps every existing replay byte-identical (closed brake).
+            active_grant: std::sync::Arc::new(std::sync::Mutex::new(
+                copperclaw_runner::run::GrantGateState::default(),
+            )),
+            // F2: replay fixtures exercise the healthy path — recovery-mode
+            // startup truncation off, so loaded history is byte-identical.
+            recovery_mode: false,
+            // M22 B1: no auto-compaction inside a deterministic replay,
+            // so the notice queue stays empty and expected outputs are
+            // unchanged.
+            notices: std::sync::Arc::new(copperclaw_runner::run::Notices::default()),
+            // M22 B4: fresh spend counters per step-runner; scripted turns
+            // that carry no usage events keep every frame token-free.
+            spend: std::sync::Arc::new(copperclaw_runner::run::hud::TurnSpend::default()),
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS
@@ -1136,7 +1240,7 @@ impl ReplayHarness {
         Ok(report)
     }
 
-    fn snapshot_messages_in(&self) -> Result<Vec<serde_json::Value>> {
+    pub fn snapshot_messages_in(&self) -> Result<Vec<serde_json::Value>> {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut seen: HashSet<SessionId> = HashSet::new();
         for (ag, sess) in &self.touched_sessions {
@@ -1150,7 +1254,7 @@ impl ReplayHarness {
         Ok(rows)
     }
 
-    fn snapshot_messages_out(&self) -> Result<Vec<serde_json::Value>> {
+    pub fn snapshot_messages_out(&self) -> Result<Vec<serde_json::Value>> {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut seen: HashSet<SessionId> = HashSet::new();
         for (ag, sess) in &self.touched_sessions {
@@ -1437,9 +1541,17 @@ fn build_adapter_set(
             .get(ct.as_str())
             .copied()
             .or_else(|| default_cap_for(ct.as_str()));
+        // Byte cap: a manifest `adapter_caps` override means the fixture is
+        // pinning an explicit char cap, so it opts out of the byte cap too.
+        let byte_cap = if fixture.manifest.adapter_caps.contains_key(ct.as_str()) {
+            None
+        } else {
+            default_byte_cap_for(ct.as_str())
+        };
         let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
             mock.clone(),
             cap,
+            byte_cap,
             fixture.manifest.model_rich_breadcrumbs,
             fixture.manifest.model_rich_cards,
         ));
@@ -1734,9 +1846,23 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
         "slack" => Some(40_000),
         "discord" => Some(2000),
         "teams" => Some(28_000),
-        "wechat" => Some(600),
+        "wechat" => Some(2048),
         "webex" => Some(7439),
         "line" => Some(5000),
+        _ => None,
+    }
+}
+
+/// Built-in `max_message_bytes` cap per channel type, mirroring the
+/// production `ChannelAdapter::max_message_bytes` overrides. Only the
+/// channels whose platform documents a BYTE-denominated limit declare one
+/// (webex 7 439 B, teams 28 KB, wechat 2 048 B); everything else is
+/// char-denominated and returns `None`.
+fn default_byte_cap_for(channel_type: &str) -> Option<usize> {
+    match channel_type {
+        "webex" => Some(7439),
+        "teams" => Some(28_000),
+        "wechat" => Some(2048),
         _ => None,
     }
 }
@@ -1752,6 +1878,9 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
 struct CappedAdapter {
     inner: Arc<MockAdapter>,
     max_message_chars: Option<usize>,
+    /// Byte-denominated cap for the channels whose platform documents one
+    /// (see [`default_byte_cap_for`]).
+    max_message_bytes: Option<usize>,
     /// M19 F1: when true, model an edit-capable rich adapter for the
     /// HUD breadcrumb surface (post once, edit in place) instead of the
     /// bare-mock degrade-to-text. See `Manifest::model_rich_breadcrumbs`.
@@ -1766,12 +1895,14 @@ impl CappedAdapter {
     fn new(
         inner: Arc<MockAdapter>,
         max_message_chars: Option<usize>,
+        max_message_bytes: Option<usize>,
         model_rich_breadcrumbs: bool,
         model_rich_cards: bool,
     ) -> Self {
         Self {
             inner,
             max_message_chars,
+            max_message_bytes,
             model_rich_breadcrumbs,
             model_rich_cards,
         }
@@ -1790,6 +1921,10 @@ impl ChannelAdapter for CappedAdapter {
 
     fn max_message_chars(&self) -> Option<usize> {
         self.max_message_chars
+    }
+
+    fn max_message_bytes(&self) -> Option<usize> {
+        self.max_message_bytes
     }
 
     async fn subscribe(

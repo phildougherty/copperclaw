@@ -60,11 +60,12 @@ use copperclaw_db::DbError;
 use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
-    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateBatchOutcome,
-    DelegateBatchRequest, DelegateSpec, EditMessageSpec, EmitTodoListSpec, InstallSpec,
-    OutboundToolEffect, Recipient, SaveSkillSpec, ScheduleSpec, SendCardSpec, SendFileSpec,
-    SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck,
-    ToolEntry, ToolError, UpdateTaskSpec,
+    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, AuthorTaskGrantSpec, CreateAgentSpec,
+    CreateGoalSpec, DelegateBatchOutcome, DelegateBatchRequest, DelegateSpec, EditMessageSpec,
+    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, RegisterConditionSpec,
+    SaveSkillSpec, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec, SetConditionFlagSpec,
+    SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck, ToolEntry, ToolError,
+    UpdateGoalSpec, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1204,11 +1205,23 @@ fn apply_effect(
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
         OutboundToolEffect::SaveSkill(spec) => apply_save_skill(conn, spec),
         OutboundToolEffect::ScheduleTask(spec) => apply_schedule_create(conn, spec),
+        OutboundToolEffect::AuthorTaskGrant(spec) => apply_author_task_grant(conn, spec),
         OutboundToolEffect::ListTasks => apply_schedule_list(conn),
         OutboundToolEffect::CancelTask { id } => apply_schedule_simple(conn, "cancel", &id),
         OutboundToolEffect::PauseTask { id } => apply_schedule_simple(conn, "pause", &id),
         OutboundToolEffect::ResumeTask { id } => apply_schedule_simple(conn, "resume", &id),
         OutboundToolEffect::UpdateTask(spec) => apply_schedule_update(conn, spec),
+        // M22 A3: goal authoring/reporting. Like the `schedule` ops, these land
+        // as `{"goal": {...}}` system rows the host's delivery `goal` handler
+        // persists into the central `goals` table.
+        OutboundToolEffect::CreateGoal(spec) => apply_goal_create(conn, spec),
+        OutboundToolEffect::UpdateGoal(spec) => apply_goal_update(conn, spec),
+        // M22 A4: condition registration + flag latch. Like the `goal` ops these
+        // land as `{"condition": {...}}` system rows the host's delivery
+        // `condition` handler persists into the central `conditions` /
+        // `condition_flags` tables.
+        OutboundToolEffect::RegisterCondition(spec) => apply_register_condition(conn, spec),
+        OutboundToolEffect::SetConditionFlag(spec) => apply_set_condition_flag(conn, spec),
     }
 }
 
@@ -1796,6 +1809,30 @@ fn apply_schedule_create(
     Ok(ToolEffectAck::Accepted)
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn apply_author_task_grant(
+    conn: &mut Connection,
+    spec: AuthorTaskGrantSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // Mirror of `apply_save_skill` (M22 A1, decision (c)): the host's delivery
+    // `task_grant` handler parses this row, resolves the concrete task id from
+    // `task_name`, and raises an approval card. Only on operator approval does a
+    // `task_grants` row persist. Agent-facing validation already happened in the
+    // `schedule_task` tool.
+    let payload = serde_json::json!({
+        "task_grant": {
+            "task_name": spec.task_name,
+            "capability_scope": spec.capability_scope,
+            "token_budget": spec.token_budget,
+            "max_fires": spec.max_fires,
+            "expires_at": spec.expires_at.to_rfc3339(),
+            "reason": spec.reason,
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
 fn apply_schedule_list(conn: &mut Connection) -> Result<ToolEffectAck, ToolApplyError> {
     let payload = serde_json::json!({
         "schedule": { "op": "list", "payload": {} }
@@ -1835,6 +1872,96 @@ fn apply_schedule_update(
     let id_for_ack = spec.id.clone();
     insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Task { id: id_for_ack })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_goal_create(
+    conn: &mut Connection,
+    spec: CreateGoalSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's delivery `goal` handler parses this row and INSERTs a `goals`
+    // row (M22 A3). A goal is internal tracking state — not approval-gated (it
+    // authorizes nothing on its own), so it applies immediately host-side like
+    // `install_packages`, unlike the approval-gated `save_skill` / `task_grant`.
+    let payload = serde_json::json!({
+        "goal": {
+            "op": "create",
+            "payload": {
+                "objective": spec.objective,
+                "checkin_recurrence": spec.checkin_recurrence,
+                "first_checkin": spec.first_checkin,
+                "checkin_prompt": spec.checkin_prompt,
+                "token_budget": spec.token_budget,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_goal_update(
+    conn: &mut Connection,
+    spec: UpdateGoalSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    let payload = serde_json::json!({
+        "goal": {
+            "op": "update",
+            "payload": {
+                "id": spec.id,
+                "status": spec.status,
+                "progress": spec.progress,
+                "progress_tokens": spec.progress_tokens,
+                "objective": spec.objective,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_register_condition(
+    conn: &mut Connection,
+    spec: RegisterConditionSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's delivery `condition` handler parses this row and upserts /
+    // soft-removes a `conditions` row (M22 A4). A condition is internal tracking
+    // state — not approval-gated (it authorizes nothing on its own) — so it
+    // applies immediately host-side like `goal`.
+    let payload = serde_json::json!({
+        "condition": {
+            "op": if spec.remove { "remove" } else { "register" },
+            "payload": {
+                "id": spec.id,
+                "kind": spec.kind,
+                "threshold": spec.threshold,
+                "flag": spec.flag,
+                "prompt": spec.prompt,
+                "grant_id": spec.grant_id,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_set_condition_flag(
+    conn: &mut Connection,
+    spec: SetConditionFlagSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    let payload = serde_json::json!({
+        "condition": {
+            "op": "set_flag",
+            "payload": {
+                "flag": spec.flag,
+                "value": spec.value,
+            }
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
 }
 
 fn insert_row(
@@ -3219,6 +3346,35 @@ mod tests {
         let row = last_row(&ctx).await;
         assert_eq!(row.content["schedule"]["op"], "create");
         assert_eq!(row.content["schedule"]["payload"]["name"], "t");
+    }
+
+    #[tokio::test]
+    async fn author_task_grant_writes_system_row() {
+        let (_tmp, ctx) = fresh_ctx();
+        let expires = chrono::Utc::now() + chrono::Duration::days(30);
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::AuthorTaskGrant(AuthorTaskGrantSpec {
+                task_name: "standup".into(),
+                capability_scope: "send_message:telegram".into(),
+                token_budget: Some(50000),
+                max_fires: Some(30),
+                expires_at: expires,
+                reason: "morning standup".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ack, ToolEffectAck::Accepted);
+        let row = last_row(&ctx).await;
+        assert_eq!(row.content["task_grant"]["task_name"], "standup");
+        assert_eq!(
+            row.content["task_grant"]["capability_scope"],
+            "send_message:telegram"
+        );
+        assert_eq!(row.content["task_grant"]["max_fires"], 30);
+        assert_eq!(
+            row.content["task_grant"]["expires_at"],
+            expires.to_rfc3339()
+        );
     }
 
     #[tokio::test]

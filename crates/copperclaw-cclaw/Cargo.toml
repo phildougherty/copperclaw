@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 copperclaw-types = { workspace = true }
 copperclaw-db = { workspace = true }
+copperclaw-channels-core = { workspace = true }
+copperclaw-channels-cli = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
