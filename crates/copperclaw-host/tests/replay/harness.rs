@@ -936,7 +936,15 @@ impl ReplayHarness {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
                 output_reserve_tokens: 4_096,
-                soft_target_tokens: 0,
+                // M22 Wave 0: default 0 (soft trigger disabled) — only the
+                // `auto-compaction` fixture sets the manifest knob, so every
+                // other fixture keeps the unreachable hard-ceiling threshold
+                // and its byte-identical no-compaction behaviour.
+                soft_target_tokens: self
+                    .fixture
+                    .manifest
+                    .compaction_soft_target_tokens
+                    .unwrap_or(0),
                 summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
@@ -966,11 +974,17 @@ impl ReplayHarness {
             // count fits under it); `max_tool_turns` in the manifest
             // raises it for scripted sequences with more tool rounds.
             max_tool_turns: self.fixture.manifest.max_tool_turns.unwrap_or(5),
-            // Hard ceiling == soft cap: smart auto-continue extension is OFF for
-            // replay fixtures, so every existing fixture keeps its deterministic
-            // flat-cap behaviour byte-for-byte (a productive run stops at the
-            // soft cap exactly as before, rather than silently extending).
-            max_tool_turns_hard: self.fixture.manifest.max_tool_turns.unwrap_or(5),
+            // Hard ceiling defaults to the soft cap: smart auto-continue
+            // extension is OFF for replay fixtures unless the manifest
+            // explicitly raises `max_tool_turns_hard` (M22 Wave 0:
+            // `telegram/budget-extension` pins the progress-gated Continue
+            // path with soft=2, hard=8). Every fixture that doesn't set the
+            // knob keeps its deterministic flat-cap behaviour byte-for-byte.
+            max_tool_turns_hard: self
+                .fixture
+                .manifest
+                .max_tool_turns_hard
+                .unwrap_or_else(|| self.fixture.manifest.max_tool_turns.unwrap_or(5)),
             // Replay fixtures bound the run via the tool-turn cap; the
             // per-task token ceiling is disabled (0) so deterministic
             // replays never trip the cost backstop.
@@ -1016,6 +1030,13 @@ impl ReplayHarness {
             // F2: replay fixtures exercise the healthy path — recovery-mode
             // startup truncation off, so loaded history is byte-identical.
             recovery_mode: false,
+            // M22 B1: no auto-compaction inside a deterministic replay,
+            // so the notice queue stays empty and expected outputs are
+            // unchanged.
+            notices: std::sync::Arc::new(copperclaw_runner::run::Notices::default()),
+            // M22 B4: fresh spend counters per step-runner; scripted turns
+            // that carry no usage events keep every frame token-free.
+            spend: std::sync::Arc::new(copperclaw_runner::run::hud::TurnSpend::default()),
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS

@@ -13,6 +13,8 @@
     "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
     "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
     "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
-    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "bash: line 1: /data/\\.shell_state: [A-Za-z ]+": "<SHELL_STATE_NOISE>",
+    "fatal: unable to get current working directory: [A-Za-z ]+": "<SHELL_STATE_NOISE>"
   }
 }

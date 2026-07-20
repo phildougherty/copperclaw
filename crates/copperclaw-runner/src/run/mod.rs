@@ -425,6 +425,44 @@ pub fn resolve_tool_deadline_secs(env: &dyn crate::config::EnvLookup) -> u64 {
     parsed
 }
 
+/// M22 B1: one-shot user-facing notices queued by loop-level events that
+/// fire OUTSIDE a turn — before any [`hud::TaskHud`] exists to carry them.
+/// Today's single producer is the automatic compaction pass in [`run_loop`]
+/// (it runs before `drive_turn`; the `/compact` slash path already confirms
+/// to the user directly, and this closes the asymmetry for the silent
+/// automatic path). The next constructed [`hud::TaskHud`] drains ONE note
+/// into its existing one-shot note machinery, so the note rides the next
+/// HUD frame (rich channels) or the next periodic status row (bare
+/// channels) and renders exactly once; a note the turn never got to render
+/// (a fast pure-text turn posts no frame) is re-queued at finalize so a
+/// later turn surfaces it instead of dropping it. FIFO: notes surface in
+/// the order pushed, at most one per turn. Best-effort by design — a
+/// poisoned lock holds or drops notes rather than panicking, because a
+/// status annotation must never take down the runner.
+#[derive(Debug, Default)]
+pub struct Notices(std::sync::Mutex<Vec<String>>);
+
+impl Notices {
+    /// Queue a note for the next turn's HUD frame / status row.
+    pub fn push(&self, text: impl Into<String>) {
+        if let Ok(mut notes) = self.0.lock() {
+            notes.push(text.into());
+        }
+    }
+
+    /// Take the oldest queued note (FIFO), one at a time. `None` when the
+    /// queue is empty (or the lock is poisoned).
+    #[must_use]
+    pub fn drain_one(&self) -> Option<String> {
+        let mut notes = self.0.lock().ok()?;
+        if notes.is_empty() {
+            None
+        } else {
+            Some(notes.remove(0))
+        }
+    }
+}
+
 /// Dependencies injected into [`run_loop`]. Holding all of these in a struct
 /// keeps the signature small and makes it easy to fan out variations from
 /// tests.
@@ -639,6 +677,20 @@ pub struct RunnerDeps {
     /// yet must latch the fire. Default (`minimal`, and every human turn) is an
     /// empty state that authorizes nothing — the brake stays closed.
     pub active_grant: Arc<std::sync::Mutex<tool_dispatch::GrantGateState>>,
+    /// M22 B1: one-shot user-facing notices queued outside a turn (see
+    /// [`Notices`]). [`run_loop`] pushes here when the automatic compaction
+    /// pass fires; [`hud::TaskHud::new`] drains one note per turn into the
+    /// HUD's one-shot note slot. Default empty — no producer, no behaviour
+    /// change.
+    pub notices: Arc<Notices>,
+    /// M22 B4: live per-inbound spend counters ([`hud::TurnSpend`]) —
+    /// bumped by the provider-call layer with each completed call's
+    /// billed tokens (priced via `copperclaw_types::pricing` when the
+    /// model is known), reset by `drive_turn` at inbound entry, read by
+    /// the Task HUD for the status line's token/cost fields and the
+    /// final collapse. Default empty counters — with no provider usage
+    /// recorded, every HUD frame stays byte-identical to pre-B4.
+    pub spend: Arc<hud::TurnSpend>,
     /// F2 safe-mode respawn: when `true`, [`run_loop`] truncates the loaded
     /// `state.history` to a small recent window ([`RECOVERY_KEEP_MESSAGES`])
     /// at startup — bypassing normal compaction — so a persistent
@@ -750,6 +802,12 @@ impl RunnerDeps {
             active_grant: Arc::new(std::sync::Mutex::new(
                 tool_dispatch::GrantGateState::default(),
             )),
+            // B1: empty notice queue — nothing rides the next HUD frame
+            // until a loop-level event (auto-compaction) pushes a note.
+            notices: Arc::new(Notices::default()),
+            // B4: empty spend counters — nothing renders until the
+            // provider-call layer records billed tokens.
+            spend: Arc::new(hud::TurnSpend::default()),
             // F2: recovery mode off by default — the host only turns it on
             // for a session that has crashed N times in a row.
             recovery_mode: false,
@@ -1095,6 +1153,7 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             // healthy compaction as "stale". The Err arm is defense-in-depth:
             // if some future internal error ever escaped `compact()`, continue
             // with a truncated tail rather than exiting the loop.
+            let before_len = state.history.len();
             state.history = {
                 let _hb = provider_call::HeartbeatTicker::start(deps.heartbeat_path.clone());
                 match compact(state.history, deps.provider.as_ref(), &deps.compaction).await {
@@ -1108,6 +1167,17 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
                     }
                 }
             };
+            // B1: the automatic path used to be silent (only the /compact
+            // slash path confirmed to the user). No TaskHud exists yet —
+            // this runs before drive_turn — so queue a one-shot note the
+            // next turn's HUD drains onto its first frame (rich channels)
+            // or periodic status row (bare channels). Kept short: it rides
+            // a HUD summary capped at MAX_SUMMARY_CHARS (200).
+            deps.notices.push(format!(
+                "history auto-compacted ({before_len} msgs -> {}, ~{}k tokens)",
+                state.history.len(),
+                est_tokens.div_ceil(1000),
+            ));
         }
 
         // Resume-after-crash guard — see `is_prompt_already_in_history`.
@@ -2056,6 +2126,77 @@ mod tests {
         };
         insert_in(inbound, &msg).unwrap();
         id
+    }
+
+    // ── M22 B1: the loop-level notice queue ─────────────────────────────
+
+    #[test]
+    fn notices_drain_one_is_fifo_one_at_a_time() {
+        let notices = Notices::default();
+        assert!(notices.drain_one().is_none(), "empty queue drains nothing");
+        notices.push("first");
+        notices.push("second");
+        assert_eq!(
+            notices.drain_one().as_deref(),
+            Some("first"),
+            "notes drain oldest-first"
+        );
+        assert_eq!(notices.drain_one().as_deref(), Some("second"));
+        assert!(notices.drain_one().is_none(), "drained queue is empty");
+    }
+
+    /// B1 producer pin: when the automatic compaction pass fires inside
+    /// `run_loop` (before `drive_turn` — no TaskHud exists yet), it queues
+    /// the one-shot "history auto-compacted" note. This turn's HUD drains
+    /// it, but a fast pure-text turn on a bare channel renders no frame
+    /// and no status row, so finalize requeues it — after the loop exits
+    /// the note is waiting for the next turn's HUD.
+    #[tokio::test]
+    async fn run_loop_auto_compaction_queues_a_notice() {
+        let mut setup = build_setup(vec![
+            // The compaction pass's summary-model call.
+            vec![ProviderEvent::Result {
+                text: Some("SUMMARY: earlier deployment chatter".into()),
+            }],
+            // The turn's ordinary reply.
+            vec![ProviderEvent::Result {
+                text: Some("still here".into()),
+            }],
+        ]);
+        // Trip the soft trigger well below the pre-saved history's
+        // estimate (6 x ~240 chars ≈ 400+ est tokens).
+        setup.deps.compaction.soft_target_tokens = 50;
+        let history: Vec<HistoryMessage> = (0..6)
+            .map(|i| HistoryMessage::User {
+                content: format!(
+                    "filler message number {i}: {}",
+                    "lorem ipsum dolor sit amet ".repeat(8)
+                ),
+            })
+            .collect();
+        {
+            let g = setup.deps.outbound.lock().await;
+            save_state(&g, &history, None).unwrap();
+        }
+        {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "and what happened next?");
+        }
+        let notices = Arc::clone(&setup.deps.notices);
+        run_loop(setup.deps).await.unwrap();
+
+        let note = notices
+            .drain_one()
+            .expect("auto-compaction must queue a notice (requeued by the unrendering turn)");
+        assert!(
+            note.starts_with("history auto-compacted (6 msgs -> "),
+            "note carries the pre-compaction entry count: {note}"
+        );
+        assert!(
+            note.ends_with("k tokens)"),
+            "note carries the estimated token size: {note}"
+        );
+        assert!(notices.drain_one().is_none(), "exactly one notice queued");
     }
 
     #[tokio::test]

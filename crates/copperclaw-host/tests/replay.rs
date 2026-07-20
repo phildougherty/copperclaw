@@ -477,37 +477,96 @@ async fn webhooks_generic_hmac_round_trip() {
 
 #[tokio::test]
 async fn cli_tool_use_shell() {
+    // Fixture-authoring path: regenerate expected/*.jsonl from a real
+    // run (used by M22 D5 when cli gained transcript frames). Never
+    // taken under a normal `cargo test`.
+    if std::env::var_os("COPPERCLAW_M22W0_GENERATE").is_some() {
+        let path = fixture_path("cli", "tool-use-shell");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        return;
+    }
     run_fixture("cli", "tool-use-shell").await;
 }
 
-/// M21 S6: the previously-unfixturable bare-channel Task HUD timed legs
-/// (the M18 X2 known gap), pinned deterministically via the harness's
-/// test-clock seam. The fixture's `provider_responses` advance the
-/// shared runner `TestClock` mid-turn (61s while serving the first
-/// scripted `tool_use` call, another 90s on the second), so the two
-/// tool-batch boundaries land at exactly 61s and 151s of "wall" time
-/// with zero real waiting. The expected streams pin the 60s first-fire
-/// status row ("61s in ... I'll keep going.") and the 150s softening
-/// ("151s in ... taking longer than usual") byte-for-byte.
+/// M21 S6 origin / M22 D5 shape: the long-silent-run heartbeat on cli,
+/// pinned deterministically via the harness's test-clock seam. The
+/// fixture's `provider_responses` advance the shared runner `TestClock`
+/// mid-turn (61s while serving the first scripted `tool_use` call,
+/// another 90s on the second), so the two tool-batch boundaries land at
+/// exactly 61s and 151s of "wall" time with zero real waiting.
+///
+/// Before D5 the expected streams pinned the bare-channel StatusRows
+/// sentences ("Still working on this — 61s in ... I'll keep going." /
+/// the 151s softening). Since D5 promoted cli to `Behavior::Transcript`
+/// the same silent stretches surface as HUD transcript frames instead:
+/// fresh `Breadcrumb` EVENTS carrying the elapsed clock ("1:01" at the
+/// first batch, "2:31" at the second) and the cumulative tool steps,
+/// collapsed by a final "done in 2:31, 2 tool calls" frame — the
+/// periodic-reassurance purpose is now served by the batch-boundary
+/// transcript cadence (the same boundaries the old status rows fired
+/// on; the client repaints the live clock between frames). The
+/// StatusRows sentences remain pinned for genuinely bare channels by
+/// the hud.rs unit tests
+/// (`status_rows_60s_first_fire_and_150s_softening_pinned_by_test_clock`).
 #[tokio::test]
 async fn cli_status_row_heartbeat_pins_60s_and_150s_legs() {
+    // Fixture-authoring path: regenerate expected/*.jsonl from a real
+    // run. Never taken under a normal `cargo test`.
+    if std::env::var_os("COPPERCLAW_M22W0_GENERATE").is_some() {
+        let path = fixture_path("cli", "status-row-heartbeat");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        return;
+    }
+
     let harness = run_fixture_into_harness("cli", "status-row-heartbeat").await;
-    // Belt-and-braces over the JSONL diff: exactly two heartbeat rows
-    // were delivered, in cadence order, and only the second is softened.
     let mock = mock_for(&harness, "cli");
-    let heartbeats: Vec<String> = mock
+    let texts: Vec<String> = mock
         .deliveries()
         .iter()
         .filter_map(|d| d.message.content["text"].as_str().map(str::to_owned))
-        .filter(|t| t.starts_with("Still working on this"))
         .collect();
-    assert_eq!(heartbeats.len(), 2, "one row per elapsed 60s window");
-    assert!(heartbeats[0].contains("61s in") && heartbeats[0].ends_with("I'll keep going."));
+    // D5: the StatusRows sentence is gone from cli — the transcript
+    // frames carry the reassurance now.
     assert!(
-        heartbeats[1].contains("151s in")
-            && heartbeats[1].contains("This is taking longer than usual"),
-        "the 150s leg softens: {}",
-        heartbeats[1]
+        !texts.iter().any(|t| t.starts_with("Still working on this")),
+        "cli must no longer emit StatusRows heartbeats: {texts:?}"
+    );
+    // The outbound stream carries the transcript as fresh Breadcrumb
+    // EVENTS (never update_breadcrumb edits), reading the test clock:
+    // the first batch boundary at 1:01, the second at 2:31, then the
+    // final collapse.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    assert!(
+        !out.iter().any(|r| r
+            .get("content")
+            .and_then(|c| c.get("update_breadcrumb"))
+            .is_some()),
+        "cli transcript frames must never ride the edit rail: {out:#?}"
+    );
+    let summaries: Vec<&str> = out
+        .iter()
+        .filter(|r| r["kind"] == "breadcrumb")
+        .filter_map(|r| r["content"]["breadcrumb"]["summary"].as_str())
+        .collect();
+    assert!(
+        summaries.iter().any(|s| s.contains("1 tool call | 1:01")),
+        "the 61s batch boundary surfaces on a transcript frame: {summaries:?}"
+    );
+    assert!(
+        summaries.iter().any(|s| s.contains("2 tool calls | 2:31")),
+        "the 151s batch boundary surfaces on a transcript frame: {summaries:?}"
+    );
+    assert!(
+        summaries
+            .last()
+            .is_some_and(|s| s.starts_with("done in 2:31, 2 tool calls")),
+        "the final frame collapses with the elapsed clock: {summaries:?}"
     );
 }
 
@@ -1081,8 +1140,19 @@ async fn telegram_rate_limited_retry_honours_retry_after() {
 /// the card's acceptance line this fixture can NOT honestly exercise
 /// (the R3 verify-gate and the H1 live HUD) and the precise, diagnosed
 /// reason for each.
+/// Serializes the two tests that replay the SAME `prototype-golden`
+/// fixture: its first scripted shell turn `rm -rf`s + recreates the
+/// shared `/tmp/copperclaw-x1-golden` root, so two concurrent harness
+/// runs delete each other's shell cwd mid-command. That race predates
+/// M22, but D5 made it visible: the HUD's `record_step` now pins each
+/// shell result's first line into the expected transcript frames, and
+/// a raced run flips it to "fatal: unable to get current working
+/// directory".
+static PROTOTYPE_GOLDEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn cli_prototype_golden_path() {
+    let _serialize = PROTOTYPE_GOLDEN_LOCK.lock().await;
     if std::env::var_os("COPPERCLAW_X2_GENERATE").is_some() {
         // Fixture-authoring path (X2): regenerate expected/*.jsonl from a
         // real run. Never taken under a normal `cargo test`.
@@ -1106,6 +1176,7 @@ async fn cli_prototype_golden_path() {
 /// fixtures/replay.rs).
 #[tokio::test]
 async fn cli_prototype_golden_ritual_card_and_screenshot_shape() {
+    let _serialize = PROTOTYPE_GOLDEN_LOCK.lock().await;
     let harness = run_fixture_into_harness("cli", "prototype-golden").await;
     let cli = mock_for(&harness, "cli");
     let deliveries = cli.deliveries();
@@ -4385,5 +4456,546 @@ fn sx_runnable_helper_skill_fixture_is_coherent() {
     assert!(
         meta.permissions().mode() & 0o111 != 0,
         "greet.sh must be committed executable, or the materialized farm helper won't run",
+    );
+}
+
+// ---- M22 Wave 0: transcript-UI baseline fixtures (fixtures first) ----
+//
+// The M22 transcript-UI program changes the Task HUD's frame content
+// (Waves 1-3), adds an auto-compaction notice (B1), adds a
+// budget-extension note (B2), and restructures the cli adapter's output
+// (A5/D5). Project rule: fixture BEFORE pipeline change — these four
+// fixtures pin the CURRENT bytes of every surface those waves touch, so
+// each wave lands as a reviewable diff against a committed baseline
+// instead of an unpinned behaviour change. Some baselines are deliberate
+// pins of *absence* (a cli run produces zero Breadcrumb rows today). The
+// auto-compaction fixture started as such a silence pin and was extended
+// by B1 (Wave 1) to pin its one-shot notice; Wave 2's B-card regenerated
+// all three telegram fixtures to pin the transcript frames (B5 steps,
+// B3 ratio-in-summary, B4 spend) and the budget-extension note (B2) —
+// see `telegram_budget_extension_notes_extension_on_hud`. Each fixture's
+// README.md carries the details.
+
+/// Fixture-authoring gate shared by the scripted-turn M22 Wave-0
+/// fixtures. When `COPPERCLAW_M22W0_GENERATE` is set the harness
+/// regenerates `expected/*.jsonl` from a real run and the caller returns
+/// before asserting. Never taken under a normal `cargo test`.
+async fn m22w0_maybe_generate(channel: &str, scenario: &str) -> bool {
+    if std::env::var_os("COPPERCLAW_M22W0_GENERATE").is_none() {
+        return false;
+    }
+    let path = fixture_path(channel, scenario);
+    let fixture = Fixture::load(&path).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+    harness.dump_expected_jsonl();
+    true
+}
+
+/// M22 Wave 0 (hud-transcript): the end-to-end byte pin of HUD frame
+/// text across a multi-batch run — regenerated by Wave 2's B-card, so
+/// it now pins the TRANSCRIPT frames: `Breadcrumb.steps` populated with
+/// each completed tool call (B5), the summary carrying rounded token
+/// spend and cost from the scripted usage events (B4), and the enriched
+/// `done` collapse. Beyond the JSONL diff this asserts the frame
+/// *cadence*: one post, >= 3 in-place edits on a single anchor, running
+/// frames whose steps accumulate to all five scripted shell calls (the
+/// first one pinned exactly), and the final "done" collapse keeping the
+/// transcript attached.
+#[tokio::test]
+async fn telegram_hud_transcript_pins_multi_batch_frames() {
+    if m22w0_maybe_generate("telegram", "hud-transcript").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("telegram", "hud-transcript").await;
+    assert_live_hud_edits_one_chip(&harness, "telegram", "100", "build is healthy");
+
+    let tg = mock_for(&harness, "telegram");
+    let edits = tg.edits();
+    assert!(
+        edits.len() >= 3,
+        "a five-batch run must produce >= 3 HUD edit frames, got {}: {edits:?}",
+        edits.len(),
+    );
+    // The cumulative tool count reaches all five scripted steps...
+    assert!(
+        edits.iter().any(|e| e.new_text.contains("5 tool calls")),
+        "some HUD frame must carry the full five-step tool count: {edits:?}",
+    );
+    // ...and the run collapses to the terminal one-liner.
+    assert!(
+        edits
+            .last()
+            .is_some_and(|e| e.new_text.contains("done in") && e.new_text.contains("5 tool calls")),
+        "the final HUD edit must be the done-collapse frame: {edits:?}",
+    );
+
+    // M22 B5: running HUD frames past the first batch carry the step
+    // transcript. Collect every breadcrumb frame from messages_out (the
+    // post plus each update) and inspect its steps array.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let frames: Vec<serde_json::Value> = out
+        .iter()
+        .filter_map(|r| {
+            r.pointer("/content/update_breadcrumb/breadcrumb")
+                .or_else(|| r.pointer("/content/breadcrumb"))
+                .cloned()
+        })
+        .filter(|b| b["tool_name"] == "task")
+        .collect();
+    let running_with_steps = frames
+        .iter()
+        .filter(|b| {
+            b["status"] == "running" && !b["steps"].as_array().unwrap_or(&vec![]).is_empty()
+        })
+        .count();
+    assert!(
+        running_with_steps >= 3,
+        "running frames after the first batch must carry non-empty steps: {frames:#?}",
+    );
+    // A frame accumulates ALL five scripted steps, and the first step is
+    // the completed `shell` echo, pinned field by field.
+    let full = frames
+        .iter()
+        .find(|b| b["steps"].as_array().is_some_and(|s| s.len() == 5))
+        .unwrap_or_else(|| panic!("some frame must carry all five steps: {frames:#?}"));
+    let first_step = &full["steps"][0];
+    assert_eq!(first_step["tool_name"], "shell");
+    assert_eq!(first_step["detail"], "echo step one");
+    assert_eq!(first_step["status"], "done", "completed step reads done");
+    assert_eq!(
+        first_step["summary"], "step one",
+        "the step summary is the tool result's stdout line",
+    );
+    // B4: the scripted usage events (900 in + 100 out per turn) surface
+    // as rounded spend on the summary, and the collapse keeps both the
+    // spend and the transcript.
+    assert!(
+        frames.iter().any(|b| {
+            b["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("5k tokens") && s.contains("$0.02"))
+        }),
+        "some running frame must carry the rounded token/cost fields: {frames:#?}",
+    );
+    let collapse = frames
+        .iter()
+        .find(|b| b["status"] == "done")
+        .expect("done collapse frame");
+    assert!(
+        collapse["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("6k tokens") && s.contains("$0.03")),
+        "the collapse carries the task's total spend: {collapse:#?}",
+    );
+    assert_eq!(
+        collapse["steps"].as_array().map(Vec::len),
+        Some(5),
+        "the collapse keeps the full transcript attached: {collapse:#?}",
+    );
+}
+
+/// M22 B1 (auto-compaction): oversized history trips the AUTOMATIC
+/// compaction path in `run_loop` (`should_compact` → `compact()`), via
+/// the manifest's soft-target knob (the replay twin of
+/// `COPPERCLAW_SOFT_COMPACTION_TARGET`). Wave 0 pinned the pre-B1
+/// silence; B1 closes the asymmetry with the `/compact` slash path
+/// (which always confirmed) by queueing a one-shot notice that the next
+/// turn's Task HUD drains onto its FIRST frame. The pin here: the
+/// `history auto-compacted (N msgs -> M, ~Kk tokens)` note appears on
+/// EXACTLY ONE outbound row (the HUD post that consumed it), never on a
+/// later frame and never as a delivered chat row. Beyond the JSONL diff
+/// this asserts the compaction genuinely ran: the pre-compaction
+/// transcript was archived under the session's `outbox/_compactions/`,
+/// the summary-model call hit the provider (5 upstream calls: 3 chat
+/// turns + 1 summary + 1 post-tool continuation), and the
+/// post-compaction turn's request history carries the `compact_boundary`
+/// summary.
+#[tokio::test]
+async fn telegram_auto_compaction_notes_once() {
+    if m22w0_maybe_generate("telegram", "auto-compaction").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("telegram", "auto-compaction").await;
+
+    // Compaction genuinely fired: the pre-compaction transcript archive
+    // exists under the session's outbox.
+    let (ag, sess) = harness.touched_sessions[0];
+    let archive_dir = harness
+        .tempdir
+        .path()
+        .join("sessions")
+        .join(ag.as_uuid().to_string())
+        .join(sess.as_uuid().to_string())
+        .join("outbox")
+        .join("_compactions");
+    let archived = std::fs::read_dir(&archive_dir)
+        .map(std::iter::Iterator::count)
+        .unwrap_or(0);
+    assert!(
+        archived >= 1,
+        "auto-compaction must archive the pre-compaction transcript under {}",
+        archive_dir.display(),
+    );
+
+    // The summary-model call really went upstream: 3 chat turns + 1
+    // summarisation call + 1 post-tool continuation = 5 provider
+    // requests, and the post-compaction turn's history carries the
+    // compact_boundary summary.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    assert_eq!(
+        reqs.len(),
+        5,
+        "expected 3 chat turns + 1 summary call + 1 post-tool continuation, \
+         got {} provider requests",
+        reqs.len(),
+    );
+    let last_body = String::from_utf8_lossy(&reqs.last().unwrap().body).into_owned();
+    assert!(
+        last_body.contains("compact_boundary: SUMMARY:"),
+        "the post-compaction turn must run against the summarised history",
+    );
+
+    // THE B1 PIN: the one-shot notice rides EXACTLY ONE outbound row —
+    // the HUD frame that drained it (the post-compaction turn's first
+    // live frame, posted at its shell batch). One row, one render; the
+    // later batch-end edit and the done-collapse must not repeat it.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let noted: Vec<&serde_json::Value> = out
+        .iter()
+        .filter(|r| r.to_string().contains("history auto-compacted"))
+        .collect();
+    assert_eq!(
+        noted.len(),
+        1,
+        "the compaction notice must appear on exactly one outbound row: {out:#?}",
+    );
+    let summary = noted[0]["content"]["breadcrumb"]["summary"]
+        .as_str()
+        .expect("the noted row is the HUD breadcrumb post");
+    assert!(
+        summary.contains("history auto-compacted (4 msgs -> 3, ~1k tokens)"),
+        "note carries the before/after counts + estimated size: {summary}",
+    );
+
+    // The note is a HUD annotation, not a chat message: the delivered
+    // chat rows stay exactly the three scripted replies, none of which
+    // mention compaction (no new-notification spam — the M18 anti-spam
+    // property the HUD exists to preserve).
+    let tg = mock_for(&harness, "telegram");
+    let deliveries = tg.deliveries();
+    let chat_texts: Vec<&str> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "chat")
+        .map(|d| d.message.content["text"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        chat_texts.len(),
+        3,
+        "exactly the three scripted chat replies deliver: {deliveries:?}",
+    );
+    for text in &chat_texts {
+        assert!(
+            !text.to_ascii_lowercase().contains("compact"),
+            "the notice must never become a chat row: {text}",
+        );
+    }
+    // ...and the HUD chip posts exactly once (the frame that carried it).
+    let posts = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "breadcrumb")
+        .count();
+    assert_eq!(posts, 1, "one HUD post carries the notice: {deliveries:?}");
+}
+
+/// M22 B2 (budget-extension): the smart auto-continue `Continue` path,
+/// reachable via the manifest's `max_tool_turns_hard` knob (soft=2,
+/// hard=8). Four progressing shell turns complete TWO full soft-cap
+/// blocks, then the fifth turn's final text ends the run. Wave 0 pinned
+/// the pre-B2 SILENCE at each extension; B2 now surfaces each extension
+/// as a one-shot HUD note. The pin: the FIRST extension's note
+/// (`extended tool budget (2/8 turns)`) rides exactly one HUD frame —
+/// the next live frame after the block boundary. The SECOND extension's
+/// note (`4/8`) is set right before the final no-tool turn, so no
+/// further frame renders it: `finalize` re-queues it (B1 machinery) and
+/// it never appears in this run's output — pinned by asserted absence.
+/// Still no checkpoint chat row and no stop-and-ask wording: the note
+/// is a HUD annotation, never new-message spam.
+#[tokio::test]
+async fn telegram_budget_extension_notes_extension_on_hud() {
+    if m22w0_maybe_generate("telegram", "budget-extension").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("telegram", "budget-extension").await;
+    assert_live_hud_edits_one_chip(&harness, "telegram", "100", "ran cleanly");
+
+    // The run genuinely extended past the soft cap of 2: all four tool
+    // turns plus the final text hit the provider.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    assert_eq!(
+        reqs.len(),
+        5,
+        "4 progressing tool turns + 1 final text must all reach the provider \
+         (the soft cap of 2 extends, not stops), got {} requests",
+        reqs.len(),
+    );
+    let tg = mock_for(&harness, "telegram");
+    let edits = tg.edits();
+    assert!(
+        edits.iter().any(|e| e.new_text.contains("4 tool calls")),
+        "the HUD must reach the past-soft-cap tool count: {edits:?}",
+    );
+
+    // THE B2 PIN: the first extension's note appears on EXACTLY ONE
+    // outbound row (the one-shot note machinery), on a running HUD frame.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let noted: Vec<&serde_json::Value> = out
+        .iter()
+        .filter(|r| r.to_string().contains("extended tool budget"))
+        .collect();
+    assert_eq!(
+        noted.len(),
+        1,
+        "the extension note must ride exactly one outbound row: {out:#?}",
+    );
+    let summary = noted[0]
+        .pointer("/content/update_breadcrumb/breadcrumb/summary")
+        .and_then(serde_json::Value::as_str)
+        .expect("the noted row is a running HUD edit frame");
+    assert!(
+        summary.contains("extended tool budget (2/8 turns)"),
+        "note carries the cumulative/hard turn counts: {summary}",
+    );
+    // The second extension fires right before the final no-tool turn, so
+    // its note never gets a frame in this run (re-queued at finalize).
+    assert!(
+        !out.iter().any(|r| r.to_string().contains("(4/8 turns)")),
+        "the unrendered second extension note must not leak into this run: {out:#?}",
+    );
+
+    // The extension is a HUD annotation, not a chat row, and the run
+    // still never stops and asks.
+    let all = out
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in ["hard ceiling", "send 'continue'", "no visible progress"] {
+        assert!(
+            !all.contains(needle),
+            "a progressing under-ceiling run must not stop and ask ({needle}): {all}",
+        );
+    }
+    let chats: Vec<&serde_json::Value> = out
+        .iter()
+        .filter(|r| r["kind"] == "chat" && r.to_string().contains("extended tool budget"))
+        .collect();
+    assert!(
+        chats.is_empty(),
+        "the extension note must never become a chat row: {chats:#?}",
+    );
+}
+
+// ---- M22 Wave 0 (transcript-render): rich cli payloads, flattened ----
+//
+// The `todo_*` MCP tools resolve their store through
+// `COPPERCLAW_DATA_ROOT` (compiled-in `/data` otherwise — unwritable on
+// a host running the suite), and `forbid(unsafe_code)` blocks
+// `std::env::set_var`, so this fixture uses the X2 re-exec seam: the
+// parent re-execs this test binary as a child with the var set via the
+// safe `Command::env`, and the child drives the real harness.
+
+/// Fixed data root for the transcript-render fixture. Distinct from the
+/// other re-exec fixtures' roots so concurrent runs never collide. The
+/// fixture's scripted turns hard-code file paths under this dir.
+const M22W0_TRANSCRIPT_DATA_ROOT: &str = "/tmp/copperclaw-m22-transcript-render";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const M22W0_TRANSCRIPT_CHILD_ENV: &str = "COPPERCLAW_M22W0_TRANSCRIPT_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams so `expected/*.jsonl` can be regenerated from a real run
+/// (`COPPERCLAW_M22W0_GENERATE=1 cargo test ... cli_transcript_render`).
+const M22W0_TRANSCRIPT_MODE_ENV: &str = "COPPERCLAW_M22W0_TRANSCRIPT_MODE";
+
+/// M22 Wave 0 (transcript-render): a cli run whose tools emit the rich
+/// outbound rows (two `TodoList`s from `todo_add`, two `Diff`s from
+/// `write_file`/`edit_file`), pinned as they render TODAY: the delivery
+/// loop hands every one of them to a bare adapter whose trait defaults
+/// flatten the structure to text — the exact flattening the real
+/// `CliAdapter` performs for `chat.log`. Wave 1's A5 structured-JSONL
+/// cli output lands as a diff against this baseline. Since Wave 3's D5
+/// it ALSO pins the cli transcript frames: cli takes
+/// `Behavior::Transcript` (`capabilities::renders_client_side_transcript`),
+/// so the Task HUD emits every frame as a fresh `Breadcrumb` EVENT —
+/// batch-start/batch-end frames with cumulative steps, then the
+/// done-collapse — never an `update_breadcrumb` edit (the append-only
+/// `chat.log` has no edit anchor; `cclaw chat` dedupes and repaints
+/// client-side). The Wave 0 baseline pinned the ABSENCE of Breadcrumb
+/// rows on cli; D5 flipped it.
+#[tokio::test]
+async fn cli_transcript_render_flattens_rich_payloads() {
+    // Child leg: env already set by the parent's re-exec.
+    if std::env::var_os(M22W0_TRANSCRIPT_CHILD_ENV).is_some() {
+        let dump = std::env::var(M22W0_TRANSCRIPT_MODE_ENV).ok().as_deref() == Some("dump");
+        run_transcript_render_child(dump).await;
+        return;
+    }
+
+    // Parent leg: re-exec ourselves with COPPERCLAW_DATA_ROOT set (via the
+    // safe Command::env — set_var is unavailable under forbid(unsafe_code)).
+    let _ = std::fs::remove_dir_all(M22W0_TRANSCRIPT_DATA_ROOT);
+    std::fs::create_dir_all(M22W0_TRANSCRIPT_DATA_ROOT)
+        .expect("create m22w0 transcript-render data root");
+
+    let mode = if std::env::var_os("COPPERCLAW_M22W0_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cli_transcript_render_flattens_rich_payloads",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(M22W0_TRANSCRIPT_CHILD_ENV, "1")
+        .env(M22W0_TRANSCRIPT_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", M22W0_TRANSCRIPT_DATA_ROOT)
+        .output()
+        .expect("spawn transcript-render re-exec child");
+
+    let _ = std::fs::remove_dir_all(M22W0_TRANSCRIPT_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "transcript-render child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `transcript-render` fixture through the
+/// real harness. In `dump` mode, print the captured actuals (fixture
+/// authoring). Otherwise diff against the committed `expected/*.jsonl`
+/// and assert the flattening + Breadcrumb-absence contracts.
+async fn run_transcript_render_child(dump: bool) {
+    let path = fixture_path("cli", "transcript-render");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load transcript-render fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The rich rows exist in outbound...
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let kinds = |k: &str| out.iter().filter(|r| r["kind"] == k).count();
+    assert_eq!(
+        kinds("todo_list"),
+        2,
+        "one TodoList row per todo_add: {out:#?}"
+    );
+    // Only the EDIT emits a Diff row — `write_file` creating a brand-new
+    // file does not (there is no before-content to diff against), which
+    // this pin records as part of today's behaviour.
+    assert_eq!(
+        kinds("diff"),
+        1,
+        "exactly the edit_file mutation emits a Diff row: {out:#?}",
+    );
+    // ...and since M22 D5 a cli run emits Breadcrumb rows: cli takes
+    // `Behavior::Transcript` (capabilities::renders_client_side_transcript),
+    // so the Task HUD emits every frame as a fresh Breadcrumb EVENT the
+    // client (`cclaw chat`) dedupes and repaints. This flips the Wave 0
+    // baseline, which pinned the ABSENCE of Breadcrumb rows on cli.
+    let breadcrumbs: Vec<&serde_json::Value> =
+        out.iter().filter(|r| r["kind"] == "breadcrumb").collect();
+    assert!(
+        !breadcrumbs.is_empty(),
+        "cli must now produce Breadcrumb transcript frames (D5): {out:#?}",
+    );
+    // The frames are EVENTS, never edits: no update_breadcrumb System
+    // row may exist — an append-only log has no edit anchor.
+    assert!(
+        !out.iter().any(|r| r
+            .get("content")
+            .and_then(|c| c.get("update_breadcrumb"))
+            .is_some()),
+        "cli transcript frames must never ride the update_breadcrumb edit rail: {out:#?}",
+    );
+    // Later frames carry the CUMULATIVE step transcript (the four tool
+    // calls), and the final frame is the done-collapse.
+    let last = &breadcrumbs.last().unwrap()["content"]["breadcrumb"];
+    assert_eq!(last["status"], "done", "the final frame collapses: {last}");
+    assert!(
+        last["summary"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("done in")),
+        "the collapse carries the final line: {last}",
+    );
+    assert_eq!(
+        last["steps"].as_array().map(Vec::len),
+        Some(4),
+        "the collapse keeps all four tool steps attached: {last}",
+    );
+    assert!(
+        breadcrumbs
+            .iter()
+            .any(|r| r["content"]["breadcrumb"]["steps"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty())
+                && r["content"]["breadcrumb"]["status"] == "running"),
+        "running frames must carry non-empty cumulative steps: {breadcrumbs:#?}",
+    );
+
+    // Delivery flattens both rich surfaces to text via the trait
+    // defaults — the todo checklist with its ASCII glyphs, and the diff
+    // as fenced unified-diff prose. The structured payloads die before
+    // the adapter, which is exactly what Wave 1's A5 changes for cli.
+    let cli = mock_for(&harness, "cli");
+    let deliveries = cli.deliveries();
+    let texts: Vec<&str> = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("[ ] Draft the release notes file")),
+        "the flattened todo checklist must reach the adapter as text: {texts:?}",
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("notes.txt")),
+        "the flattened diff must reach the adapter as text: {texts:?}",
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("both todos are staged")),
+        "the final chat answer must be delivered: {texts:?}",
     );
 }

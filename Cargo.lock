@@ -458,6 +458,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "copperclaw-channels-cli",
+ "copperclaw-channels-core",
  "copperclaw-db",
  "copperclaw-types",
  "rusqlite",

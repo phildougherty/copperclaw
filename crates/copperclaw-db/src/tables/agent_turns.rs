@@ -105,6 +105,48 @@ pub fn rollup_since(db: &CentralDb, since: DateTime<Utc>) -> Result<Vec<UsageRol
     Ok(rows)
 }
 
+/// Per-(group, model, provider) rollup over a time window.
+///
+/// Finer-grained companion to [`UsageRollup`]: cost is priced per model,
+/// so the usage handler needs the token sums split by which model (and
+/// which provider) produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUsageRollup {
+    pub agent_group_id: String,
+    pub model: String,
+    pub provider: String,
+    pub turns: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// Sum tokens + count turns per `(agent_group_id, model, provider)` since
+/// `since`. Pure read — the `idx_agent_turns_group_ended` index covers the
+/// scan; no migration required. Rows are ordered by group then descending
+/// output tokens so each group's heaviest model comes first.
+pub fn rollup_by_model_since(
+    db: &CentralDb,
+    since: DateTime<Utc>,
+) -> Result<Vec<ModelUsageRollup>, DbError> {
+    let conn = db.conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT agent_group_id,
+                model,
+                provider,
+                COUNT(*) AS turns,
+                COALESCE(SUM(input_tokens), 0)  AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM agent_turns
+         WHERE ended_at >= ?1
+         GROUP BY agent_group_id, model, provider
+         ORDER BY agent_group_id, output_tokens DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![since.to_rfc3339()], row_to_model_rollup)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Count LLM-call rows for `agent_group_id` since `since`.
 /// Used by the container manager to enforce per-minute and per-hour
 /// spawn-rate caps without pulling the full token history.
@@ -226,6 +268,23 @@ fn row_to_rollup(row: &Row<'_>) -> rusqlite::Result<UsageRollup> {
     })
 }
 
+fn row_to_model_rollup(row: &Row<'_>) -> rusqlite::Result<ModelUsageRollup> {
+    let agent_group_id: String = row.get(0)?;
+    let model: String = row.get(1)?;
+    let provider: String = row.get(2)?;
+    let turns: i64 = row.get(3)?;
+    let input_tokens: i64 = row.get(4)?;
+    let output_tokens: i64 = row.get(5)?;
+    Ok(ModelUsageRollup {
+        agent_group_id,
+        model,
+        provider,
+        turns,
+        input_tokens,
+        output_tokens,
+    })
+}
+
 fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -291,6 +350,79 @@ mod tests {
         let rollups = rollup_since(&db, Utc::now() - chrono::Duration::hours(24)).unwrap();
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].agent_group_id, "ag-recent");
+    }
+
+    fn turn_with_model(
+        ag: &str,
+        model: &str,
+        provider: &str,
+        input: i64,
+        output: i64,
+    ) -> NewAgentTurn {
+        let mut t = turn(ag, input, output);
+        t.model = model.into();
+        t.provider = provider.into();
+        t
+    }
+
+    #[test]
+    fn rollup_by_model_splits_groups_by_model() {
+        let db = CentralDb::open_in_memory().unwrap();
+        // ag-1 uses two models; ag-2 uses one.
+        insert(
+            &db,
+            &turn_with_model("ag-1", "claude-sonnet-4-6", "anthropic", 100, 200),
+        )
+        .unwrap();
+        insert(
+            &db,
+            &turn_with_model("ag-1", "claude-sonnet-4-6", "anthropic", 50, 75),
+        )
+        .unwrap();
+        insert(
+            &db,
+            &turn_with_model("ag-1", "claude-haiku-4-5", "anthropic", 10, 20),
+        )
+        .unwrap();
+        insert(&db, &turn_with_model("ag-2", "qwen3.6:27b", "ollama", 7, 9)).unwrap();
+        let rows = rollup_by_model_since(&db, Utc::now() - chrono::Duration::hours(1)).unwrap();
+        assert_eq!(rows.len(), 3);
+        // Ordered by group, then output_tokens DESC within the group.
+        assert_eq!(rows[0].agent_group_id, "ag-1");
+        assert_eq!(rows[0].model, "claude-sonnet-4-6");
+        assert_eq!(rows[0].provider, "anthropic");
+        assert_eq!(rows[0].turns, 2);
+        assert_eq!(rows[0].input_tokens, 150);
+        assert_eq!(rows[0].output_tokens, 275);
+        assert_eq!(rows[1].agent_group_id, "ag-1");
+        assert_eq!(rows[1].model, "claude-haiku-4-5");
+        assert_eq!(rows[1].turns, 1);
+        assert_eq!(rows[1].input_tokens, 10);
+        assert_eq!(rows[1].output_tokens, 20);
+        assert_eq!(rows[2].agent_group_id, "ag-2");
+        assert_eq!(rows[2].model, "qwen3.6:27b");
+        assert_eq!(rows[2].provider, "ollama");
+        assert_eq!(rows[2].turns, 1);
+    }
+
+    #[test]
+    fn rollup_by_model_filters_by_window() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut old = turn_with_model("ag-1", "claude-sonnet-4-6", "anthropic", 999, 999);
+        old.started_at = Utc::now() - chrono::Duration::hours(48);
+        old.ended_at = Utc::now() - chrono::Duration::hours(48);
+        insert(&db, &old).unwrap();
+        insert(
+            &db,
+            &turn_with_model("ag-1", "claude-sonnet-4-6", "anthropic", 5, 5),
+        )
+        .unwrap();
+        let rows = rollup_by_model_since(&db, Utc::now() - chrono::Duration::hours(24)).unwrap();
+        assert_eq!(rows.len(), 1);
+        // The old row's tokens must not leak into the recent bucket.
+        assert_eq!(rows[0].input_tokens, 5);
+        assert_eq!(rows[0].output_tokens, 5);
+        assert_eq!(rows[0].turns, 1);
     }
 
     #[test]

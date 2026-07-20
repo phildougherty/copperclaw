@@ -386,6 +386,10 @@ async fn run_one_turn(
         )),
         // F2: healthy e2e turn — recovery mode off.
         recovery_mode: false,
+        // M22 B1: no compaction notices expected in this one-turn e2e.
+        notices: Arc::new(copperclaw_runner::run::Notices::default()),
+        // M22 B4: fresh spend counters (no usage events in this e2e).
+        spend: Arc::new(copperclaw_runner::run::hud::TurnSpend::default()),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())
@@ -569,12 +573,14 @@ async fn e2e_chat_round_trip_via_fifo_and_log() {
                 panic!("expected reply in log: {e}");
             }
         };
-    // Sanity: the cli adapter prefixes outbound with its label
-    // (`"agent> "` by default). Anchor the assert on that to catch
-    // regressions in the cli renderer too.
+    // Sanity: in FIFO/log mode the cli adapter appends structured JSONL
+    // frames (`copperclaw_channels_cli::CliFrame`), one per line, with a
+    // `kind` discriminator. The mocked reply is a plain chat row, so the
+    // log must carry the exact chat frame — anchoring the assert on the
+    // frame bytes catches regressions in the cli JSONL renderer too.
     assert!(
-        body.contains("agent> hi from the mock") || body.contains("hi from the mock"),
-        "log body did not contain expected reply: {body:?}",
+        body.contains(r#"{"kind":"chat","text":"hi from the mock"}"#),
+        "log body did not contain expected chat frame: {body:?}",
     );
 
     // 9. Clean shutdown. Cancel the shared token; both tasks observe

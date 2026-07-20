@@ -1,11 +1,12 @@
 //! Slack [`ChannelAdapter`] implementation.
 
 use crate::api::{CompleteUploadEntry, SlackApi, build_card_blocks};
+use crate::factory::CHANNEL_TYPE_STR;
 use async_trait::async_trait;
 use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
-    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 use copperclaw_types::{ChannelType, OutboundFile, OutboundMessage};
 use serde_json::{Value, json};
@@ -606,11 +607,7 @@ pub(crate) fn build_breadcrumb_blocks(b: &Breadcrumb) -> Value {
     if !b.steps.is_empty() {
         return build_activity_blocks(b);
     }
-    let marker = match b.status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    };
+    let marker = breadcrumb_marker(b.status);
     // Inline-code the tool name (Slack mrkdwn uses backticks). Detail
     // text rides as plain mrkdwn so URLs/paths render normally.
     let mut text = format!("{marker} `{}`", escape_mrkdwn(&b.tool_name));
@@ -642,15 +639,15 @@ pub(crate) fn build_breadcrumb_blocks(b: &Breadcrumb) -> Value {
     ])
 }
 
-/// ASCII-only status marker per the project's no-emoji rule. Even
-/// non-emoji Unicode symbols render as colourful emoji on some clients;
-/// plain ASCII sidesteps that. Mirrors Telegram's `breadcrumb_glyph`.
+/// ASCII-only status marker per the project's no-emoji rule (even
+/// non-emoji Unicode symbols render as colourful emoji on some
+/// clients), looked up through the transcript vocabulary
+/// ([`vocab::for_channel`] binds `slack` to [`vocab::ASCII`],
+/// byte-identical to the literals this adapter hardcoded before
+/// M22 A4). Used by both the single-tool chip and the
+/// rolling-aggregate step lines.
 fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// Cap on steps rendered inside the activity region — keeps the section
@@ -999,15 +996,10 @@ pub(crate) fn build_todo_list_blocks(list: &TodoList) -> Value {
     }));
     for item in list.items.iter().take(48) {
         // 48 leaves headroom for header + footer-style addenda.
-        let emoji = match item.status {
-            // ASCII-only glyphs per the project's no-emoji rule.
-            // Slack emoji shortcodes (`:white_check_mark:` etc.)
-            // render as colourful emoji in the client.
-            TodoItemStatus::Completed => "[x]",
-            TodoItemStatus::InProgress => "[~]",
-            TodoItemStatus::Blocked => "[!]",
-            TodoItemStatus::Pending => "[ ]",
-        };
+        // ASCII-only glyphs via the vocab binding, per the project's
+        // no-emoji rule. Slack emoji shortcodes (`:white_check_mark:`
+        // etc.) render as colourful emoji in the client.
+        let emoji = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
         let escaped = escape_mrkdwn(item.text.trim());
         let mut body = if item.status == TodoItemStatus::Completed {
             // mrkdwn `~text~` renders as strikethrough.
@@ -2431,6 +2423,78 @@ mod tests {
         let prog_text = arr[2]["text"]["text"].as_str().unwrap();
         assert!(prog_text.contains("[~]"));
         assert!(prog_text.contains("Dry dishes"));
+    }
+
+    #[test]
+    fn build_todo_list_blocks_items_are_byte_identical_to_pre_vocab_literals() {
+        // M22 A4 byte-identity gate for the vocab rerouting: the
+        // expected strings are hardcoded literals of the exact
+        // pre-vocab output (all four statuses) — deliberately NOT read
+        // through vocab constants, which would be circular.
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on API key".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        let blocks = super::build_todo_list_blocks(&list);
+        let arr = blocks.as_array().expect("array");
+        assert_eq!(arr[1]["text"]["text"], "[x] ~done item~");
+        assert_eq!(arr[2]["text"]["text"], "[~] active item");
+        assert_eq!(
+            arr[3]["text"]["text"],
+            "[!] stuck item _(blocked: waiting on API key)_"
+        );
+        assert_eq!(arr[4]["text"]["text"], "[ ] later item");
+    }
+
+    #[test]
+    fn build_breadcrumb_blocks_text_is_byte_identical_to_pre_vocab_literals() {
+        // Same M22 A4 byte-identity gate for the breadcrumb rail
+        // markers: hardcoded literal expectations, not vocab constants.
+        use copperclaw_channels_core::Breadcrumb;
+        let running = Breadcrumb::running("shell").with_detail("cargo check");
+        assert_eq!(
+            super::build_breadcrumb_blocks(&running)[0]["elements"][0]["text"],
+            "[~] `shell` · cargo check"
+        );
+        let done = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        assert_eq!(
+            super::build_breadcrumb_blocks(&done)[0]["elements"][0]["text"],
+            "[ok] `shell` · cargo check — passed (0.4s)"
+        );
+        let failed = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(false, Some("timeout".into()));
+        assert_eq!(
+            super::build_breadcrumb_blocks(&failed)[0]["elements"][0]["text"],
+            "[x] `shell` · cargo check — failed: timeout"
+        );
     }
 
     #[tokio::test]

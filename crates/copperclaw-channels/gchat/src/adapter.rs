@@ -2,10 +2,11 @@
 
 use crate::api::GchatApi;
 use crate::emoji::emoji_codepoint;
+use crate::factory::CHANNEL_TYPE_STR;
 use async_trait::async_trait;
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter, DiffCard,
-    DmHandle, ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    DmHandle, ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 use copperclaw_types::{ChannelType, OutboundMessage};
 use serde_json::{Value, json};
@@ -479,11 +480,7 @@ pub(crate) fn build_breadcrumb_card(b: &Breadcrumb) -> Value {
     // BOOKMARK) but those render as colourful inline pictograms —
     // visually indistinguishable from emoji to the user — so they're
     // dropped in favour of a plain-text prefix on `topLabel`.
-    let marker = match b.status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    };
+    let marker = activity_marker(b.status);
     let top_label = format!("{marker} {}", b.tool_name);
     let mut body = String::new();
     if let Some(d) = b.detail.as_deref() {
@@ -597,15 +594,15 @@ pub(crate) fn build_activity_card(b: &Breadcrumb) -> Value {
 }
 
 /// ASCII-only status marker per the project's no-emoji rule — shared by
-/// the collapsed summary header and each step line. Cards v2 `knownIcon`
-/// renders as a colourful pictogram (emoji-equivalent to the user), so a
-/// plain-text prefix is used instead.
+/// the single-tool chip, the collapsed summary header and each step
+/// line. Looked up through the transcript vocabulary
+/// ([`vocab::for_channel`] binds `gchat` to [`vocab::ASCII`],
+/// byte-identical to the literals this adapter hardcoded before
+/// M22 A4). Cards v2 `knownIcon` renders as a colourful pictogram
+/// (emoji-equivalent to the user), so a plain-text prefix is used
+/// instead.
 fn activity_marker(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
 
 /// Render one styled step line for the activity card's collapsible body:
@@ -678,10 +675,13 @@ pub(crate) fn build_error_card(err: &ErrorCard) -> Value {
     let mut widgets: Vec<Value> = Vec::with_capacity(3);
     // No `startIcon` — Cards v2 `knownIcon` renders as a colourful
     // pictogram which violates the project's no-emoji rule. The text
-    // already carries an "[!]" prefix + bold label.
+    // carries an attention prefix + bold label instead; the prefix
+    // reuses the vocab *blocked* glyph (`[!]`), the transcript
+    // vocabulary's one attention marker.
+    let attention = vocab::for_channel(CHANNEL_TYPE_STR).todo.blocked;
     widgets.push(json!({
         "decoratedText": {
-            "text": format!("[!] <b>{}</b>", escape_html_gchat(label)),
+            "text": format!("{attention} <b>{}</b>", escape_html_gchat(label)),
         }
     }));
     if let Some(d) = err.details.as_deref() {
@@ -835,15 +835,11 @@ pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
         .items
         .iter()
         .map(|item| {
-            // ASCII-only status marker per the project's no-emoji rule.
-            // `knownIcon` renders as a colourful Material pictogram —
-            // visually indistinguishable from emoji to the user.
-            let marker = match item.status {
-                TodoItemStatus::Completed => "[x]",
-                TodoItemStatus::InProgress => "[~]",
-                TodoItemStatus::Blocked => "[!]",
-                TodoItemStatus::Pending => "[ ]",
-            };
+            // ASCII-only status marker via the vocab binding, per the
+            // project's no-emoji rule. `knownIcon` renders as a
+            // colourful Material pictogram — visually
+            // indistinguishable from emoji to the user.
+            let marker = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
             let escaped = escape_html_gchat(item.text.trim());
             let mut body = if item.status == TodoItemStatus::Completed {
                 // <s> = strikethrough; muted grey reinforces "done".
@@ -2299,6 +2295,101 @@ mod tests {
         assert!(widgets[1]["decoratedText"].get("startIcon").is_none());
         let prog_body = widgets[1]["decoratedText"]["text"].as_str().unwrap();
         assert!(prog_body.starts_with("[~]"), "got: {prog_body}");
+    }
+
+    #[test]
+    fn build_todo_list_card_items_are_byte_identical_to_pre_vocab_literals() {
+        // M22 A4 byte-identity gate for the vocab rerouting: the
+        // expected strings are hardcoded literals of the exact
+        // pre-vocab output (all four statuses) — deliberately NOT read
+        // through vocab constants, which would be circular.
+        use copperclaw_channels_core::TodoListItem;
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "done item".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "active item".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 3,
+                    text: "stuck item".into(),
+                    status: TodoItemStatus::Blocked,
+                    blocked_reason: Some("waiting on API key".into()),
+                },
+                TodoListItem {
+                    id: 4,
+                    text: "later item".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        let card = super::build_todo_list_card(&list);
+        let widgets = card["sections"][0]["widgets"].as_array().unwrap();
+        assert_eq!(
+            widgets[0]["decoratedText"]["text"],
+            "[x] <font color=\"#808080\"><s>done item</s></font>"
+        );
+        assert_eq!(widgets[1]["decoratedText"]["text"], "[~] active item");
+        assert_eq!(
+            widgets[2]["decoratedText"]["text"],
+            "[!] stuck item <font color=\"#d93025\"><i>(blocked: waiting on API key)</i></font>"
+        );
+        assert_eq!(widgets[3]["decoratedText"]["text"], "[ ] later item");
+    }
+
+    #[test]
+    fn build_breadcrumb_card_top_label_is_byte_identical_to_pre_vocab_literals() {
+        // Same M22 A4 byte-identity gate for the breadcrumb rail
+        // markers: hardcoded literal expectations, not vocab constants.
+        use copperclaw_channels_core::Breadcrumb;
+        let running = Breadcrumb::running("shell").with_detail("cargo check");
+        let card = super::build_breadcrumb_card(&running);
+        assert_eq!(
+            card["sections"][0]["widgets"][0]["decoratedText"]["topLabel"],
+            "[~] shell"
+        );
+        let done = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed".into()));
+        let card = super::build_breadcrumb_card(&done);
+        assert_eq!(
+            card["sections"][0]["widgets"][0]["decoratedText"]["topLabel"],
+            "[ok] shell"
+        );
+        let failed = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(false, Some("exit 1".into()));
+        let card = super::build_breadcrumb_card(&failed);
+        assert_eq!(
+            card["sections"][0]["widgets"][0]["decoratedText"]["topLabel"],
+            "[x] shell"
+        );
+    }
+
+    #[test]
+    fn build_error_card_attention_prefix_is_byte_identical_to_pre_vocab_literal() {
+        // Same M22 A4 byte-identity gate for the error-card attention
+        // prefix (the vocab *blocked* glyph): hardcoded literal.
+        let card = copperclaw_channels_core::ErrorCard::new(
+            copperclaw_channels_core::ErrorCardKind::Internal,
+            "boom",
+        )
+        .with_title("Tool failed");
+        let built = super::build_error_card(&card);
+        assert_eq!(
+            built["sections"][0]["widgets"][0]["decoratedText"]["text"],
+            "[!] <b>Tool error</b>"
+        );
     }
 
     #[tokio::test]

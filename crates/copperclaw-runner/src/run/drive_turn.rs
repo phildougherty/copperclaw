@@ -349,6 +349,10 @@ pub(super) async fn drive_turn_with_health(
     context_block: Option<&str>,
     health: &FailoverHealth,
 ) -> Result<TurnResult> {
+    // M22 B4: zero the live spend counters at inbound entry so the HUD's
+    // token/cost fields are per-task (the provider-call layer bumps them
+    // with every billed call from here on).
+    deps.spend.reset();
     // One Task HUD per inbound: posted at the first tool call, edited
     // in place around every tool batch (plus a wall-clock ticker), then
     // collapsed to a one-line summary here — on the failure paths too,
@@ -715,6 +719,10 @@ async fn drive_turn_inner(
                     let reason: String = content.chars().take(240).collect();
                     tracing::warn!(tool_turn, tool = %call.name, reason, "tool call failed");
                 }
+                // M22 B5: fold the completed call into the HUD's bounded
+                // step transcript (tool name, arg summary, result line,
+                // done/failed) so the next frame's `steps` carry it.
+                hud.record_step(&call.name, &call.input, &content, is_error);
                 // F2: fold this result into the tail-run tracker in call
                 // order — a run of same-blocker denials at the tail of a
                 // silent turn surfaces one curated wall card at finalize.
@@ -891,6 +899,19 @@ async fn drive_turn_inner(
                 // ceiling — extend by another block silently (no operator
                 // interruption). `made_progress` resets at the top of the next
                 // iteration.
+                //
+                // M22 B2: surface the extension as a one-shot HUD note (the
+                // next live frame renders it once), NOT a chat row — a chat
+                // row here would be a periodic "still working" message under
+                // another name. Gated on `total_turns >= soft` (always true
+                // at this point, kept explicit) so the common short run —
+                // which returns out of the block before ever reaching this
+                // arm — stays byte-stable.
+                if total_turns >= soft {
+                    hud.add_note(&format!(
+                        "extended tool budget ({total_turns}/{hard} turns)"
+                    ));
+                }
                 tracing::debug!(
                     target: "copperclaw_runner",
                     total_turns,
@@ -2078,9 +2099,11 @@ mod execute_tool_batch_tests {
         );
     }
 
-    /// A bare adapter (cli: no `edit_message`) must get the old
-    /// behaviour — no HUD rows at all in a fast run (the periodic
-    /// status row only fires after a 60s silent stretch).
+    /// A bare adapter (webhooks: no `edit_message`, no client-side
+    /// transcript renderer) must get the old behaviour — no HUD rows at
+    /// all in a fast run (the periodic status row only fires after a
+    /// 60s silent stretch). Rode cli before M22 D5 promoted cli onto
+    /// the Transcript path.
     #[tokio::test]
     async fn hud_bare_adapter_emits_no_hud_rows() {
         let tracker = Arc::new(ConcurrencyTracker::default());
@@ -2090,7 +2113,7 @@ mod execute_tool_batch_tests {
             hud_scripts(3, "done"),
         );
         deps.tool_ctx
-            .set_originating(Some("cli"), Some("stdin"), None, None);
+            .set_originating(Some("webhooks"), Some("hook-1"), None, None);
 
         let mut history: Vec<HistoryMessage> = Vec::new();
         let result = drive_turn(&deps, &mut history, None, None).await.unwrap();

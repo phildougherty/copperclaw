@@ -30,6 +30,7 @@
 //! - `detail` ≤ [`MAX_DETAIL_CHARS`].
 //! - `summary` ≤ [`MAX_SUMMARY_CHARS`].
 
+use crate::vocab::{self, Vocabulary};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -228,9 +229,30 @@ impl Breadcrumb {
     /// - `Running`: `[shell] cargo check`
     /// - `Done` with summary: `[shell] cargo check — passed (0.4s)`
     /// - `Failed` with summary: `[shell] cargo check — failed: timeout`
-    /// - `Done` no summary: `[shell] cargo check ✓`
-    /// - `Failed` no summary: `[shell] cargo check ✗`
+    /// - `Done` no summary: `[shell] cargo check (done)`
+    /// - `Failed` no summary: `[shell] cargo check (failed)`
     pub fn to_text_fallback(&self) -> String {
+        self.to_text_fallback_with(&vocab::ASCII)
+    }
+
+    /// [`Self::to_text_fallback`] parameterised over a transcript
+    /// [`Vocabulary`] (M22 A2). With [`vocab::ASCII`] the output is
+    /// byte-identical to the historical renderer.
+    ///
+    /// None of this renderer's joining literals routes through the
+    /// vocabulary's `Layout` yet: the `" — "` summary join and the
+    /// `" · "` aggregate head/summary join have no matching slot (ASCII
+    /// `separator` is `" | "`), so rerouting either would change bytes.
+    /// They stay hardcoded until `Layout` grows the right granularity;
+    /// the vocabulary is threaded through the recursive step rendering
+    /// so the signature is already in place for the transcript
+    /// renderers of later M22 cards.
+    // The lint is right that `vocab` only reaches the recursive call
+    // today — that is the deliberate state documented above, not an
+    // accident, so it is allowed rather than "fixed" by dropping the
+    // parameter.
+    #[allow(clippy::only_used_in_recursion)]
+    pub fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
         // Rolling aggregate: a summary line plus one plain line per step.
         // Channels without a native collapse affordance still get the
         // low-churn rolling view (just not collapsed).
@@ -252,7 +274,7 @@ impl Breadcrumb {
             }
             for step in &self.steps {
                 out.push_str("\n  ");
-                out.push_str(&step.to_text_fallback());
+                out.push_str(&step.to_text_fallback_with(vocab));
             }
             return out;
         }
@@ -268,9 +290,9 @@ impl Breadcrumb {
             (BreadcrumbStatus::Failed, Some(s)) if !s.trim().is_empty() => {
                 format!("{head} — failed: {}", s.trim())
             }
-            // The status-only suffix uses ASCII glyphs so it survives every
-            // channel's text encoding — adapters that want fancier presence
-            // are expected to override `deliver_breadcrumb`.
+            // The status-only suffix is a plain ASCII word so it survives
+            // every channel's text encoding — adapters that want fancier
+            // presence are expected to override `deliver_breadcrumb`.
             (BreadcrumbStatus::Done, _) => format!("{head} (done)"),
             (BreadcrumbStatus::Failed, _) => format!("{head} (failed)"),
         }
@@ -411,6 +433,62 @@ mod tests {
         // Each step on its own indented line, reusing the single-chip format.
         assert!(txt.contains("\n  [read_file] a.rs — 10 lines"), "{txt}");
         assert!(txt.contains("\n  [shell] cargo build"), "{txt}");
+    }
+
+    #[test]
+    fn text_fallback_with_ascii_is_byte_identical_to_pre_vocab_output() {
+        // Hardcoded expected literals of the exact pre-A2 output (NOT
+        // built from vocab constants — that would be circular): the
+        // byte-identity proof for the to_text_fallback_with rerouting.
+        let cases: [(Breadcrumb, &str); 6] = [
+            (running_shell(), "[shell] cargo check"),
+            (Breadcrumb::running("shell"), "[shell]"),
+            (
+                running_shell().finished(true, Some("passed (0.4s)".into())),
+                "[shell] cargo check — passed (0.4s)",
+            ),
+            (
+                running_shell().finished(false, Some("timeout".into())),
+                "[shell] cargo check — failed: timeout",
+            ),
+            (
+                running_shell().finished(true, None),
+                "[shell] cargo check (done)",
+            ),
+            (
+                running_shell().finished(false, None),
+                "[shell] cargo check (failed)",
+            ),
+        ];
+        for (b, expected) in cases {
+            assert_eq!(b.to_text_fallback(), expected);
+            assert_eq!(b.to_text_fallback_with(&vocab::ASCII), expected);
+        }
+    }
+
+    #[test]
+    fn text_fallback_with_ascii_aggregate_is_byte_identical_to_pre_vocab_output() {
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("a.rs")
+                .finished(true, Some("10 lines".into())),
+            Breadcrumb::running("shell").with_detail("cargo build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell cargo build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        // Pins the hardcoded " · " head/summary join and the recursive
+        // step lines (see to_text_fallback_with on why the joins stay
+        // hardcoded).
+        let expected = "shell cargo build · 1/2 steps\n  \
+                        [read_file] a.rs — 10 lines\n  \
+                        [shell] cargo build";
+        assert_eq!(agg.to_text_fallback(), expected);
+        assert_eq!(agg.to_text_fallback_with(&vocab::ASCII), expected);
     }
 
     #[test]

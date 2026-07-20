@@ -1,0 +1,16 @@
+{
+  "name": "cli-transcript-render",
+  "channel": "cli",
+  "description": "M22 Wave 0: rich payloads on the cli surface, pinned as they render TODAY. Two todo_add turns emit TodoList rows and the edit_file turn emits a Diff row (write_file creating a brand-new file emits none — no before-content to diff, also pinned here); the delivery loop hands all of them to a bare (non-rich) adapter, so every structured payload is flattened to text via the ChannelAdapter trait defaults — exactly the flattening the real CliAdapter performs for chat.log. The expected delivered stream is the byte baseline Wave 1's A5 structured-JSONL cli output will diff against. Since Wave 3's D5, cli takes Behavior::Transcript (capabilities::renders_client_side_transcript): the Task HUD emits every frame as a fresh Breadcrumb EVENT (batch-start/batch-end frames with cumulative steps, then the done-collapse) and never an update_breadcrumb edit — cclaw chat dedupes and repaints client-side. Runs under a re-exec'd child with COPPERCLAW_DATA_ROOT set (the todo store path resolves through it) — see replay.rs. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 10000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "channel_type": "telegram",
+  "platform_id": "100",
+  "thread_id": null,
+  "message": {
+    "id": "tg-auto-compact-002",
+    "kind": "chat",
+    "content": {
+      "text": "what does it say about capacity planning and failure modes?"
+    },
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": null,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "telegram",
+    "identity": "200",
+    "display_name": "Test User"
+  }
+}

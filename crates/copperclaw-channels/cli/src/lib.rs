@@ -25,22 +25,35 @@
 //!
 //! ## Wire format
 //!
-//! One message per line, plain UTF-8 text, no JSON wrapping. Each
-//! inbound line becomes an `InboundEvent` with `channel_type = "cli"`,
-//! `platform_id = "stdin"` (legacy name — kept stable so existing
-//! messaging-group rows match regardless of which mode the host runs
-//! in), and a chat `InboundMessage` carrying `{"text": <line>}`.
+//! **Inbound** (both modes): one message per line, plain UTF-8 text, no
+//! JSON wrapping. Each inbound line becomes an `InboundEvent` with
+//! `channel_type = "cli"`, `platform_id = "stdin"` (legacy name — kept
+//! stable so existing messaging-group rows match regardless of which
+//! mode the host runs in), and a chat `InboundMessage` carrying
+//! `{"text": <line>}`.
+//!
+//! **Outbound** depends on the mode:
+//!
+//! - stdio mode writes legacy labelled text (`agent> hello`) so the
+//!   developer REPL stays human-readable.
+//! - FIFO/log mode appends one [`CliFrame`] JSONL frame per delivery so
+//!   structured payloads (breadcrumbs, todo lists, diffs, …) survive to
+//!   the `cclaw chat` renderer. See [`CliFrame`] for the wire contract
+//!   and the per-line sniff rule readers use to tell the two formats
+//!   apart.
 //!
 //! See `PLAN.md` § 6 (T6a).
 
 use async_trait::async_trait;
 use chrono::Utc;
 use copperclaw_channels_core::{
-    AdapterError, ChannelAdapter, ChannelFactory, ChannelSetup, ContainerContribution, DmHandle,
+    AdapterError, Breadcrumb, Card, ChannelAdapter, ChannelFactory, ChannelSetup,
+    ContainerContribution, DiffCard, DmHandle, ErrorCard, ThinkingBlock, TodoList,
 };
 use copperclaw_types::{
     ChannelType, InboundEvent, InboundMessage, MessageKind, OutboundMessage, SenderIdentity,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,6 +67,69 @@ pub const DEFAULT_LABEL: &str = "agent> ";
 
 /// Channel-type string used by this channel (`"cli"`).
 pub const CHANNEL_TYPE_STR: &str = ChannelType::CLI;
+
+/// One structured outbound frame in the FIFO/log-mode `chat.log` stream.
+///
+/// ## Wire contract (stable — `cclaw chat` deserializes these)
+///
+/// In FIFO/log mode every outbound delivery appends exactly ONE line to
+/// the log file: the compact `serde_json` encoding of this enum. The
+/// `kind` field is the discriminator and the structured payload lives
+/// under a sibling field named after the kind, reusing the core schema
+/// types' existing serde shapes (`Breadcrumb`, `TodoList`, `DiffCard`,
+/// …) so the wire matches the `messages-out.jsonl` conventions and
+/// readers deserialize with the same structs the runner emitted:
+///
+/// ```json
+/// {"kind":"chat","text":"hello"}
+/// {"kind":"breadcrumb","breadcrumb":{"tool_name":"shell","status":"running"}}
+/// {"kind":"todo_list","todo_list":{"items":[{"id":1,"text":"a","status":"pending"}]}}
+/// ```
+///
+/// ## Sniff rule for readers
+///
+/// Logs written before this format existed contain legacy labelled text
+/// (`agent> hello`). Readers MUST sniff per line:
+/// `line.starts_with('{')` means "parse as a `CliFrame`", anything else
+/// is legacy plain text. A frame line always starts with `{`, and a
+/// legacy line never does under the default `"agent> "` label. `cclaw
+/// chat` seeks to `SeekFrom::End(0)` before tailing, so mixed-era
+/// history is never replayed and the format transition is free.
+///
+/// JSON string escaping keeps embedded newlines inside the frame, so a
+/// multi-line body is always exactly one log line — fixing the legacy
+/// corruption where the label prefixed only the first physical line of
+/// a multi-line reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CliFrame {
+    /// Plain chat text, plus attachment filenames when the outbound row
+    /// carried files.
+    Chat {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
+    /// A portable [`Card`].
+    Card { card: Card },
+    /// A tool [`Breadcrumb`] chip.
+    Breadcrumb { breadcrumb: Breadcrumb },
+    /// A file-edit [`DiffCard`].
+    Diff { diff: DiffCard },
+    /// The long-output collapsible treatment of a chat body.
+    Collapsible {
+        text: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preview_lines: Vec<String>,
+    },
+    /// A live [`TodoList`] checklist.
+    TodoList { todo_list: TodoList },
+    /// A host-emitted [`ErrorCard`].
+    Error { error: ErrorCard },
+    /// A model-reasoning [`ThinkingBlock`].
+    Thinking { thinking: ThinkingBlock },
+}
 
 /// Configuration read from `ChannelSetup::config`.
 ///
@@ -123,6 +199,11 @@ impl CliConfig {
 pub struct CliAdapter {
     channel_type: ChannelType,
     label: String,
+    /// `true` when the writer is the `chat.log` file (FIFO/log mode):
+    /// outbound deliveries are serialized as [`CliFrame`] JSONL frames.
+    /// `false` on the stdio path, which keeps the legacy labelled-text
+    /// formatting for the human-facing developer REPL.
+    structured: bool,
     writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
     /// When the adapter is in FIFO mode we keep a writer handle to the
@@ -161,6 +242,7 @@ impl CliAdapter {
         Self {
             channel_type: ChannelType::new(ChannelType::CLI),
             label: label.into(),
+            structured: false,
             writer: Arc::new(Mutex::new(Box::new(writer))),
             reader_task: Mutex::new(Some(task)),
             _fifo_writer_keepalive: None,
@@ -244,10 +326,29 @@ impl CliAdapter {
         Ok(Self {
             channel_type: ChannelType::new(ChannelType::CLI),
             label: label.into(),
+            // Structured JSONL frames only when writing to the log
+            // file; when `log` is unset replies still go to stdout,
+            // which keeps the human-readable legacy formatting.
+            structured: log.is_some(),
             writer: Arc::new(Mutex::new(writer)),
             reader_task: Mutex::new(Some(reader_task)),
             _fifo_writer_keepalive: keepalive,
         })
+    }
+
+    /// Serialize `frame` compactly and append it as one line to the
+    /// writer (log-mode only). One frame per line is the invariant the
+    /// [`CliFrame`] sniff rule depends on — `serde_json` string escaping
+    /// guarantees the encoded frame itself contains no raw newline.
+    async fn write_frame(&self, frame: &CliFrame) -> Result<(), AdapterError> {
+        let line = serde_json::to_string(frame).map_err(|e| {
+            AdapterError::Io(std::io::Error::other(format!("encode cli frame: {e}")))
+        })?;
+        let mut guard = self.writer.lock().await;
+        guard.write_all(line.as_bytes()).await?;
+        guard.write_all(b"\n").await?;
+        guard.flush().await?;
+        Ok(())
     }
 
     /// Abort the background reader (used by tests; not part of the
@@ -438,6 +539,20 @@ impl ChannelAdapter for CliAdapter {
         _thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            let text = message
+                .content
+                .get("text")
+                .and_then(Value::as_str)
+                .map_or_else(|| message.content.to_string(), str::to_owned);
+            let files = message
+                .files
+                .iter()
+                .map(|f| f.filename.clone())
+                .collect::<Vec<_>>();
+            self.write_frame(&CliFrame::Chat { text, files }).await?;
+            return Ok(None);
+        }
         let line = render_outbound(message);
         let mut guard = self.writer.lock().await;
         guard.write_all(self.label.as_bytes()).await?;
@@ -445,6 +560,153 @@ impl ChannelAdapter for CliAdapter {
         guard.write_all(b"\n").await?;
         guard.flush().await?;
         Ok(None)
+    }
+
+    // -------------------------------------------------------------------
+    // Rich deliver hooks. The delivery service calls these on every
+    // adapter regardless of capability; the trait defaults flatten the
+    // structured payload to text via `to_text_fallback()` before
+    // `deliver` ever runs, which is exactly where cli structure used to
+    // die. In log mode each hook serializes its payload as a
+    // [`CliFrame`] instead, so `cclaw chat` can render it natively; on
+    // the stdio path each hook reproduces the trait-default text
+    // flattening so the developer REPL stays human-readable.
+    //
+    // The log is append-only and `deliver` returns no message id, so
+    // `existing_message_id` / `pin_hint` are ignored — the client
+    // dedupes and repaints frames itself (M22 Finding 3).
+    // -------------------------------------------------------------------
+
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Card { card: card.clone() })
+                .await?;
+            return Ok(None);
+        }
+        let text = card.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
+    }
+
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        breadcrumb: &Breadcrumb,
+        _existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Breadcrumb {
+                breadcrumb: breadcrumb.clone(),
+            })
+            .await?;
+            return Ok(None);
+        }
+        let text = breadcrumb.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
+    }
+
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Diff { diff: diff.clone() })
+                .await?;
+            return Ok(None);
+        }
+        let text = diff.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
+    }
+
+    async fn deliver_collapsible(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+        summary: &str,
+        preview_lines: &[String],
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Collapsible {
+                text: text.to_owned(),
+                summary: summary.to_owned(),
+                preview_lines: preview_lines.to_vec(),
+            })
+            .await?;
+            return Ok(None);
+        }
+        let body = copperclaw_channels_core::render_collapsible_text_fallback(
+            text,
+            summary,
+            preview_lines,
+        );
+        self.deliver_text_capped(platform_id, thread_id, &body)
+            .await
+    }
+
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        list: &TodoList,
+        _existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::TodoList {
+                todo_list: list.clone(),
+            })
+            .await?;
+            return Ok(None);
+        }
+        let text = list.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
+    }
+
+    async fn deliver_error(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        err: &ErrorCard,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Error { error: err.clone() })
+                .await?;
+            return Ok(None);
+        }
+        let text = err.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
+    }
+
+    async fn deliver_thinking(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        thinking: &ThinkingBlock,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.structured {
+            self.write_frame(&CliFrame::Thinking {
+                thinking: thinking.clone(),
+            })
+            .await?;
+            return Ok(None);
+        }
+        let text = thinking.to_text_fallback();
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
@@ -621,6 +883,9 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_writes_label_and_text() {
+        // stdio mode (`new_with_io`) keeps the LEGACY labelled-text
+        // formatting — only FIFO/log mode emits `CliFrame` JSONL. This
+        // pins the legacy half of the sniff contract.
         let reader = BufReader::new(Cursor::new(b""));
         let (mut client, server) = tokio::io::duplex(1024);
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
@@ -642,6 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_renders_non_text_content_as_json() {
+        // stdio mode: legacy formatting (compact JSON body, no frame).
         let (mut client, server) = tokio::io::duplex(1024);
         let reader = BufReader::new(Cursor::new(b""));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
@@ -665,6 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_appends_attachment_list() {
+        // stdio mode: legacy `[files: …]` suffix formatting.
         let (mut client, server) = tokio::io::duplex(1024);
         let reader = BufReader::new(Cursor::new(b""));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
@@ -696,6 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_attachment_only_when_text_empty() {
+        // stdio mode: legacy attachment-only rendering.
         let (mut client, server) = tokio::io::duplex(1024);
         let reader = BufReader::new(Cursor::new(b""));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
@@ -846,6 +1114,8 @@ mod tests {
 
     #[test]
     fn render_outbound_text_path() {
+        // `render_outbound` is the LEGACY stdio-mode renderer only; the
+        // structured log path serializes a `CliFrame` and never calls it.
         let msg = outbound_text("hi");
         assert_eq!(render_outbound(&msg), "hi");
     }
@@ -946,13 +1216,14 @@ mod tests {
         assert_eq!(evt.channel_type.as_str(), "cli");
         assert_eq!(evt.platform_id, "stdin");
 
-        // Deliver writes to the log.
+        // Deliver writes a structured JSONL chat frame to the log
+        // (log mode never uses the label — that is stdio-only).
         adapter
             .deliver("p", None, &outbound_text("reply"))
             .await
             .unwrap();
         let log_contents = tokio::fs::read_to_string(&log).await.unwrap();
-        assert_eq!(log_contents, "agent> reply\n");
+        assert_eq!(log_contents, "{\"kind\":\"chat\",\"text\":\"reply\"}\n");
     }
 
     #[cfg(unix)]
@@ -1025,8 +1296,14 @@ mod tests {
             .deliver("p", None, &outbound_text("second"))
             .await
             .unwrap();
+        // Appends (never truncates) one JSONL chat frame per delivery;
+        // the seeded legacy line is left untouched, which is exactly the
+        // mixed-era log the sniff rule handles.
         let body = tokio::fs::read_to_string(&log).await.unwrap();
-        assert_eq!(body, "prior\nagent> first\nagent> second\n");
+        assert_eq!(
+            body,
+            "prior\n{\"kind\":\"chat\",\"text\":\"first\"}\n{\"kind\":\"chat\",\"text\":\"second\"}\n"
+        );
     }
 
     #[cfg(unix)]
@@ -1075,5 +1352,394 @@ mod tests {
         // Second call must not error even though the FIFO already exists.
         ensure_fifo(&p).unwrap();
         assert!(p.exists());
+    }
+
+    // -------------------------------------------------------------------
+    // Structured JSONL frames (FIFO/log mode). Every test pins the exact
+    // frame bytes — the wire contract `cclaw chat` deserializes.
+    // -------------------------------------------------------------------
+
+    use copperclaw_channels_core::{
+        BreadcrumbStatus, DiffHunk, DiffLine, DiffLineKind, ErrorCardKind, TodoItemStatus,
+        TodoListItem,
+    };
+
+    /// Build a log-mode adapter (structured JSONL output) writing into a
+    /// fresh log file inside `dir`. No FIFO — inbound is irrelevant here.
+    async fn log_adapter(dir: &tempfile::TempDir) -> (CliAdapter, PathBuf) {
+        let log = dir.path().join("chat.log");
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(2);
+        let adapter = CliAdapter::new_with_paths(None, Some(&log), tx, "agent> ")
+            .await
+            .unwrap();
+        (adapter, log)
+    }
+
+    #[tokio::test]
+    async fn log_mode_chat_frame_includes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({ "text": "see attached" }),
+            files: vec![
+                OutboundFile {
+                    filename: "a.txt".into(),
+                    data: vec![1],
+                },
+                OutboundFile {
+                    filename: "b.png".into(),
+                    data: vec![],
+                },
+            ],
+        };
+        adapter.deliver("p", None, &msg).await.unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"chat\",\"text\":\"see attached\",\"files\":[\"a.txt\",\"b.png\"]}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_multiline_body_stays_one_frame_line() {
+        // The legacy format corrupted the tail here: only the first
+        // physical line carried the label. JSON string escaping keeps
+        // the whole body inside a single log line.
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        adapter
+            .deliver("p", None, &outbound_text("one\ntwo\nthree"))
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(body, "{\"kind\":\"chat\",\"text\":\"one\\ntwo\\nthree\"}\n");
+        assert_eq!(body.lines().count(), 1, "one frame must be one line");
+    }
+
+    #[tokio::test]
+    async fn log_mode_breadcrumb_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let bc = Breadcrumb {
+            tool_name: "shell".into(),
+            detail: Some("cargo check".into()),
+            status: BreadcrumbStatus::Running,
+            summary: None,
+            steps: vec![],
+        };
+        let id = adapter
+            .deliver_breadcrumb("p", None, &bc, None)
+            .await
+            .unwrap();
+        assert!(id.is_none(), "append-only log anchors no edits");
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"breadcrumb\",\"breadcrumb\":{\"tool_name\":\"shell\",\"detail\":\"cargo check\",\"status\":\"running\"}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_breadcrumb_ignores_existing_message_id() {
+        // `existing_message_id` is an edit anchor; the log is append-only
+        // so a fresh frame is emitted and no id is returned.
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let bc = Breadcrumb {
+            tool_name: "shell".into(),
+            detail: None,
+            status: BreadcrumbStatus::Done,
+            summary: Some("passed (1.8s)".into()),
+            steps: vec![],
+        };
+        let id = adapter
+            .deliver_breadcrumb("p", None, &bc, Some("prev-9"))
+            .await
+            .unwrap();
+        assert!(id.is_none());
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"breadcrumb\",\"breadcrumb\":{\"tool_name\":\"shell\",\"status\":\"done\",\"summary\":\"passed (1.8s)\"}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_todo_list_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let list = TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "write tests".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "run gate".into(),
+                    status: TodoItemStatus::Pending,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Plan".into()),
+        };
+        let id = adapter
+            .deliver_todo_list("p", None, &list, Some("prev-1"), true)
+            .await
+            .unwrap();
+        assert!(id.is_none(), "pin hint and edit anchor are ignored");
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"todo_list\",\"todo_list\":{\"items\":[{\"id\":1,\"text\":\"write tests\",\"status\":\"in_progress\"},{\"id\":2,\"text\":\"run gate\",\"status\":\"pending\"}],\"title\":\"Plan\"}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_diff_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let diff = DiffCard {
+            path: "src/lib.rs".into(),
+            language: None,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Remove,
+                        text: "old".into(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: "new".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 1,
+            truncated: false,
+        };
+        adapter.deliver_diff("p", None, &diff).await.unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"diff\",\"diff\":{\"path\":\"src/lib.rs\",\"hunks\":[{\"old_start\":1,\"old_lines\":1,\"new_start\":1,\"new_lines\":1,\"lines\":[{\"kind\":\"remove\",\"text\":\"old\"},{\"kind\":\"add\",\"text\":\"new\"}]}],\"added\":1,\"removed\":1}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_card_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let card = Card {
+            title: Some("Deploy".into()),
+            body: Some("Ready to ship".into()),
+            ..Card::default()
+        };
+        adapter.deliver_card("p", None, &card, None).await.unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"card\",\"card\":{\"title\":\"Deploy\",\"body\":\"Ready to ship\"}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_collapsible_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        adapter
+            .deliver_collapsible(
+                "p",
+                None,
+                "line1\nline2",
+                "2 lines of output",
+                &["line1".to_owned()],
+            )
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"collapsible\",\"text\":\"line1\\nline2\",\"summary\":\"2 lines of output\",\"preview_lines\":[\"line1\"]}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_error_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let err = ErrorCard {
+            title: "Something went wrong".into(),
+            summary: "provider failed".into(),
+            kind: ErrorCardKind::Provider,
+            details: None,
+            retryable: true,
+        };
+        adapter.deliver_error("p", None, &err).await.unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"error\",\"error\":{\"title\":\"Something went wrong\",\"summary\":\"provider failed\",\"kind\":\"provider\",\"retryable\":true}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_mode_thinking_frame_exact_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        let thinking = ThinkingBlock {
+            text: "pondering the diff".into(),
+            redacted: false,
+            model: None,
+        };
+        adapter
+            .deliver_thinking("p", None, &thinking)
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(
+            body,
+            "{\"kind\":\"thinking\",\"thinking\":{\"text\":\"pondering the diff\",\"redacted\":false}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_mode_rich_hooks_keep_legacy_text_flattening() {
+        // On the stdio path the hooks reproduce the trait-default
+        // behaviour: flatten to `to_text_fallback()` and route through
+        // `deliver`, which prefixes the label. No JSON frame appears.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let reader = BufReader::new(Cursor::new(b""));
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let adapter = CliAdapter::new_with_io(reader, server, tx, "agent> ");
+        let bc = Breadcrumb {
+            tool_name: "shell".into(),
+            detail: Some("cargo check".into()),
+            status: BreadcrumbStatus::Running,
+            summary: None,
+            steps: vec![],
+        };
+        adapter
+            .deliver_breadcrumb("p", None, &bc, None)
+            .await
+            .unwrap();
+        let mut out = vec![0u8; 512];
+        let n = tokio::io::AsyncReadExt::read(&mut client, &mut out)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&out[..n]).unwrap();
+        assert!(text.starts_with("agent> "), "label kept on stdio: {text:?}");
+        assert!(text.contains("shell"), "fallback text present: {text:?}");
+        assert!(!text.starts_with('{'), "stdio must not emit JSON frames");
+    }
+
+    #[tokio::test]
+    async fn sniff_contract_frame_lines_parse_and_legacy_lines_do_not() {
+        // The reader-side contract documented on `CliFrame`: a frame
+        // line starts with '{' and deserializes; a legacy labelled line
+        // does neither.
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, log) = log_adapter(&dir).await;
+        adapter
+            .deliver("p", None, &outbound_text("hello there"))
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        let frame_line = body.lines().next().unwrap();
+        assert!(frame_line.starts_with('{'));
+        let frame: CliFrame = serde_json::from_str(frame_line).unwrap();
+        assert_eq!(
+            frame,
+            CliFrame::Chat {
+                text: "hello there".to_owned(),
+                files: vec![],
+            }
+        );
+
+        let legacy_line = "agent> hello there";
+        assert!(!legacy_line.starts_with('{'));
+        assert!(serde_json::from_str::<CliFrame>(legacy_line).is_err());
+    }
+
+    #[test]
+    fn cli_frame_round_trips_every_kind() {
+        // Serialize -> deserialize identity for each variant, proving
+        // the reused core serde shapes survive the frame wrapper.
+        let frames = vec![
+            CliFrame::Chat {
+                text: "hi".into(),
+                files: vec!["a.txt".into()],
+            },
+            CliFrame::Card {
+                card: Card {
+                    title: Some("t".into()),
+                    ..Card::default()
+                },
+            },
+            CliFrame::Breadcrumb {
+                breadcrumb: Breadcrumb {
+                    tool_name: "shell".into(),
+                    detail: None,
+                    status: BreadcrumbStatus::Failed,
+                    summary: Some("timeout".into()),
+                    steps: vec![],
+                },
+            },
+            CliFrame::Diff {
+                diff: DiffCard {
+                    path: "a.rs".into(),
+                    language: Some("rust".into()),
+                    hunks: vec![],
+                    added: 0,
+                    removed: 0,
+                    truncated: true,
+                },
+            },
+            CliFrame::Collapsible {
+                text: "full".into(),
+                summary: "sum".into(),
+                preview_lines: vec![],
+            },
+            CliFrame::TodoList {
+                todo_list: TodoList {
+                    items: vec![TodoListItem {
+                        id: 7,
+                        text: "x".into(),
+                        status: TodoItemStatus::Blocked,
+                        blocked_reason: Some("stuck".into()),
+                    }],
+                    title: None,
+                },
+            },
+            CliFrame::Error {
+                error: ErrorCard {
+                    title: "t".into(),
+                    summary: "s".into(),
+                    kind: ErrorCardKind::Internal,
+                    details: Some("stderr".into()),
+                    retryable: false,
+                },
+            },
+            CliFrame::Thinking {
+                thinking: ThinkingBlock {
+                    text: String::new(),
+                    redacted: true,
+                    model: Some("claude-opus-4-7".into()),
+                },
+            },
+        ];
+        for frame in frames {
+            let line = serde_json::to_string(&frame).unwrap();
+            assert!(!line.contains('\n'), "frame must be single-line: {line}");
+            let back: CliFrame = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, frame);
+        }
     }
 }

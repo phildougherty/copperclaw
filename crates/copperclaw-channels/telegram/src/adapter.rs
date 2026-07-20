@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
-    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
 };
 use copperclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use std::net::SocketAddr;
@@ -417,6 +417,13 @@ impl ChannelAdapter for TelegramAdapter {
     /// chat line. When `existing_message_id` is provided we drive
     /// `editMessageText` to update the original chip in place;
     /// otherwise we emit a fresh `sendMessage`.
+    ///
+    /// Pin discipline (M22 D4): the breadcrumb / HUD message is NEVER
+    /// pinned. The split is deliberate — the todo list is the *pinned
+    /// plan* (see [`Self::deliver_todo_list`], which pins on first emit
+    /// and unpins on completion) while the HUD is the *live transcript*
+    /// that scrolls with the conversation. Two pinned messages per task
+    /// is worse than one; do not add a `pin_chat_message` call here.
     async fn deliver_breadcrumb(
         &self,
         platform_id: &str,
@@ -509,6 +516,10 @@ impl ChannelAdapter for TelegramAdapter {
     ///
     /// Pin / unpin failures are swallowed and logged at `debug` —
     /// the chip is the load-bearing UX, pinning is decoration.
+    ///
+    /// Pin discipline (M22 D4): this is the ONLY delivery path that
+    /// pins — todo list = pinned plan, HUD breadcrumb = live transcript
+    /// (never pinned, see [`Self::deliver_breadcrumb`]).
     async fn deliver_todo_list(
         &self,
         platform_id: &str,
@@ -729,16 +740,6 @@ fn render_card_markdown_v2(card: &Card) -> String {
     out
 }
 
-/// Render a [`Breadcrumb`] as a compact Telegram HTML chip. Format:
-///
-/// - Running: `[~] <code>shell</code> · cargo check`
-/// - Done:    `[ok] <code>shell</code> · cargo check — passed (0.4s)`
-/// - Failed:  `[x] <code>shell</code> · cargo check — failed: timeout`
-///
-/// Tool name is wrapped in `<code>` so Telegram renders it as a
-/// monospace badge (the "chip" affordance). Detail / summary strings
-/// are HTML-escaped — they're free-form text from the agent's tool
-/// inputs so we cannot trust them to be HTML-clean.
 /// Render a [`DiffCard`] as a Telegram `MarkdownV2` message wrapping
 /// the unified-diff body in a ` ```diff … ``` ` fenced block. Mobile
 /// clients colourise `diff`-tagged fences, so the user sees `+`/`-`
@@ -790,17 +791,24 @@ pub(crate) fn render_diff_markdown_v2(diff: &DiffCard) -> String {
     out
 }
 
-/// ASCII-only status marker per the project's no-emoji rule. Even
-/// non-emoji Unicode symbols (U+23F3 hourglass, U+2713 check, U+2717
-/// cross) get rendered as colourful emoji on iOS Telegram — user-visible
-/// emoji either way. Plain ASCII squarely sidesteps that.
+/// Status marker from the transcript vocabulary (M22). Telegram binds
+/// the RAIL vocabulary — Claude Code's geometric transcript markers
+/// (U+23FA filled bullet for done, U+25CB hollow circle for running,
+/// U+00D7 for failed). These are geometric/punctuation codepoints, NOT
+/// emoji; that is the visual-fidelity point of the M22 D card. If
+/// real-device checks show iOS Telegram promoting them to color-emoji
+/// forms, the fallback is the one-line binding change in
+/// `vocab::for_channel` (`core/src/vocab.rs`) — do not reintroduce
+/// literals here.
 fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
-    match status {
-        BreadcrumbStatus::Running => "[~]",
-        BreadcrumbStatus::Done => "[ok]",
-        BreadcrumbStatus::Failed => "[x]",
-    }
+    vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
 }
+
+/// The HUD breadcrumb's `tool_name`, as emitted by the runner's Task
+/// HUD (`copperclaw-runner/src/tools.rs` `TASK_HUD_TOOL`). The runner
+/// is a separate process, so this is a wire contract, not a shared
+/// const — pinned by the `hud-transcript` replay fixture.
+const HUD_TOOL_NAME: &str = "task";
 
 /// Rendered-length budget for the whole activity message. Telegram rejects
 /// messages over ~4096 chars with `MESSAGE_TOO_LONG`; long shell commands /
@@ -809,13 +817,45 @@ fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
 /// most recent steps that fit and folding the rest into a `+N earlier` note.
 const ACTIVITY_HTML_BUDGET: usize = 3500;
 
+/// Step-log size (in rendered HTML bytes) up to which the transcript is
+/// emitted as a plain `<blockquote>` — which Telegram renders fully
+/// EXPANDED — rather than `<blockquote expandable>`, which every modern
+/// client renders COLLAPSED behind a "Show more" tap (M22 D1: the user's
+/// explicit "expanded by default" decision).
+///
+/// Why 1500: a rendered step line runs ~80-120 bytes including markup,
+/// so 1500 bytes is roughly 12-15 steps — about one phone screen of
+/// transcript. Below that, showing the log outright costs nothing and
+/// saves the tap; beyond it an always-expanded log would dominate the
+/// chat scroll on every 30s edit, so the collapsed expandable widget is
+/// the kinder default. Comfortably under [`ACTIVITY_HTML_BUDGET`]
+/// (3500), so a log that had steps folded into `+N earlier` is always
+/// past this threshold and therefore always collapsed.
+const ACTIVITY_EXPANDED_BUDGET: usize = 1500;
+
+/// Render a [`Breadcrumb`] as Telegram HTML.
+///
+/// Three shapes:
+///
+/// - HUD frame (`tool_name == "task"`): bold status headline over the
+///   step log, no `<code>` chip — see [`render_activity_html`].
+/// - Aggregate (non-empty `steps`): legacy activity headline over the
+///   same step log.
+/// - Single chip: one line, e.g. running `○ <code>shell</code> · cargo
+///   check` — status marker (rail vocabulary), monospace `<code>` tool
+///   badge, ` — summary` / ` — failed: summary` tail.
+///
+/// Detail / summary strings are HTML-escaped — they're free-form text
+/// from the agent's tool inputs so we cannot trust them to be
+/// HTML-clean.
 pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
-    // Aggregate "activity" chip: a collapsed summary line plus an
-    // expandable, per-step-styled list. Each step is real Telegram HTML
-    // (bold tool, <code> detail, italic summary), not raw text.
-    if !b.steps.is_empty() {
+    // HUD frames and aggregate "activity" chips: a headline plus a
+    // blockquote whose body is one styled line per tool step (bold
+    // tool, <code> detail, italic summary), not raw text.
+    if b.tool_name == HUD_TOOL_NAME || !b.steps.is_empty() {
         return render_activity_html(b);
     }
+    let v = vocab::for_channel(CHANNEL_TYPE_STR);
     let glyph = breadcrumb_glyph(b.status);
     let mut out = String::with_capacity(64);
     out.push_str(glyph);
@@ -826,7 +866,7 @@ pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
     if let Some(d) = b.detail.as_deref() {
         let d = d.trim();
         if !d.is_empty() {
-            out.push_str(" · ");
+            out.push_str(v.layout.separator);
             out.push_str(&escape_html(d));
         }
     }
@@ -844,36 +884,74 @@ pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
     out
 }
 
-/// Render the rolling aggregate "activity" chip: a one-line collapsed
-/// summary (current activity + completed/total count) followed by a
-/// `<blockquote expandable>` whose body is one styled line per tool step.
+/// Render the live-transcript message: a one-line headline followed by
+/// a blockquote whose body is one styled line per tool step.
+///
+/// Headline typography (M22 D2): for the HUD breadcrumb (`tool_name ==
+/// "task"`) the summary IS the status line (clock / ratio / tokens /
+/// cost from the runner), so it gets bold weight and the literal
+/// `<code>task</code>` chip — noise on every frame — is dropped:
 ///
 /// ```text
-/// [~] edit_file src/HomePage.tsx · 14/20 steps
-/// <blockquote expandable>
-/// [ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>
-/// [ok] <b>edit_file</b> <code>src/HomePage.tsx</code> <i>— wrote 12 lines</i>
-/// [~] <b>shell</b> <code>npm run build</code>
+/// ○ <b>5 tool calls | 0:42 | 5k tokens | $0.02</b> · last: shell ok
+/// <blockquote>
+/// ⏺ <b>shell</b> <code>echo one</code> <i>— step one</i>
+/// ⏺ <b>shell</b> <code>echo two</code> <i>— step two</i>
 /// </blockquote>
 /// ```
+///
+/// Legacy aggregates (any other `tool_name`) keep the current-activity
+/// detail first: `○ edit_file src/HomePage.tsx · 14/20 steps`.
+///
+/// The step log is a plain `<blockquote>` (rendered EXPANDED — M22 D1)
+/// while it fits [`ACTIVITY_EXPANDED_BUDGET`], and falls back to
+/// `<blockquote expandable>` (rendered collapsed) beyond that.
 fn render_activity_html(b: &Breadcrumb) -> String {
-    // Collapsed summary line from the top-level fields. The current-activity
-    // detail is truncated so one long command can't dominate the line.
+    let v = vocab::for_channel(CHANNEL_TYPE_STR);
+    // Headline from the top-level fields. The current-activity detail
+    // is truncated so one long command can't dominate the line.
     let mut summary = String::with_capacity(96);
     summary.push_str(breadcrumb_glyph(b.status));
     summary.push(' ');
-    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => summary.push_str(&escape_html(&truncate_chars(d, 80))),
-        None => summary.push_str("working"),
-    }
-    if let Some(s) = b
+    let detail = b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    let status = b
         .summary
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        summary.push_str(" · ");
-        summary.push_str(&escape_html(s));
+        .filter(|s| !s.is_empty());
+    if b.tool_name == HUD_TOOL_NAME {
+        // D2: bold status headline; the runner's summary line leads,
+        // the transient "running: …" / "last: …" detail trails.
+        match (status, detail) {
+            (Some(s), d) => {
+                summary.push_str("<b>");
+                summary.push_str(&escape_html(s));
+                summary.push_str("</b>");
+                if let Some(d) = d {
+                    summary.push_str(v.layout.separator);
+                    summary.push_str(&escape_html(&truncate_chars(d, 80)));
+                }
+            }
+            (None, Some(d)) => {
+                summary.push_str("<b>");
+                summary.push_str(&escape_html(&truncate_chars(d, 80)));
+                summary.push_str("</b>");
+            }
+            (None, None) => summary.push_str("<b>working</b>"),
+        }
+    } else {
+        match detail {
+            Some(d) => summary.push_str(&escape_html(&truncate_chars(d, 80))),
+            None => summary.push_str("working"),
+        }
+        if let Some(s) = status {
+            summary.push_str(v.layout.separator);
+            summary.push_str(&escape_html(s));
+        }
+    }
+    if b.steps.is_empty() {
+        // First HUD frame of a turn — headline only, no empty blockquote.
+        return summary;
     }
 
     // Render steps NEWEST-FIRST into a rendered-length budget; keep the most
@@ -893,31 +971,41 @@ fn render_activity_html(b: &Breadcrumb) -> String {
     lines.reverse();
     let hidden = b.steps.len() - lines.len();
 
-    let mut out = String::with_capacity(used + 96);
-    out.push_str(&summary);
-    out.push('\n');
-    out.push_str("<blockquote expandable>");
+    // Step-log body, assembled first so its rendered size can pick the
+    // blockquote flavor (D1: plain = expanded, expandable = collapsed).
+    let mut body = String::with_capacity(used);
     if hidden > 0 {
-        out.push_str(&format!("<i>+{hidden} earlier step(s)</i>\n"));
+        body.push_str(&format!("<i>+{hidden} earlier step(s)</i>\n"));
     }
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
-            out.push('\n');
+            body.push('\n');
         }
-        out.push_str(line);
+        body.push_str(line);
     }
+
+    let mut out = String::with_capacity(used + 96);
+    out.push_str(&summary);
+    out.push('\n');
+    if body.len() <= ACTIVITY_EXPANDED_BUDGET {
+        out.push_str("<blockquote>");
+    } else {
+        out.push_str("<blockquote expandable>");
+    }
+    out.push_str(&body);
     out.push_str("</blockquote>");
     out
 }
 
-/// Truncate `s` to at most `max` chars (char-boundary safe), appending an
-/// ellipsis when cut. Keeps a single long detail from blowing the budget.
+/// Truncate `s` to at most `max` chars (char-boundary safe), appending the
+/// vocabulary ellipsis when cut. Keeps a single long detail from blowing
+/// the budget.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
+    out.push_str(vocab::for_channel(CHANNEL_TYPE_STR).layout.ellipsis);
     out
 }
 
@@ -1067,49 +1155,60 @@ pub(crate) fn render_thinking_html(t: &ThinkingBlock) -> String {
     out
 }
 
-/// Render a [`TodoList`] for Telegram `MarkdownV2`. Format:
+/// Number of cells in the todo progress bar (M22 D3).
+const PROGRESS_BAR_CELLS: usize = 10;
+
+/// Minimum item count before the progress bar is rendered. A 1-2 item
+/// list's checkboxes already tell the whole story at a glance; the bar
+/// earns its line only once the plan is long enough that the eye wants
+/// a ratio.
+const PROGRESS_BAR_MIN_ITEMS: usize = 3;
+
+/// Render a [`TodoList`] for Telegram `MarkdownV2` — the *pinned plan*
+/// message (see the M22 D4 pin-discipline notes on
+/// `deliver_todo_list`). Format:
 ///
 /// ```text
 /// *Plan*
-/// ☑ Wash dishes
-/// ▶ Dry dishes
-/// ☐ Put dishes away
+/// \[x\] ~Wash dishes~
+/// \[\~\] Dry dishes
+/// \[ \] Put dishes away
+/// ▰▰▰▱▱▱▱▱▱▱
 /// _1/3 done_
 /// ```
 ///
-/// Glyphs are picked so they're visually distinct without depending
-/// on color: `☑` for completed (filled check), `▶` for in-progress
-/// (forward-pointing arrow), `☐` for pending (empty box). All static
-/// markup characters are emitted verbatim; only user-supplied text
-/// (title, item text) goes through [`escape_markdown_v2`] so the
-/// `parse_mode` doesn't reject the body on a bare `.` / `-` / `!` in
-/// the agent's plan. Completed items are wrapped in `~strikethrough~`
-/// so the eye can scan the unchecked work at a glance.
+/// Checkbox glyphs come from the transcript vocabulary
+/// (`vocab::for_channel("telegram")`): ASCII `[x]` / `[~]` / `[!]` /
+/// `[ ]` — the rail binding deliberately keeps checkboxes ASCII, so
+/// they're visually distinct without depending on color and safe from
+/// iOS Telegram's habit of promoting symbol forms (`☑` / `▶` / `☐`) to
+/// colourful emoji. All static markup characters are emitted verbatim;
+/// only user-supplied text (title, item text) goes through
+/// [`escape_markdown_v2`] so the `parse_mode` doesn't reject the body
+/// on a bare `.` / `-` / `!` in the agent's plan. Completed items are
+/// wrapped in `~strikethrough~` so the eye can scan the unchecked work
+/// at a glance.
+///
+/// M22 D3: lists with at least [`PROGRESS_BAR_MIN_ITEMS`] items get a
+/// [`PROGRESS_BAR_CELLS`]-cell completion bar (vocabulary
+/// `progress_filled` / `progress_empty`: `▰` / `▱`, geometric
+/// parallelograms, not emoji) above the `done/total` footer.
 pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
+    let v = vocab::for_channel(CHANNEL_TYPE_STR);
     let mut out = String::with_capacity(64 + list.items.len() * 48);
     out.push('*');
     out.push_str(&escape_markdown_v2(list.title_or_default()));
     out.push_str("*\n");
     for item in &list.items {
-        // ASCII-only glyphs per the project's no-emoji rule. iOS
-        // Telegram renders the symbol forms (☑ / ▶ / ☐) as colourful
-        // emoji even though they're technically symbols.
-        //
         // MarkdownV2 reserves `[`, `]`, `(`, `)`, `~`, `_`, `*`, `>`,
         // `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!` — they MUST be
         // backslash-escaped or Telegram rejects the message with
-        // `Bad Request: can't parse entities`. The raw markers below
+        // `Bad Request: can't parse entities`. The vocabulary markers
         // pass through `escape_markdown_v2` so `[`/`]` survive the
         // parse. Caught live on 2026-05-24: every TodoList edit
         // returned 400, the delivery loop marked failed, the agent
         // saw it and cascaded into endless retries.
-        let glyph_raw = match item.status {
-            TodoItemStatus::Completed => "[x]",
-            TodoItemStatus::InProgress => "[~]",
-            TodoItemStatus::Blocked => "[!]",
-            TodoItemStatus::Pending => "[ ]",
-        };
-        out.push_str(&escape_markdown_v2(glyph_raw));
+        out.push_str(&escape_markdown_v2(v.todo.get(item.status)));
         out.push(' ');
         if item.status == TodoItemStatus::Completed {
             out.push('~');
@@ -1128,6 +1227,20 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
     }
     let done = list.completed_count();
     let total = list.items.len();
+    if total >= PROGRESS_BAR_MIN_ITEMS {
+        // D3: 10-cell completion bar. Floor division — a cell fills only
+        // once fully earned, and all 10 fill exactly at done == total.
+        // The bar glyphs (U+25B0 / U+25B1) are not in MarkdownV2's
+        // reserved set (ASCII-only), so they're emitted verbatim.
+        let filled = (done * PROGRESS_BAR_CELLS) / total;
+        for _ in 0..filled {
+            out.push_str(v.layout.progress_filled);
+        }
+        for _ in filled..PROGRESS_BAR_CELLS {
+            out.push_str(v.layout.progress_empty);
+        }
+        out.push('\n');
+    }
     out.push('_');
     out.push_str(&escape_markdown_v2(&format!("{done}/{total} done")));
     out.push('_');
@@ -2616,12 +2729,16 @@ mod tests {
     // ── Breadcrumb chip rendering ──────────────────────────────────
 
     #[test]
-    fn render_breadcrumb_running_uses_code_chip_and_ascii_marker() {
+    fn render_breadcrumb_running_uses_code_chip_and_rail_marker() {
         let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let html = super::render_breadcrumb_html(&bc);
-        assert!(html.starts_with("[~]"), "running ASCII marker: {html}");
-        assert!(html.contains("<code>shell</code>"));
-        assert!(html.contains("cargo check"));
+        // Full-string pin: telegram binds the RAIL vocabulary (M22),
+        // so running carries U+25CB (hollow circle, geometric NOT
+        // emoji) and fields join on the U+00B7 interpunct.
+        assert_eq!(
+            html, "\u{25CB} <code>shell</code> \u{00B7} cargo check",
+            "running rail marker: {html}"
+        );
     }
 
     #[test]
@@ -2630,8 +2747,11 @@ mod tests {
             .with_detail("cargo check")
             .finished(true, Some("passed (0.4s)".into()));
         let html = super::render_breadcrumb_html(&bc);
-        assert!(html.starts_with("[ok]"), "got: {html}");
-        assert!(html.contains("passed (0.4s)"));
+        // Done = U+23FA (filled record bullet, as in Claude Code).
+        assert_eq!(
+            html, "\u{23FA} <code>shell</code> \u{00B7} cargo check — passed (0.4s)",
+            "got: {html}"
+        );
     }
 
     #[test]
@@ -2640,7 +2760,8 @@ mod tests {
             .with_detail("cargo check")
             .finished(false, Some("timeout".into()));
         let html = super::render_breadcrumb_html(&bc);
-        assert!(html.starts_with("[x]"), "got: {html}");
+        // Failed = U+00D7 (multiplication sign, geometric NOT emoji).
+        assert!(html.starts_with("\u{00D7}"), "got: {html}");
         assert!(html.contains("failed: timeout"));
     }
 
@@ -2653,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn render_breadcrumb_aggregate_renders_styled_expandable_steps() {
+    fn render_breadcrumb_aggregate_renders_styled_steps_expanded() {
         use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
         let steps = vec![
             Breadcrumb::running("read_file")
@@ -2669,18 +2790,25 @@ mod tests {
             steps,
         };
         let html = super::render_breadcrumb_html(&agg);
-        // Collapsed summary line with ASCII marker + count.
+        // Headline with the rail running marker + count.
         assert!(
-            html.starts_with("[~] shell npm run build · 1/2 steps"),
+            html.starts_with("\u{25CB} shell npm run build \u{00B7} 1/2 steps"),
             "summary line: {html}"
         );
-        // Expandable region present.
-        assert!(html.contains("<blockquote expandable>"));
+        // A step log this small renders as a PLAIN blockquote — Telegram
+        // shows it expanded, no tap (M22 D1).
+        assert!(html.contains("<blockquote>"), "plain blockquote: {html}");
+        assert!(
+            !html.contains("<blockquote expandable>"),
+            "expanded: {html}"
+        );
         assert!(html.contains("</blockquote>"));
         // Each step individually styled (bold tool, <code> detail, italic
-        // summary) — not raw markdown.
-        assert!(html.contains("[ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>"));
-        assert!(html.contains("[~] <b>shell</b> <code>npm run build</code>"));
+        // summary) — not raw markdown. Done = U+23FA, running = U+25CB.
+        assert!(
+            html.contains("\u{23FA} <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>")
+        );
+        assert!(html.contains("\u{25CB} <b>shell</b> <code>npm run build</code>"));
         assert!(!html.contains("**"), "no raw markdown: {html}");
     }
 
@@ -2713,11 +2841,118 @@ mod tests {
         assert!(html.len() < 4096, "len {} must be < 4096", html.len());
         // Older steps folded behind a "+N earlier" note.
         assert!(html.contains("earlier step(s)"), "cap note: {html}");
+        // A log big enough to fold is far past ACTIVITY_EXPANDED_BUDGET,
+        // so it always takes the collapsed expandable fallback (D1).
+        assert!(
+            html.contains("<blockquote expandable>"),
+            "collapsed fallback: {html}"
+        );
         // Newest step is kept (newest-first budget) and HTML is escaped.
         assert!(
             html.contains("a &lt;b&gt; &amp; c"),
             "escaped newest: {html}"
         );
+    }
+
+    #[test]
+    fn render_activity_over_expanded_budget_falls_back_to_collapsed_expandable() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        // D1 threshold: a step log past ACTIVITY_EXPANDED_BUDGET (1500
+        // rendered bytes) but under the fold budget takes the collapsed
+        // `expandable` widget with NO steps folded — proving the
+        // threshold picks the blockquote flavor independently of the
+        // MESSAGE_TOO_LONG cap.
+        let steps: Vec<Breadcrumb> = (0..14)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!(
+                        "cd /data/project-{i:02} && cargo build --release --workspace \
+                         --all-targets 2>&1 | tail -n 20"
+                    ))
+                    .finished(true, Some("ok".into()))
+            })
+            .collect();
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell cargo build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("14/14 steps".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html(&agg);
+        assert!(
+            html.contains("<blockquote expandable>"),
+            "collapsed past threshold: {html}"
+        );
+        assert!(
+            !html.contains("earlier step(s)"),
+            "no folding needed: {html}"
+        );
+        assert!(html.len() < 4096, "len {} must be < 4096", html.len());
+    }
+
+    #[test]
+    fn render_breadcrumb_task_headline_bolds_summary_without_task_chip() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        // D2: the HUD breadcrumb (tool_name "task") gets a bold status
+        // headline — no literal `<code>task</code>` chip. Shape copied
+        // from the first hud-transcript fixture frame (no steps yet).
+        let bc = Breadcrumb {
+            tool_name: "task".into(),
+            detail: Some("running: shell (echo step one)".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("0 tool calls | 0:00 | 1k tokens".into()),
+            steps: Vec::new(),
+        };
+        let html = super::render_breadcrumb_html(&bc);
+        assert_eq!(
+            html,
+            "\u{25CB} <b>0 tool calls | 0:00 | 1k tokens</b> \u{00B7} \
+             running: shell (echo step one)",
+            "task headline: {html}"
+        );
+        assert!(!html.contains("<code>task</code>"), "no chip: {html}");
+        assert!(!html.contains("<blockquote"), "no empty step log: {html}");
+    }
+
+    #[test]
+    fn render_activity_hud_frame_full_string_from_fixture_shape() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        // Byte-exact render of a realistic B5-shaped HUD frame — copied
+        // from fixtures/telegram/hud-transcript/expected/messages-out.jsonl
+        // (the seq-29 update_breadcrumb, with the clock made concrete).
+        let steps: Vec<Breadcrumb> = ["one", "two", "three", "four", "five"]
+            .iter()
+            .map(|n| Breadcrumb {
+                tool_name: "shell".into(),
+                detail: Some(format!("echo step {n}")),
+                status: BreadcrumbStatus::Done,
+                summary: Some(format!("step {n}")),
+                steps: Vec::new(),
+            })
+            .collect();
+        let frame = Breadcrumb {
+            tool_name: "task".into(),
+            detail: Some("last: shell ok".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("5 tool calls | 0:42 | 5k tokens | $0.02".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html(&frame);
+        // Bold headline (D2), interpunct join, five rail step lines in a
+        // PLAIN blockquote (D1: expanded by default at this size).
+        let expected = concat!(
+            "\u{25CB} <b>5 tool calls | 0:42 | 5k tokens | $0.02</b>",
+            " \u{00B7} last: shell ok\n",
+            "<blockquote>",
+            "\u{23FA} <b>shell</b> <code>echo step one</code> <i>— step one</i>\n",
+            "\u{23FA} <b>shell</b> <code>echo step two</code> <i>— step two</i>\n",
+            "\u{23FA} <b>shell</b> <code>echo step three</code> <i>— step three</i>\n",
+            "\u{23FA} <b>shell</b> <code>echo step four</code> <i>— step four</i>\n",
+            "\u{23FA} <b>shell</b> <code>echo step five</code> <i>— step five</i>",
+            "</blockquote>"
+        );
+        assert_eq!(html, expected);
     }
 
     #[test]
@@ -2925,7 +3160,8 @@ mod tests {
         assert_eq!(body["parse_mode"], "HTML");
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("passed (0.4s)"));
-        assert!(text.starts_with("[ok]"), "got: {text}");
+        // Rail vocabulary: done = U+23FA (M22).
+        assert!(text.starts_with("\u{23FA}"), "got: {text}");
         adapter.shutdown().await;
     }
 
@@ -3291,8 +3527,70 @@ mod tests {
         // the `[~]` glyph becomes `\[\~\]` after escaping.
         assert!(body.contains(r"\[\~\] Dry dishes"), "in-progress: {body}");
         assert!(body.contains(r"\[ \] Put dishes away"), "pending: {body}");
+        // D3: 3 items reach the progress-bar minimum; 1/3 done floors to
+        // 3 filled cells of 10 (U+25B0 filled / U+25B1 empty).
+        assert!(
+            body.contains(concat!(
+                "\u{25B0}\u{25B0}\u{25B0}",
+                "\u{25B1}\u{25B1}\u{25B1}\u{25B1}\u{25B1}\u{25B1}\u{25B1}",
+                "\n_1/3 done_"
+            )),
+            "bar above footer: {body}"
+        );
         assert!(body.ends_with("done_"), "footer: {body}");
         assert!(body.contains("1/3 done"));
+    }
+
+    #[test]
+    fn render_todo_list_bar_fills_four_cells_at_two_of_five() {
+        // D3 fill math: 2/5 done -> (2 * 10) / 5 = 4 filled cells.
+        let items = (1..=5)
+            .map(|i| copperclaw_channels_core::TodoListItem {
+                id: i,
+                text: format!("step {i}"),
+                status: if i <= 2 {
+                    copperclaw_channels_core::TodoItemStatus::Completed
+                } else {
+                    copperclaw_channels_core::TodoItemStatus::Pending
+                },
+                blocked_reason: None,
+            })
+            .collect();
+        let list = copperclaw_channels_core::TodoList { items, title: None };
+        let body = super::render_todo_list_markdown(&list);
+        assert!(
+            body.contains(concat!(
+                "\u{25B0}\u{25B0}\u{25B0}\u{25B0}",
+                "\u{25B1}\u{25B1}\u{25B1}\u{25B1}\u{25B1}\u{25B1}",
+                "\n_2/5 done_"
+            )),
+            "4/10 filled at 2/5: {body}"
+        );
+    }
+
+    #[test]
+    fn render_todo_list_two_items_renders_no_bar() {
+        // D3 gate: below PROGRESS_BAR_MIN_ITEMS the checkboxes already
+        // tell the story — no bar line.
+        let items = vec![
+            copperclaw_channels_core::TodoListItem {
+                id: 1,
+                text: "one".into(),
+                status: copperclaw_channels_core::TodoItemStatus::Completed,
+                blocked_reason: None,
+            },
+            copperclaw_channels_core::TodoListItem {
+                id: 2,
+                text: "two".into(),
+                status: copperclaw_channels_core::TodoItemStatus::Pending,
+                blocked_reason: None,
+            },
+        ];
+        let list = copperclaw_channels_core::TodoList { items, title: None };
+        let body = super::render_todo_list_markdown(&list);
+        assert!(!body.contains('\u{25B0}'), "no filled cells: {body}");
+        assert!(!body.contains('\u{25B1}'), "no empty cells: {body}");
+        assert!(body.ends_with("_1/2 done_"), "footer intact: {body}");
     }
 
     #[test]

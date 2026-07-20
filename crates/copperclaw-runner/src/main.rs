@@ -261,6 +261,12 @@ async fn main() -> Result<()> {
         active_grant: std::sync::Arc::new(std::sync::Mutex::new(
             copperclaw_runner::run::GrantGateState::default(),
         )),
+        // M22 B1: loop-level one-shot notices (auto-compaction fired outside a
+        // turn) drained onto the next turn's HUD frame / status row.
+        notices: std::sync::Arc::new(copperclaw_runner::run::Notices::default()),
+        // M22 B4: live per-inbound spend counters — bumped by the provider-call
+        // layer, rendered on the Task HUD's status line and final collapse.
+        spend: std::sync::Arc::new(copperclaw_runner::run::hud::TurnSpend::default()),
         // F2 safe-mode respawn: the host flips `runner.json`'s `recovery_mode`
         // on once a session's container crash streak reaches its threshold, so
         // the runner truncates an oversized persisted history at startup rather

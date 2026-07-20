@@ -6,6 +6,143 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M22 — Claude Code-style transcript UI across channels)
+
+- **Live tool-step transcript in the Task HUD.** The HUD now accumulates the
+  turn's tool steps (tool name, capped arg detail, status, first result line)
+  and attaches them to every frame via `Breadcrumb.steps` — the four
+  construction sites in `crates/copperclaw-runner/src/run/hud.rs` that
+  hardcoded `steps: Vec::new()` now feed the already-existing (and previously
+  dead) Telegram step-log renderer. Capped at 40 steps, reset per inbound;
+  the excess folds into the renderer's `+N earlier` line.
+- **Status line with progress, tokens, and spend.** HUD running frames carry
+  `[N tool calls, M:SS, step N/M, tokens, cost]` and the collapse line reads
+  `done in M:SS, N tool calls, Nk tokens, $N.NN`. Live spend is tracked
+  in-container via a new `Arc<TurnSpend>` on `RunnerDeps` (atomic tokens +
+  cost micros, bumped at both `provider_call.rs` emit sites). Tokens round to
+  the nearest 100 and cost to the nearest cent so frame fingerprints do not
+  force an edit on every LLM call; the summary is capped at four fields
+  (cost drops first when a note is pending) and unit-tested to stay under
+  100 chars. Cost renders only when every call in the turn was priced —
+  unknown models render absence, never `$0.00`.
+- **Auto-compaction notice.** The silent automatic compaction path in
+  `run_loop` now queues `history auto-compacted (N msgs -> N, ~Nk tokens)`
+  on a new `Notices` queue on `RunnerDeps`; the note rides exactly one HUD
+  frame (rich channels) or one status row (bare channels) via the existing
+  one-shot note machinery, and re-queues if a text-only turn never rendered
+  a frame. The `/compact` slash path already confirmed; now the automatic
+  one does too.
+- **Budget-extension notice.** When the smart auto-continue extends the
+  tool-turn budget past the soft cap, the HUD notes
+  `extended tool budget (N/M turns)` — a HUD note, not a chat row.
+- **Structured `cclaw chat` transcript.** The cli channel adapter now
+  overrides the seven rich delivery hooks and appends JSONL frames to
+  `chat.log` (public `CliFrame` enum in
+  `crates/copperclaw-channels/cli/src/lib.rs`: chat, card, breadcrumb, diff,
+  collapsible, todo_list, error, thinking) instead of flattening to text.
+  Readers sniff per line (`{`-prefixed = frame, else legacy text); the stdio
+  path keeps the legacy label format. This also fixes multi-line bodies
+  corrupting the line-oriented tail.
+- **`cclaw chat` renders the transcript like Claude Code.** Tool steps on a
+  geometric rail with status coloring, checkbox todos with strikethrough,
+  dimmed thinking, green/red diffs, red errors; the status line repaints in
+  place at the bottom. The log tail and stdin reader are unified under one
+  event loop (single terminal writer) so repaints cannot race input; repeat
+  HUD edit frames dedupe client-side into new-steps-only output. The prompt
+  goes to stderr, and all color/repaint bytes route through the
+  `Palette`/`color_enabled` path — `cclaw chat > out.txt` stays ANSI- and
+  CR-free, enforced by a new spawned-binary test in `no_ansi_when_piped.rs`.
+- **cli promoted out of StatusRows.** New
+  `capabilities::renders_client_side_transcript` predicate and a
+  `Behavior::Transcript` HUD arm emit breadcrumb frames as append-only
+  events (never edits — cli stays out of `EDIT_CAPABLE_CHANNELS` and the
+  drift guard still passes) at the same fingerprint-suppressed cadence as
+  the edit path, plus the finalize collapse. The 30s clock ticker stays
+  edit-only by design: on an append-only log every tick would be a permanent
+  line; the client repaints the clock itself.
+- **Transcript vocabulary as source of truth.**
+  `crates/copperclaw-channels/core/src/vocab.rs`: flat const `Vocabulary`
+  tables (`ASCII` — today's exact `[ ]`/`[~]`/`[!]`/`[x]`/`[ok]` literals —
+  and `RAIL` — Claude Code's geometric U+23FA/U+23BF/U+25B0/U+25B1 markers)
+  bound per channel via `vocab::for_channel`; cli and telegram bind RAIL,
+  everything else ASCII, and the binding is a one-line flip per surface.
+  Reaction emoji (`core/src/reaction.rs`, `*/src/config.rs`) are protocol
+  values and deliberately never route through vocab.
+- **Pricing table.** `crates/copperclaw-types/src/pricing.rs`:
+  `price_for(provider, model) -> Option<ModelPrice>` in integer micros per
+  MTok (exact match then most-specific prefix, mirroring
+  `is_anthropic_family_model`), `PRICING_AS_OF` marker, ollama pinned as
+  known-free zero, unknown models `None` — every surface renders a blank,
+  never a confidently wrong `$0.00`.
+- **Per-model usage rollup with cost.** `rollup_by_model_since` in
+  `crates/copperclaw-db/src/tables/agent_turns.rs` (pure read on the
+  existing index, no migration); `usage.rollup` JSON gains a per-group
+  `models` array with `cost_micros` (null when unpriced; group total null
+  unless every slice priced) and `pricing_as_of`. `cclaw usage` grows a COST
+  column (`$0.42`, em dash for unknown) and a `pricing as of` footer;
+  `--json` passes the handler payload through untouched.
+- **Replay fixtures pinning the pipeline end-to-end**:
+  `fixtures/telegram/hud-transcript/` (multi-batch HUD frames byte-for-byte,
+  the program's byte-anchor), `fixtures/telegram/auto-compaction/` (the note
+  exactly once, compaction proven by archive + summary request),
+  `fixtures/telegram/budget-extension/` (extension note exactly once, never
+  a chat row), `fixtures/cli/transcript-render/` (breadcrumb/todo/diff JSONL
+  frames), plus two additive replay-harness knobs (`max_tool_turns_hard`,
+  `compaction_soft_target_tokens`, both default-off).
+- **Adoption gate for the transcript vocabulary**
+  (`crates/copperclaw-host-delivery/tests/vocab_adoption.rs`): walks every
+  `crates/copperclaw-channels/*/src/**/*.rs` and fails if non-test,
+  non-comment adapter code hardcodes a transcript glyph — the RAIL codepoints
+  (U+23FA, U+23BF, U+25B0, U+25B1, U+25CB, U+00D7; raw or `\u{...}`-escaped)
+  or the ASCII literals `[x]` / `[~]` / `[!]` / `[ ]` / `[ok]` inside string
+  literals — instead of routing through
+  `copperclaw_channels_core::vocab::for_channel`. Allowlist:
+  `core/src/vocab.rs` (the source of truth), `core/src/reaction.rs` and
+  `*/src/config.rs` (reaction emoji are protocol values, not presentation).
+  Test modules are exempt by design: byte-identity tests MUST pin rendered
+  output with hardcoded literals.
+
+### Changed (M22 — Claude Code-style transcript UI across channels)
+
+- **Telegram is the reference transcript surface**
+  (`crates/copperclaw-channels/telegram/src/adapter.rs`): the step log now
+  renders in a plain `<blockquote>` (expanded by default) when it fits 1500
+  rendered bytes, falling back to `<blockquote expandable>` beyond; the HUD
+  frame drops the noisy `<code>task</code>` chip for a bold status headline
+  over the step log; todo lists with 3+ items gain a 10-cell
+  `U+25B0`/`U+25B1` progress bar; breadcrumb markers switch from ASCII to
+  the geometric RAIL glyphs via vocab (one-line fallback to ASCII if real
+  devices promote them to emoji). Pin discipline documented and verified:
+  todo list = the one pinned message, HUD = live transcript, never pinned.
+- **Progressive reveal widened, cadence unchanged**
+  (`crates/copperclaw-runner/src/run/progressive.rs`): eligibility gates
+  lowered (elapsed 30s -> 15s, length 280 -> 200 chars) and `MAX_STEPS`
+  raised 6 -> 8; `STEP_INTERVAL` stays 800ms so worst-case edit frequency is
+  unchanged (~7 edits over ~5.6s). Final values are documented in-code as
+  pending live verification against a real Telegram client.
+- **Core renderers route glyphs through vocab**
+  (`core/src/todo_list.rs`, `core/src/breadcrumb.rs`):
+  `TodoItemStatus::glyph()` and `to_text_fallback()` now delegate through
+  `vocab::ASCII` with new `to_text_fallback_with(&Vocabulary)` variants —
+  byte-identical, proven by tests asserting against hardcoded pre-vocab
+  literals. Matrix and discord adapters likewise rerouted (byte-identical),
+  with stale doc comments claiming emoji output corrected in
+  `matrix/src/adapter.rs` and `discord/src/adapter.rs`.
+- **slack, gchat, teams, webex, mattermost, whatsapp-cloud now render
+  transcript glyphs through `vocab::for_channel`** — the adoption gate found
+  hardcoded breadcrumb rail markers and todo checkbox glyphs beyond the
+  telegram/matrix/discord sweeps (`slack/src/adapter.rs`,
+  `gchat/src/adapter.rs` incl. the error-card `[!]` attention prefix,
+  `teams/src/api.rs`, `webex/src/api.rs`, `mattermost/src/render.rs`,
+  `whatsapp-cloud/src/render.rs`). All six channels bind `vocab::ASCII`, so
+  output is byte-identical — proven by new
+  `*_byte_identical_to_pre_vocab_literals` tests in each crate whose expected
+  strings are hardcoded pre-vocab literals (all four todo statuses and all
+  three breadcrumb statuses). The deliberate mattermost / whatsapp-cloud
+  quirk is preserved and documented in-code: their in-progress todo item
+  reuses the *pending* glyph (`[ ]`, markdown has no half-checked box) plus
+  an `_(in progress)_` suffix.
+
 ### Added
 
 - **Auto-reap of orphaned `create_agent` child sessions.** A new supervised

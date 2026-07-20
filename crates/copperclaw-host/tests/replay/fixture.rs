@@ -123,6 +123,26 @@ pub struct Manifest {
     /// with no final text. `None` keeps the existing default of 5.
     #[serde(default)]
     pub max_tool_turns: Option<usize>,
+    /// M22 Wave 0: override the runner's smart auto-continue HARD ceiling
+    /// (`RunnerDeps::max_tool_turns_hard`) independently of the soft cap.
+    /// The harness default keeps `hard == soft` (extension disabled, the
+    /// historical flat-cap behaviour every existing fixture pins), so only
+    /// a fixture that explicitly sets this — e.g.
+    /// `telegram/budget-extension`'s `soft=2, hard=8` — exercises the
+    /// progress-gated `Continue` path deterministically. `None` keeps
+    /// `hard == max_tool_turns` (or the built-in 5).
+    #[serde(default)]
+    pub max_tool_turns_hard: Option<usize>,
+    /// M22 Wave 0: set the runner's SOFT compaction target
+    /// (`CompactionCfg::soft_target_tokens`, the replay twin of the
+    /// production `COPPERCLAW_SOFT_COMPACTION_TARGET` env knob). The
+    /// harness default keeps it `0` (soft trigger disabled — the hard
+    /// window ceiling of ~188k estimated tokens is unreachable by any
+    /// scripted fixture), so only a fixture that explicitly sets this —
+    /// `telegram/auto-compaction` — trips the `should_compact` gate in
+    /// `run_loop` and exercises the automatic compaction path.
+    #[serde(default)]
+    pub compaction_soft_target_tokens: Option<usize>,
     /// M19 F1: model the harness's wrapped `MockAdapter` as an
     /// edit-capable *rich* adapter for the Task HUD breadcrumb surface.
     ///

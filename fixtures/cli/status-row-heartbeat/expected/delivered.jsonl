@@ -1,3 +1,6 @@
-{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Still working on this — 61s in, 1 tool call so far (latest: shell). I'll keep going."},"files":0}
-{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Still working on this — 151s in, 2 tool calls so far (latest: shell). This is taking longer than usual, but I'm still going."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"[task] running: shell (echo step one)"},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"last: shell ok · 1 tool call | 1:01\n  [shell] echo step one — step one"},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"running: shell (echo step two) · 1 tool call | 2:31\n  [shell] echo step one — step one"},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"last: shell ok · 2 tool calls | 2:31\n  [shell] echo step one — step one\n  [shell] echo step two — step two"},"files":0}
 {"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Both slow steps are done."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"working · done in 2:31, 2 tool calls\n  [shell] echo step one — step one\n  [shell] echo step two — step two"},"files":0}
