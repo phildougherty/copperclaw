@@ -156,6 +156,16 @@ impl ChannelAdapter for MatrixAdapter {
         true
     }
 
+    /// Intentionally uncapped — the case the trait docs name explicitly.
+    /// The Matrix spec caps the *whole PDU* at 65 536 bytes (Server-Server
+    /// API), not the `body` field, and that budget is shared with
+    /// signatures, `prev_events` and `formatted_body`. There is no
+    /// per-message character limit to split on, and any number we invented
+    /// would be wrong in both directions.
+    fn max_message_chars(&self) -> Option<usize> {
+        None
+    }
+
     async fn subscribe(
         &self,
         platform_id: &str,
@@ -1149,6 +1159,18 @@ mod tests {
         assert_eq!(adapter.channel_type().as_str(), "matrix");
         assert!(adapter.supports_threads());
         assert_eq!(adapter.bot_user_id(), "@bot:m.org");
+        adapter.shutdown().await;
+    }
+
+    /// Deliberately uncapped: the Matrix spec's 65 536-byte ceiling is on
+    /// the whole PDU, not on `body`, so there is no per-message character
+    /// limit to split against.
+    #[tokio::test]
+    async fn max_message_chars_is_uncapped_by_design() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        assert_eq!(adapter.max_message_chars(), None);
         adapter.shutdown().await;
     }
 

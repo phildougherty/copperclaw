@@ -8,7 +8,7 @@ use copperclaw_container_rt::{ContainerSpec, ImageBuildSpec, Mount, ResourceLimi
 use copperclaw_db::session::SessionPaths;
 use copperclaw_db::tables::{container_configs, sessions};
 use copperclaw_types::{AgentGroupId, Session};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default poll cadence. The router debounces inbound, so once a
 /// message has settled in `messages_in` we want to spawn fast — this
@@ -230,6 +230,26 @@ fn set_mode(path: &std::path::Path, mode: u32, what: &str) {
 }
 
 impl ContainerManager {
+    /// Whether the host environment currently forbids launching a
+    /// container, and why. `None` means "go ahead".
+    ///
+    /// Reads the *cached* disk probe (refreshed once per reconcile tick by
+    /// `refresh_host_resources`) rather than calling `statvfs` itself, so
+    /// a pass over N sessions costs one stat, not N. Unknown free space
+    /// (the filesystem could not be stat'd) is deliberately NOT a block:
+    /// a stat error is not evidence of exhaustion, and failing closed on
+    /// it would let one bad path freeze every session on the box.
+    pub(crate) fn spawn_blocked_by_host_resources(&self) -> Option<&'static str> {
+        if self.env_breaker.is_tripped() {
+            return Some("environment fault (multiple sessions crash-restarted)");
+        }
+        let disk = self
+            .disk_probe
+            .get(&self.cfg.data_dir, tokio::time::Instant::now())?;
+        disk.is_exhausted()
+            .then_some("disk below the failure floor")
+    }
+
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
     /// a container was actually spawned (i.e. pending work was found
     /// and the runtime call succeeded), `Ok(false)` when there was
@@ -244,6 +264,23 @@ impl ContainerManager {
     pub async fn maybe_spawn(&self, session: &Session) -> Result<bool, ManagerError> {
         if self.is_degraded() {
             return Err(ManagerError::HostDegraded);
+        }
+        // Host-resource preflight. Ordered BEFORE `ensure_dirs` on purpose:
+        // when the box is out of disk, the very first thing this function
+        // would otherwise do is try to write. Spawning into a full
+        // filesystem does not fail fast — it fails halfway, after Docker
+        // has written image layers and the runner has half-created a
+        // session DB, and then presents as a stale heartbeat that the
+        // reconcile loop reads as a per-session crash. Refusing here keeps
+        // the session `Stopped` with its inbound still pending, which is
+        // the outcome we actually want: nothing lost, nothing burned.
+        if let Some(reason) = self.spawn_blocked_by_host_resources() {
+            debug!(
+                session = %session.id.as_uuid(),
+                reason,
+                "spawn preflight refused: host cannot support a container right now"
+            );
+            return Err(ManagerError::HostResourceExhausted);
         }
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         paths.ensure_dirs().map_err(ManagerError::Io)?;

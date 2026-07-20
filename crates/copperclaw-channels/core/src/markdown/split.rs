@@ -129,6 +129,81 @@ pub fn split_into_chunks(text: &str, max: usize, channel_type: &str) -> Vec<Stri
     out
 }
 
+/// Split honoring BOTH a char cap and (optionally) a UTF-8 **byte** cap.
+///
+/// Some platforms document their limit in bytes, not chars — Webex's
+/// `POST /messages` caps `text` / `markdown` / `html` at 7 439 *bytes*.
+/// [`split_into_chunks`] counts chars, so a CJK- or emoji-heavy reply can
+/// pass a 7 439-char split and still arrive at ~3-4x the byte budget; the
+/// 10% render headroom does not cover a 3x overshoot.
+///
+/// Rather than pessimize every message to `bytes / 4` chars — which would
+/// fragment ordinary ASCII replies fourfold for no reason — this runs the
+/// shared char splitter first and then re-splits only the chunks that
+/// actually blow the byte budget, using each offending chunk's own
+/// bytes-per-char density to derive a tighter char cap. ASCII text (1
+/// byte/char) never triggers the second pass at all.
+///
+/// `max_chars` and `max_bytes` are EFFECTIVE caps — the caller applies
+/// [`effective_max`] headroom to each, exactly as it does for
+/// [`split_into_chunks`]. `max_bytes` of `None` (or 0) means "no byte
+/// cap", and the result is identical to [`split_into_chunks`].
+///
+/// Fence balance is preserved: every chunk the char splitter emits parses
+/// with balanced fences, and re-splitting such a chunk runs the same
+/// fence-aware logic over it, so sub-chunks are balanced too.
+pub fn split_into_chunks_within_bytes(
+    text: &str,
+    max_chars: usize,
+    max_bytes: Option<usize>,
+    channel_type: &str,
+) -> Vec<String> {
+    let chunks = split_into_chunks(text, max_chars, channel_type);
+    let Some(max_bytes) = max_bytes.filter(|b| *b > 0) else {
+        return chunks;
+    };
+    chunks
+        .into_iter()
+        .flat_map(|c| enforce_byte_cap(c, max_chars, max_bytes, channel_type, BYTE_SPLIT_DEPTH))
+        .collect()
+}
+
+/// How many density-guided re-split passes [`split_into_chunks_within_bytes`]
+/// will make before accepting an over-budget chunk. Each pass strictly
+/// shrinks the char cap, so this is a belt-and-braces bound: mixed
+/// ASCII/CJK text converges in one or two.
+const BYTE_SPLIT_DEPTH: u8 = 8;
+
+/// Re-split one chunk until it fits `max_bytes`, or the cap can shrink no
+/// further. Returns the chunk untouched when it already fits.
+fn enforce_byte_cap(
+    chunk: String,
+    cap_chars: usize,
+    max_bytes: usize,
+    channel_type: &str,
+    depth: u8,
+) -> Vec<String> {
+    if chunk.len() <= max_bytes || depth == 0 || cap_chars <= 1 {
+        return vec![chunk];
+    }
+    // Derive a char cap from THIS chunk's density: chars * (max_bytes /
+    // bytes). Clamped strictly below the cap that produced the chunk so the
+    // recursion always makes progress.
+    let chars = chunk.chars().count();
+    let est = (chars.saturating_mul(max_bytes) / chunk.len()).max(1);
+    let next = est.min(cap_chars - 1).max(1);
+    let pieces = split_into_chunks(&chunk, next, channel_type);
+    if pieces.len() <= 1 {
+        // The splitter cannot break this down any further (single char, or a
+        // degenerate cap); emit as-is rather than spin.
+        return pieces;
+    }
+    pieces
+        .into_iter()
+        .flat_map(|p| enforce_byte_cap(p, next, max_bytes, channel_type, depth - 1))
+        .collect()
+}
+
 /// Find the best cut point in `[lo, hi)` (char indices). Tries paragraph
 /// (`\n\n`) → sentence-ender then space (`. `, `! `, `? `, `。`, `！`,
 /// `？`) → fallback to `hi` (hard cut).
@@ -163,6 +238,44 @@ fn find_cut(chars: &[char], lo: usize, hi: usize) -> usize {
         i -= 1;
     }
     hi
+}
+
+/// Percentage of a platform's declared cap the splitter is allowed to
+/// fill. The remainder is render headroom — see [`effective_max`].
+pub const RENDER_HEADROOM_PERCENT: usize = 90;
+
+/// Shrink a channel's declared cap
+/// ([`crate::ChannelAdapter::max_message_chars`]) by a safety margin, so a
+/// chunk that fits the cap as *markdown* still fits it once the adapter
+/// has *rendered* it.
+///
+/// Why this exists: the host splits the agent's raw markdown at exactly
+/// `max` chars, but every adapter renders AFTER the split — e.g. telegram
+/// runs `render(&text, Flavor::Html)` on the chunk it is handed. Rendering
+/// only ever grows the string:
+///
+/// - HTML escaping expands single chars (`&` → `&amp;`, `<` → `&lt;`);
+/// - inline markup gains tags (`**b**` → `<b>b</b>`, `[t](u)` → `<a
+///   href="u">t</a>`).
+///
+/// So a chunk of exactly 4096 markdown chars can be 4200+ chars at the
+/// API, and the platform rejects the whole message
+/// (`Bad Request: message is too long`, `MESSAGE_TOO_LONG`, `text is too
+/// long`) — which the delivery loop records as a permanent drop. Reserving
+/// [`RENDER_HEADROOM_PERCENT`] of the cap absorbs that expansion for every
+/// adapter at once, instead of each one guessing its own fudge factor.
+///
+/// `None` in → `None` out: a channel that opted out of splitting stays
+/// opted out. A cap of 0 (degenerate) yields `Some(1)` rather than
+/// `Some(0)`, since a zero-width chunk would make the splitter spin.
+#[must_use]
+pub fn effective_max(max: Option<usize>) -> Option<usize> {
+    max.map(|m| {
+        // floor(m * 90 / 100) computed without overflowing on huge caps.
+        let scaled =
+            (m / 100) * RENDER_HEADROOM_PERCENT + (m % 100) * RENDER_HEADROOM_PERCENT / 100;
+        scaled.max(1)
+    })
 }
 
 #[cfg(test)]
@@ -320,6 +433,194 @@ mod tests {
         assert_eq!(
             split_into_chunks("short", 100, "test"),
             vec!["short".to_string()]
+        );
+    }
+
+    /// REGRESSION (fix 2): Webex documents 7 439 **bytes**, and the
+    /// splitter counts chars. A CJK reply (3 bytes/char in UTF-8) passes a
+    /// 7 439-char split and arrives at ~3x the byte budget — the 10%
+    /// render headroom does not cover a 3x overshoot. With the byte cap
+    /// declared, every chunk must fit BOTH budgets.
+    #[test]
+    fn split_within_bytes_honours_byte_cap_on_cjk() {
+        let cap = 7439;
+        let text = "这是一个很长的中文回复内容需要被正确地分割。".repeat(500);
+        assert!(text.len() > cap * 2, "fixture must overshoot in bytes");
+
+        // Char-only split: passes the char cap, blows the byte budget.
+        let char_only = split_into_chunks(&text, cap, "webex");
+        assert!(
+            char_only.iter().any(|c| c.len() > cap),
+            "fixture no longer demonstrates the byte overshoot"
+        );
+
+        let chunks = split_into_chunks_within_bytes(&text, cap, Some(cap), "webex");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.len() <= cap,
+                "chunk {i} is {} bytes, over the byte cap {cap}",
+                c.len()
+            );
+            assert!(c.chars().count() <= cap, "chunk {i} exceeds the char cap");
+            assert!(is_balanced(c), "chunk {i} has unbalanced fences");
+        }
+        // Nothing was dropped: every source char is still accounted for.
+        let joined: String = chunks.concat();
+        assert!(joined.chars().count() >= text.chars().count() - chunks.len());
+    }
+
+    /// Emoji are up to 4 bytes/char — the worst case for a byte budget.
+    #[test]
+    fn split_within_bytes_honours_byte_cap_on_emoji() {
+        let cap = 400;
+        let text = "🙂🚀🎉".repeat(300); // 900 chars, 3 600 bytes
+        let chunks = split_into_chunks_within_bytes(&text, cap, Some(cap), "webex");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= cap, "chunk {i} is {} bytes > {cap}", c.len());
+        }
+        assert_eq!(
+            chunks.concat().chars().count(),
+            text.chars().count(),
+            "emoji body lost characters across the split"
+        );
+    }
+
+    /// The byte cap must cost ASCII nothing: a plain English reply splits
+    /// exactly where the char splitter would. This is the whole reason the
+    /// fix is a second cap rather than a `bytes / 4` char cap — the latter
+    /// would fragment ordinary replies fourfold.
+    #[test]
+    fn split_within_bytes_leaves_ascii_chunking_identical() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+        let plain = split_into_chunks(&text, 1000, "webex");
+        let capped = split_into_chunks_within_bytes(&text, 1000, Some(1000), "webex");
+        assert_eq!(plain, capped);
+    }
+
+    /// No byte cap declared → behaviour is exactly [`split_into_chunks`],
+    /// including for multibyte text.
+    #[test]
+    fn split_within_bytes_without_byte_cap_matches_char_splitter() {
+        let text = "漢字テスト。".repeat(200);
+        assert_eq!(
+            split_into_chunks_within_bytes(&text, 300, None, "t"),
+            split_into_chunks(&text, 300, "t")
+        );
+        assert_eq!(
+            split_into_chunks_within_bytes(&text, 300, Some(0), "t"),
+            split_into_chunks(&text, 300, "t")
+        );
+    }
+
+    /// Mixed ASCII + CJK: only the multibyte chunks get re-split, and the
+    /// density estimate converges without hitting the depth guard.
+    #[test]
+    fn split_within_bytes_handles_mixed_density() {
+        let cap = 300;
+        let text = format!(
+            "{}\n\n{}\n\n{}",
+            "ascii paragraph here. ".repeat(40),
+            "中文段落内容。".repeat(80),
+            "more ascii text. ".repeat(40)
+        );
+        let chunks = split_into_chunks_within_bytes(&text, cap, Some(cap), "t");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= cap, "chunk {i} is {} bytes > {cap}", c.len());
+        }
+    }
+
+    /// A fenced code block of CJK must still close and reopen its fence
+    /// when the byte cap forces the tighter split.
+    #[test]
+    fn split_within_bytes_preserves_fence_balance_under_byte_pressure() {
+        let body: String = (0..40).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("行{i:02}：这是一行中文代码注释内容\n"));
+            acc
+        });
+        let text = format!("```rust\n{body}```");
+        let chunks = split_into_chunks_within_bytes(&text, 400, Some(400), "t");
+        assert!(chunks.len() > 1, "byte cap must force a split");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= 400, "chunk {i} is {} bytes > 400", c.len());
+            assert!(is_balanced(c), "chunk {i} has an unbalanced fence:\n{c}");
+        }
+    }
+
+    /// `None` means "this channel opted out of splitting" — headroom must
+    /// not silently opt it back in by inventing a cap.
+    #[test]
+    fn effective_max_passes_none_through() {
+        assert_eq!(effective_max(None), None);
+    }
+
+    /// Table of the caps adapters actually declare, with the headroom-
+    /// adjusted value the splitter should use. Every row must be strictly
+    /// below its input, or the margin is not doing anything.
+    #[test]
+    fn effective_max_reserves_ten_percent_of_real_caps() {
+        // (declared cap, expected effective cap)
+        let cases = [
+            (280usize, 252usize), // x
+            (600, 540),           // wechat
+            (2000, 1800),         // discord (2000), signal (2000)
+            (4000, 3600),         // mattermost, imessage
+            (4096, 3686),         // telegram, gchat, whatsapp-cloud
+            (5000, 4500),         // line
+            (7439, 6695),         // webex
+            (28000, 25200),       // teams
+            (40000, 36000),       // slack
+            (65536, 58982),       // github
+        ];
+        for (declared, expected) in cases {
+            let got = effective_max(Some(declared)).expect("Some in, Some out");
+            assert_eq!(got, expected, "headroom for cap {declared}");
+            assert!(got < declared, "cap {declared} must actually shrink");
+        }
+    }
+
+    /// A tiny or degenerate cap must still yield a usable, non-zero
+    /// window — a `Some(0)` would make the greedy splitter spin forever.
+    #[test]
+    fn effective_max_never_returns_zero() {
+        for declared in [0usize, 1, 2, 5, 10, 11] {
+            let got = effective_max(Some(declared)).expect("Some in, Some out");
+            assert!(got >= 1, "cap {declared} produced a zero-width window");
+        }
+        assert_eq!(effective_max(Some(10)), Some(9));
+        assert_eq!(effective_max(Some(100)), Some(90));
+    }
+
+    /// The overflow-safe arithmetic must agree with the naive formula
+    /// everywhere it does not overflow, and must not panic where it would.
+    #[test]
+    fn effective_max_matches_naive_formula_and_survives_huge_caps() {
+        for declared in [1usize, 7, 99, 101, 999, 4096, 123_457] {
+            assert_eq!(
+                effective_max(Some(declared)),
+                Some((declared * 90 / 100).max(1)),
+                "mismatch at {declared}"
+            );
+        }
+        // Would overflow under `m * 90`; must still be sane and in range.
+        let huge = effective_max(Some(usize::MAX)).expect("Some in, Some out");
+        assert!(huge < usize::MAX && huge > usize::MAX / 2);
+    }
+
+    /// The headroom exists so a rendered chunk still fits. Sanity-check
+    /// the motivating case: markdown that expands under HTML escaping.
+    #[test]
+    fn effective_max_absorbs_html_escape_expansion() {
+        let cap = 4096;
+        let eff = effective_max(Some(cap)).expect("Some in, Some out");
+        // Worst realistic expansion for the escape set is `&` -> `&amp;`
+        // (5x) on a minority of chars; a body that is 5% ampersands grows
+        // by 20%... but a typical reply grows well under 10%.
+        let chunk = "a".repeat(eff - 100) + &"&".repeat(100);
+        let rendered = chunk.replace('&', "&amp;");
+        assert!(
+            rendered.chars().count() <= cap,
+            "rendered {} chars exceeded cap {cap}",
+            rendered.chars().count()
         );
     }
 }

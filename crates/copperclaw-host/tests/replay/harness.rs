@@ -1520,9 +1520,17 @@ fn build_adapter_set(
             .get(ct.as_str())
             .copied()
             .or_else(|| default_cap_for(ct.as_str()));
+        // Byte cap: a manifest `adapter_caps` override means the fixture is
+        // pinning an explicit char cap, so it opts out of the byte cap too.
+        let byte_cap = if fixture.manifest.adapter_caps.contains_key(ct.as_str()) {
+            None
+        } else {
+            default_byte_cap_for(ct.as_str())
+        };
         let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
             mock.clone(),
             cap,
+            byte_cap,
             fixture.manifest.model_rich_breadcrumbs,
             fixture.manifest.model_rich_cards,
         ));
@@ -1817,9 +1825,23 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
         "slack" => Some(40_000),
         "discord" => Some(2000),
         "teams" => Some(28_000),
-        "wechat" => Some(600),
+        "wechat" => Some(2048),
         "webex" => Some(7439),
         "line" => Some(5000),
+        _ => None,
+    }
+}
+
+/// Built-in `max_message_bytes` cap per channel type, mirroring the
+/// production `ChannelAdapter::max_message_bytes` overrides. Only the
+/// channels whose platform documents a BYTE-denominated limit declare one
+/// (webex 7 439 B, teams 28 KB, wechat 2 048 B); everything else is
+/// char-denominated and returns `None`.
+fn default_byte_cap_for(channel_type: &str) -> Option<usize> {
+    match channel_type {
+        "webex" => Some(7439),
+        "teams" => Some(28_000),
+        "wechat" => Some(2048),
         _ => None,
     }
 }
@@ -1835,6 +1857,9 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
 struct CappedAdapter {
     inner: Arc<MockAdapter>,
     max_message_chars: Option<usize>,
+    /// Byte-denominated cap for the channels whose platform documents one
+    /// (see [`default_byte_cap_for`]).
+    max_message_bytes: Option<usize>,
     /// M19 F1: when true, model an edit-capable rich adapter for the
     /// HUD breadcrumb surface (post once, edit in place) instead of the
     /// bare-mock degrade-to-text. See `Manifest::model_rich_breadcrumbs`.
@@ -1849,12 +1874,14 @@ impl CappedAdapter {
     fn new(
         inner: Arc<MockAdapter>,
         max_message_chars: Option<usize>,
+        max_message_bytes: Option<usize>,
         model_rich_breadcrumbs: bool,
         model_rich_cards: bool,
     ) -> Self {
         Self {
             inner,
             max_message_chars,
+            max_message_bytes,
             model_rich_breadcrumbs,
             model_rich_cards,
         }
@@ -1873,6 +1900,10 @@ impl ChannelAdapter for CappedAdapter {
 
     fn max_message_chars(&self) -> Option<usize> {
         self.max_message_chars
+    }
+
+    fn max_message_bytes(&self) -> Option<usize> {
+        self.max_message_bytes
     }
 
     async fn subscribe(

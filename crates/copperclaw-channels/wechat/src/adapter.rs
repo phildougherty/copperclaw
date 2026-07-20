@@ -9,6 +9,12 @@ use copperclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
 use copperclaw_types::{ChannelType, OutboundFile, OutboundMessage};
 use serde_json::Value;
 use std::sync::Mutex;
+
+/// Work Weixin's documented `message/send` text budget: 2 048 UTF-8
+/// **bytes**. Declared through both `max_message_chars` (a valid ceiling)
+/// and `max_message_bytes` (the real constraint) on the `ChannelAdapter`
+/// impl below.
+pub const WECHAT_MAX_MESSAGE_BYTES: usize = 2048;
 use tokio::task::JoinHandle;
 
 /// The `WeChat` Work channel adapter.
@@ -160,14 +166,23 @@ impl ChannelAdapter for WeChatAdapter {
         false
     }
 
-    /// Work Weixin `message/send` text caps at 2 048 bytes. Our splitter
-    /// is char-based, so we use 600 chars as a safe under-approximation
-    /// (CJK in UTF-8 is up to 3 bytes per char → 600 chars ≈ 1 800 bytes).
-    /// Operators with mostly-ASCII workloads will hit this earlier than
-    /// strictly necessary; tightening this requires a byte-aware splitter
-    /// — out of scope for the initial cohesive-UX pass.
+    /// Work Weixin `message/send` text caps at 2 048 **bytes** (see
+    /// [`Self::max_message_bytes`]). 2 048 is also a valid CHAR ceiling —
+    /// one char is at least one UTF-8 byte.
+    ///
+    /// This used to declare 600 chars: a deliberate under-approximation
+    /// (600 CJK chars ≈ 1 800 bytes) chosen because the splitter was
+    /// char-only, at the cost of fragmenting mostly-ASCII workloads more
+    /// than three times as often as necessary. The byte-aware splitter
+    /// makes the pessimization unnecessary — ASCII now uses the real
+    /// budget, and multi-byte text is tightened by the byte cap alone.
     fn max_message_chars(&self) -> Option<usize> {
-        Some(600)
+        Some(WECHAT_MAX_MESSAGE_BYTES)
+    }
+
+    /// The Work Weixin limit as documented: 2 048 UTF-8 **bytes**.
+    fn max_message_bytes(&self) -> Option<usize> {
+        Some(WECHAT_MAX_MESSAGE_BYTES)
     }
 
     async fn deliver(
@@ -711,5 +726,18 @@ mod tests {
         assert_eq!(infer_media_kind("noext"), "file");
         assert_eq!(infer_media_kind("x.pdf"), "file");
         assert_eq!(infer_media_kind("x.bin"), "file");
+    }
+
+    /// The Work Weixin 2 048-byte budget is now declared as bytes. The old
+    /// 600-char under-approximation existed only because the splitter was
+    /// char-only; with a byte cap, ASCII gets the real budget and
+    /// multibyte text is tightened by the byte cap alone.
+    #[tokio::test]
+    async fn max_message_caps_are_byte_denominated() {
+        let server = MockServer::start().await;
+        token_mount(&server).await;
+        let a = adapter_for(&server, 1);
+        assert_eq!(a.max_message_bytes(), Some(WECHAT_MAX_MESSAGE_BYTES));
+        assert_eq!(a.max_message_chars(), Some(WECHAT_MAX_MESSAGE_BYTES));
     }
 }

@@ -43,6 +43,176 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`ChannelAdapter` default rich-kind renderers no longer bypass the
+  splitter.** The trait's default `deliver_thinking` / `deliver_error` /
+  `deliver_diff` / `deliver_card` / `deliver_breadcrumb` / `deliver_todo_list`
+  / `deliver_collapsible` each rendered an UNBOUNDED `to_text_fallback()` and
+  called `self.deliver(...)` from *inside* the adapter
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Because they never
+  return `AdapterError::Unsupported`, they never reached the host's newly
+  cap-aware `call_adapter` in `copperclaw-host-delivery`, so any adapter
+  relying on the defaults could still hand the platform an over-length body
+  and take a permanent `BadRequest` — the reasoning block / error card / diff
+  was dropped, not truncated. All seven now route through a new provided
+  method `ChannelAdapter::deliver_text_capped`, which applies the same
+  `markdown::effective_max` render headroom the host applies and delegates to
+  the shared fence-aware `markdown::split_into_chunks` — no second splitter,
+  no duplicated headroom math. Fence balance is preserved, so a split diff or
+  thinking block never leaves a code fence dangling open, and the first part's
+  platform id is still returned as the edit/reaction anchor. In-cap bodies are
+  unaffected (exactly one `deliver` call, as before).
+
+- **Byte-denominated platform caps are no longer mis-declared as char caps.**
+  `max_message_chars()` counts chars, but three platforms document their limit
+  in UTF-8 **bytes**: Webex `POST /messages` at 7 439 bytes
+  (`crates/copperclaw-channels/webex/src/adapter.rs`), MS Graph `chatMessage`
+  at 28 KB (`teams/src/adapter.rs`), and Work Weixin `message/send` at 2 048
+  bytes (`wechat/src/adapter.rs`). A CJK reply is 3 bytes/char and many emoji
+  are 4, so a body that passed a 7 439-*char* split arrived at up to ~3x the
+  byte budget — far past what the 10% render headroom absorbs — and was
+  rejected outright. New trait method `ChannelAdapter::max_message_bytes()`
+  (default `None`) expresses the real constraint; the shared splitter gained
+  `markdown::split_into_chunks_within_bytes`, which runs the existing char
+  splitter first and re-splits ONLY the chunks that actually exceed the byte
+  budget, using each chunk's own bytes-per-char density. Ordinary ASCII
+  chunking is therefore byte-for-byte unchanged — the alternative, declaring
+  `bytes / 4` as a char cap, would have fragmented every plain English reply
+  fourfold. Honored by the host split path (`split_chat_content_if_needed` and
+  the streaming-edit split in `copperclaw-host-delivery/src/service.rs`, plus
+  the too-long re-split retry) and by the trait's own `deliver_text_capped`.
+  Webex and Teams keep their existing numbers as char ceilings (one char is at
+  least one byte); wechat's char cap goes 600 → 2 048, retiring the deliberate
+  under-approximation its own comment flagged as "requires a byte-aware
+  splitter — out of scope".
+
+- **Over-long outbound replies no longer drop permanently.** A correct
+  fence-aware splitter already existed and was wired into `dispatch_chat`, but
+  only there — so `BadRequest("Bad Request: message is too long")` /
+  `MESSAGE_TOO_LONG` / `text is too long` kept recurring through 2026-07-18/19
+  on every other path. Four fixes, all in
+  `crates/copperclaw-host-delivery/src/service.rs`: (1) the **streaming edit
+  path** (`try_streaming_edit_split`) — `editMessageText` enforces the same
+  4096 limit as `sendMessage`, so a streamed reply that grew past the cap
+  failed on every subsequent edit and froze at whatever prefix had landed;
+  the overflow now spills into follow-up messages and later ticks extend the
+  new TAIL with only the text past an accounted `committed` prefix, so the
+  stream keeps extending coherently instead of re-posting itself (state in
+  the new `edit_splits` map, keyed by anchor id, TTL-pruned; in-memory, so a
+  restart mid-stream degrades to editing the anchor). (2) **`call_adapter` is
+  now the cap-aware send surface** — the split moved below it rather than
+  being patched into eight call sites, so the seven `Unsupported` rich-kind
+  text fallbacks (collapsible / card / breadcrumb / todo list / error /
+  thinking / diff) and the delivery-action output path all inherit it at once;
+  rows already split by `dispatch_chat` pass through unchanged, so there is no
+  double split. (3) **Render headroom** — adapters render markdown to their
+  own flavor AFTER the split and HTML escaping expands the string, so a chunk
+  cut at exactly the declared cap could be over-length at the API;
+  `split_chat_content_if_needed` now shrinks the cap via
+  `copperclaw_channels_core::markdown::effective_max` in the one place the cap
+  becomes a chunk size. (4) **Empty-payload guard** — a `Chat` row with
+  absent / non-string / whitespace-only `text` passed through the splitter
+  untouched and was rejected by the adapter (`telegram deliver requires text
+  or files`; every `OutboundMessage` this crate builds hardcodes
+  `files: vec![]`, so that branch could never rescue it), burning the whole
+  retry budget and emitting a spurious user-facing `MessageKind::Error`
+  receipt for what is a runner-side condition; it is now recorded as a
+  delivered no-op. Plus a backstop: `is_too_long_bad_request` degrades an
+  over-length rejection into a re-split retry at a halved cap (only when
+  nothing was sent yet, so it cannot duplicate), insurance for adapters that
+  under-declare `max_message_chars` or platforms that tighten a limit. All
+  four defects were invisible to the suite — which is why this surface read as
+  already fixed — and each now has a regression test that was confirmed to
+  fail with its fix reverted.
+
+- **A full disk no longer turns into an unbounded per-session respawn storm.**
+  On 2026-07-18/19 the host's disk filled and the reconcile loop escalated from
+  1 to 56 to 179 `heartbeat stale; running -> stopped (will respawn)` lines a
+  day plus 235 `crash-restart recorded ... cause="generic"`, because the host
+  had no notion of "the environment cannot support a container right now": a
+  whole-box fault presented as N independent per-session bugs, and the remedy
+  applied (per-session backoff) structurally could not help — every session
+  retried forever at the 300s cap against the same full filesystem. Four
+  changes, all in `crates/copperclaw-host/src/container_manager/`:
+  (1) a **spawn preflight** (new `host_resources.rs`) `statvfs`es the data dir
+  and refuses to launch a container below the failure floor, returning the new
+  `ManagerError::HostResourceExhausted` — the session stays `Stopped` with its
+  inbound still pending instead of burning a doomed spawn. The probe is cached
+  per reconcile *tick*, not per session, so a pass over N sessions costs one
+  stat. (2) A **global circuit breaker** keyed on *distinct* sessions: when
+  `ENV_FAULT_SESSION_THRESHOLD` (3) different sessions crash-restart inside
+  `ENV_FAULT_WINDOW` (120s), the manager pauses respawns fleet-wide and fires
+  exactly ONE operator alert (not one per session), self-clearing once the disk
+  recovers and the hold elapses, or via `clear_env_exhausted()`. (3) `classify`
+  no longer swallows inbound-DB read failures: `has_pending_inbound`'s
+  `.unwrap_or(false)` made an unreadable DB indistinguishable from "no pending
+  work", so on a full disk every session silently stopped spawning with **no log
+  line at all**; it now warns. (4) A new `CrashCause::ResourceExhausted` plus
+  `free_disk_bytes` on every crash-restart log line, so an operator reading the
+  crash records has a thread back to the disk. Thresholds are no longer
+  duplicated: the pure classifier and `statvfs` call moved to the new
+  `copperclaw_cclaw::disk` module, shared by `cclaw doctor`'s `disk-space` check
+  and the host's preflight, so the CLI and the runtime cannot disagree about how
+  full is too full.
+
+- **Over-long agent replies are no longer permanently dropped on X, Signal,
+  Mattermost, iMessage and GitHub.** Those adapters declared no
+  `ChannelAdapter::max_message_chars`, so the host's outbound splitter never
+  engaged and any reply past the platform ceiling was rejected outright —
+  `text is too long` (X), `MESSAGE_TOO_LONG`, `Bad Request: message is too
+  long` — and recorded as a permanent `dropped_messages` failure, still
+  recurring 2026-07-18/19. Each now declares its real documented limit, with
+  the source cited in the doc comment: x 280 (`POST /2/tweets`,
+  standard-account limit, `x/src/adapter.rs`), signal 2000 (the composer limit
+  every official client enforces — over-long bodies were *silently truncated*,
+  a worse failure than a split), mattermost 4000 (`PostMessageMaxRunesV1`, the
+  default `MaxPostSize`; the 16383 v2 limit needs an opt-in migration),
+  imessage 4000 (self-imposed — Apple documents none, but long AppleScript
+  literals through `osascript` are unreliable), github 65536 (documented
+  comment-body max; the REST API returns a hard 422 above it). `matrix`,
+  `resend` and `deltachat` are now *explicitly* uncapped with a stated reason
+  rather than uncapped by omission — Matrix's 65 536-byte ceiling is on the
+  whole PDU and not on `body`, and Resend/Delta Chat are email, where chopping
+  one message into a numbered burst is worse than sending one long one.
+- **Rendered chunks can no longer overshoot the cap they were split to.** New
+  `markdown::effective_max` in
+  `crates/copperclaw-channels/core/src/markdown/split.rs` shrinks a declared
+  cap by a 10% render-headroom margin (`RENDER_HEADROOM_PERCENT`). The host
+  splits *raw markdown* at exactly `max`, but adapters render **after** the
+  split (telegram runs `render(&text, Flavor::Html)` on the chunk it is
+  handed), and rendering only grows the string — HTML escaping expands single
+  chars (`&` → `&amp;`) and inline markup gains tags (`**b**` → `<b>b</b>`).
+  So a chunk of exactly 4096 markdown chars could arrive at the API well over
+  4096 and take the whole message down. One helper next to `split_into_chunks`
+  means all 21 adapters inherit the margin instead of each guessing its own
+  fudge factor; `None` passes through unchanged (opted-out channels stay
+  opted out) and a degenerate cap floors at `Some(1)` so the greedy splitter
+  cannot spin. Arithmetic is overflow-safe on huge caps.
+- **Route-less sessions no longer lose every `usage_report` (delegate token
+  spend was invisible).** `process_row` in
+  `crates/copperclaw-host-delivery/src/service.rs` resolved a dispatch target as
+  a hard precondition *before* the `row.kind` match, so any session without
+  `session_routing` failed every outbound row. `delegate`-profile children are
+  spawned with no routing **on purpose** (that is their containment property),
+  yet they emit one `MessageKind::System` `usage_report` row per turn — 550 of
+  those were permanently marked failed on 2026-07-19, so delegate token spend
+  never reached `agent_turns` and was invisible to `cclaw usage` and to budget
+  enforcement. System rows are host-local control messages and are now processed
+  route-free; `handle_system` takes an optional target and demands a real one
+  only for the sub-actions that genuinely dispatch to a channel (`save_skill` /
+  `task_grant` approval cards, `update_breadcrumb`, `edit` / `reaction`).
+  Deliberately **no** parent-route fallback — inheriting the parent's chat route
+  would break the containment the profile exists to provide. User-facing kinds
+  are unchanged: they still require a route.
+- **Unroutable rows are now dead-lettered instead of vanishing.** The `NoRoute`
+  arm of the delivery loop wrote nothing central, so `cclaw dropped-messages
+  outbound-list` stayed empty through those 550+ failures. New
+  `Service::record_no_route` mirrors the existing no-adapter dead-letter path:
+  replayable kinds get an `outbound_dropped_messages` row with the new
+  `NO_ROUTE_DROP_REASON` (`no_route`) prefix, ephemeral UI kinds keep the
+  terminal record only, and no `ErrorCard` is emitted (there is nowhere to send
+  one). New `copperclaw_metrics::DEAD_LETTER_REASON_NO_ROUTE` gives the case its
+  own `copperclaw_delivery_dead_letter_total{reason="no_route"}` series, so it is
+  no longer indistinguishable from any other terminal delivery failure.
 - **`todo_watcher` background loop no longer restart-storms when disabled.**
   The todo-notifications watcher is opt-in (`COPPERCLAW_TODO_NOTIFICATIONS`,
   default off), but its `run_loop` *returned immediately* when the flag was

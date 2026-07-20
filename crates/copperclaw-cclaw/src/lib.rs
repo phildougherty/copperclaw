@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod commands;
+pub mod disk;
 pub mod output;
 pub mod protocol;
 pub mod security;
@@ -1376,65 +1377,29 @@ where
     finalise_doctor(&checks, as_json, palette)
 }
 
-/// Byte thresholds for the `disk-space` doctor check, kept next to the
-/// pure classifier they parameterise. WARN below 10% free *or* below
-/// 20 GiB free (whichever trips first); FAIL below 3% free *or* below
-/// 5 GiB free.
-const GIB: u64 = 1024 * 1024 * 1024;
-const DISK_WARN_BYTES: u64 = 20 * GIB;
-const DISK_FAIL_BYTES: u64 = 5 * GIB;
+/// The thresholds, the pure classifier, and the `statvfs` call now live in
+/// [`crate::disk`] — the host's spawn preflight
+/// (`copperclaw_host::container_manager::host_resources`) classifies free
+/// space with the *same* numbers, and two copies would drift into `doctor`
+/// saying OK while the reconcile loop refuses every spawn. What stays here
+/// is only the doctor-specific presentation.
+use crate::disk::{DISK_FIX, DiskLevel, free_pct, human_bytes};
 
-/// Remediation hint shared by the WARN/FAIL disk rows.
-const DISK_FIX: &str = "reclaim space: rotate/delete old host logs under \
-    <data>/logs, `docker system prune -af --volumes`, and clear stale \
-    Rust `target/` dirs (`cargo clean` in dev checkouts)";
-
-/// Classify free disk into a [`CheckLevel`]. Pure so the boundaries are
-/// unit-testable without touching a real filesystem. Percent is compared
-/// with integer (u128) math to stay clippy-clean (no float casts) and
-/// overflow-free: `free/total < n%`  ⇔  `free*100 < total*n`.
+/// `disk-space` doctor severity from free bytes. Thin adapter over
+/// [`crate::disk::level`] mapping the shared band onto doctor's own
+/// [`CheckLevel`].
 fn disk_level(free_bytes: u64, total_bytes: u64) -> CheckLevel {
-    let free = u128::from(free_bytes);
-    let total = u128::from(total_bytes);
-    let below_pct = |n: u128| total != 0 && free * 100 < total * n;
-    if below_pct(3) || free_bytes < DISK_FAIL_BYTES {
-        CheckLevel::Fail
-    } else if below_pct(10) || free_bytes < DISK_WARN_BYTES {
-        CheckLevel::Warn
-    } else {
-        CheckLevel::Ok
+    match crate::disk::level(free_bytes, total_bytes) {
+        DiskLevel::Ok => CheckLevel::Ok,
+        DiskLevel::Warn => CheckLevel::Warn,
+        DiskLevel::Fail => CheckLevel::Fail,
     }
 }
 
-/// Human-readable byte size (binary units) for disk-check detail lines.
-/// Integer-only (no float casts) to stay clippy-pedantic-clean; one
-/// decimal place via scaled u128 arithmetic with round-to-nearest.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut unit = 0;
-    let mut scale: u64 = 1;
-    while unit < UNITS.len() - 1 && n / scale >= 1024 {
-        scale *= 1024;
-        unit += 1;
-    }
-    if unit == 0 {
-        return format!("{n} B");
-    }
-    let scale = u128::from(scale);
-    let tenths = (u128::from(n) * 10 + scale / 2) / scale;
-    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
-}
-
-/// Integer free-space percentage (rounded down) for detail lines. Result
-/// is 0..=100, so the `try_from` fallback is unreachable in practice; it
-/// exists to dodge a lossy-cast clippy lint without an `as` cast.
-fn free_pct(free_bytes: u64, total_bytes: u64) -> u64 {
-    if total_bytes == 0 {
-        return 0;
-    }
-    let pct = (u128::from(free_bytes) * 100) / u128::from(total_bytes);
-    u64::try_from(pct).unwrap_or(100)
-}
+/// One binary gibibyte — test-only alias so the existing boundary tests
+/// keep reading in GiB. Non-test code goes through [`crate::disk`].
+#[cfg(test)]
+const GIB: u64 = crate::disk::GIB;
 
 // Test seam: when set on the current thread, `disk_space_check` skips the
 // real `statvfs` and reports these synthetic `(free, total)` bytes. Keeps
@@ -1514,16 +1479,8 @@ fn disk_check_bytes(free: u64, total: u64, label_path: &std::path::Path) -> Chec
 /// path resolution above stays readable. `label_path` is what the detail
 /// line names (the data dir), `stat_path` is what we actually statvfs.
 fn disk_check_at(stat_path: &std::path::Path, label_path: &std::path::Path) -> Check {
-    match rustix::fs::statvfs(stat_path) {
-        Ok(vfs) => {
-            // Bytes = block count * fragment size. `f_bavail` is the space
-            // available to unprivileged writers (excludes root-reserved
-            // blocks) — the number that actually predicts write failures.
-            let frag = vfs.f_frsize;
-            let total = vfs.f_blocks.saturating_mul(frag);
-            let free = vfs.f_bavail.saturating_mul(frag);
-            disk_check_bytes(free, total, label_path)
-        }
+    match crate::disk::statvfs_bytes(stat_path) {
+        Ok((free, total)) => disk_check_bytes(free, total, label_path),
         Err(e) => Check::warn(
             "disk-space",
             format!("could not stat {}: {e}", stat_path.display()),
