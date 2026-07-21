@@ -1,7 +1,7 @@
 {
   "name": "cli-empty-llm-response",
   "channel": "cli",
-  "description": "LLM returns a successful turn with no text and no tool_use blocks. Runner completes the inbound with no outbound chat row.",
+  "description": "LLM returns empty turns (no text, no tool_use) on all three attempts. Runner retries twice, then fails the inbound with the empty-reply apology on an Error row.",
   "schema": 1,
   "replay": {
     "mode": "direct",

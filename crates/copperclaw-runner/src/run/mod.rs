@@ -2589,6 +2589,122 @@ mod tests {
         );
     }
 
+    /// Transient-empty path: the model returns two empty replies (no
+    /// text, no tool call) and then a real answer. The empty turn
+    /// appends nothing to history, so the runner replays the identical
+    /// request instead of terminally failing — the inbound completes
+    /// and the third turn's text reaches the channel. Pins the retry
+    /// half of `MAX_EMPTY_REPLY_ATTEMPTS`.
+    #[tokio::test]
+    async fn empty_reply_retries_then_succeeds() {
+        let mut setup = build_setup(vec![
+            vec![ProviderEvent::Result { text: None }],
+            vec![ProviderEvent::Result { text: None }],
+            vec![ProviderEvent::Result {
+                text: Some("ok done".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "anyone there?")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "two empty replies followed by a real one must not terminally fail the inbound"
+        );
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(
+            chat_rows.len(),
+            1,
+            "expected one chat outbound (the recovered reply), got: {chat_rows:?}"
+        );
+        assert_eq!(chat_rows[0].content["text"], "ok done");
+    }
+
+    /// Cap path: three consecutive empty replies exhaust
+    /// `MAX_EMPTY_REPLY_ATTEMPTS`. The fourth scripted turn is never
+    /// reached, the inbound is marked `failed`, and the apology rides
+    /// an Error-kind row.
+    #[tokio::test]
+    async fn empty_reply_gives_up_after_three_attempts() {
+        let empty = || vec![ProviderEvent::Result { text: None }];
+        let mut setup = build_setup(vec![
+            empty(),
+            empty(),
+            empty(),
+            vec![ProviderEvent::Result {
+                text: Some("should never be seen".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "anyone there?")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "three consecutive empty replies must terminally fail the inbound"
+        );
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert!(
+            chat_rows.is_empty(),
+            "no Chat outbound expected — apology rides Error kind: {chat_rows:?}"
+        );
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "expected exactly one Error apology row, got: {error_rows:?}"
+        );
+        let card_value = error_rows[0]
+            .content
+            .get("error")
+            .expect("Error apology row must carry content.error");
+        let card: copperclaw_channels_core::ErrorCard =
+            serde_json::from_value(card_value.clone()).unwrap();
+        assert!(
+            !card.summary.contains("should never be seen"),
+            "fourth turn must not have been consumed: {:?}",
+            card.summary
+        );
+    }
+
     /// Content-loop breaker: the model emits the SAME `(tool, args)`
     /// call on every turn. After `TOOL_LOOP_BREAKER_THRESHOLD` identical
     /// calls the runner trips the circuit breaker, terminates the

@@ -149,6 +149,21 @@ const MAX_TOOL_PARSE_ERROR_ATTEMPTS: u32 = 3;
 /// remain. See `identical_tool_call_loop_trips_breaker`.
 const TOOL_LOOP_BREAKER_THRESHOLD: usize = 4;
 
+/// Cap on CONSECUTIVE provider calls that return an empty reply — no
+/// text and no tool call (an HTTP 200 with zero output content; seen
+/// live with reasoning models behind gateways, where a single empty
+/// reply is usually a transient upstream blip). Because the empty turn
+/// appends nothing to history, the runner can replay the identical
+/// request; it does so up to this many attempts (matching
+/// `MAX_PROVIDER_ATTEMPTS` and its backoff schedule) before surfacing
+/// the terminal failure. Without the retry, one blip terminally fails
+/// the inbound — and on a session's kickoff call that means a
+/// crash-loop: spawn, empty reply, exit, respawn. A non-empty reply
+/// resets the counter, so only a genuinely wedged model trips it. See
+/// `empty_reply_retries_then_succeeds` and
+/// `empty_reply_gives_up_after_three_attempts`.
+const MAX_EMPTY_REPLY_ATTEMPTS: u32 = 3;
+
 /// Which degenerate tool-call pattern tripped the breaker. Carries the
 /// `copperclaw-metrics` `pattern` label value so the call site can't
 /// drift from the recorded label.
@@ -482,6 +497,7 @@ async fn drive_turn_inner(
     // completes.
     let hard = deps.max_tool_turns_hard.max(soft);
     let mut total_turns: usize = 0;
+    let mut empty_reply_attempts: u32 = 0;
     'blocks: loop {
         // Per-block progress latch. Set true by the batch-results loop below
         // when a successful non-read-only tool call runs (real work, as opposed
@@ -558,26 +574,47 @@ async fn drive_turn_inner(
                 // the user sees no response at all — caught live on
                 // 2026-05-24 with `deepseek/deepseek-v4-flash` + effort=high,
                 // where the model returned an HTTP 200 with zero output
-                // tokens. Flip to Failed so `emit_terminal_failure_apologies`
-                // surfaces an ErrorCard to the originating channel instead.
+                // tokens. The empty turn appended nothing to history, so
+                // first replay the identical request (transient upstream
+                // blips are the common case); only after
+                // `MAX_EMPTY_REPLY_ATTEMPTS` consecutive empties flip to
+                // Failed so `emit_terminal_failure_apologies` surfaces an
+                // ErrorCard to the originating channel.
                 if output.text.is_empty() {
+                    empty_reply_attempts += 1;
+                    if empty_reply_attempts < MAX_EMPTY_REPLY_ATTEMPTS {
+                        tracing::warn!(
+                            target: "copperclaw_runner",
+                            provider = %deps.provider.name(),
+                            model = %deps.model,
+                            attempt = empty_reply_attempts,
+                            "model returned empty reply (no text, no tool \
+                             call); backing off and retrying"
+                        );
+                        // Give the turn slot back — the empty call must
+                        // not eat tool-turn budget.
+                        total_turns -= 1;
+                        super::provider_call::backoff_for_attempt(empty_reply_attempts).await;
+                        continue;
+                    }
                     tracing::warn!(
                         target: "copperclaw_runner",
                         provider = %deps.provider.name(),
                         model = %deps.model,
-                        "model returned empty reply (no text, no tool call); \
-                         surfacing as terminal failure"
+                        attempts = empty_reply_attempts,
+                        "model returned empty reply (no text, no tool call) \
+                         on every attempt; surfacing as terminal failure"
                     );
                     return Ok(TurnResult {
                         continuation,
-                        outcome: TurnOutcome::Failed(
+                        outcome: TurnOutcome::Failed(format!(
                             "the model returned an empty reply — no text and no \
-                         tool call. This usually means the model id is \
+                         tool call — on {MAX_EMPTY_REPLY_ATTEMPTS} consecutive \
+                         attempts. This usually means the model id is \
                          wrong, the provider's response was malformed, or a \
                          reasoning model produced only thinking tokens. Try \
                          a different model or lower the reasoning effort."
-                                .to_string(),
-                        ),
+                        )),
                         blocker: None,
                     });
                 }
@@ -650,6 +687,9 @@ async fn drive_turn_inner(
             } else {
                 consecutive_parse_error_turns = 0;
             }
+            // Reaching here means the turn had tool calls — the
+            // empty-reply cap only counts CONSECUTIVE empties.
+            empty_reply_attempts = 0;
 
             // Tools requested → execute each, push the result as a
             // user-role tool_result history entry, and loop into

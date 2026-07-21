@@ -240,6 +240,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Empty provider replies are retried instead of terminally failing the
+  inbound.** An HTTP-200 reply with no text and no tool call (seen live with
+  reasoning models behind gateways, e.g. `openai/gpt-5.6-luna` via OpenRouter)
+  previously flipped the turn straight to a terminal failure — on a session's
+  kickoff call that meant a spawn / empty-reply / exit crash-loop, surfacing to
+  users as "agent container unresponsive". `drive_turn` now replays the
+  identical request (the empty turn appends nothing to history) up to 3
+  consecutive attempts with the standard provider backoff schedule before
+  giving up; a non-empty reply resets the counter. The terminal apology now
+  says the reply was empty on every attempt.
 - **`ChannelAdapter` default rich-kind renderers no longer bypass the
   splitter.** The trait's default `deliver_thinking` / `deliver_error` /
   `deliver_diff` / `deliver_card` / `deliver_breadcrumb` / `deliver_todo_list`
