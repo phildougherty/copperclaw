@@ -397,6 +397,17 @@ impl ChannelAdapter for DeltaChatAdapter {
         false
     }
 
+    /// Intentionally uncapped. Delta Chat is email over IMAP/SMTP, which
+    /// is exactly the "email-shaped" case the trait docs call out: there
+    /// is no send-side length reject, only the SMTP message-size ceiling
+    /// (megabytes, dominated by attachments). Delta Chat clients fold a
+    /// long body behind "Show full message" rather than refusing it, so
+    /// splitting here would turn one readable mail into a burst of
+    /// fragments for no protocol reason.
+    fn max_message_chars(&self) -> Option<usize> {
+        None
+    }
+
     async fn subscribe(
         &self,
         platform_id: &str,
@@ -755,6 +766,17 @@ mod tests {
         let (adapter, _dir, _rx) = build(m, 1);
         assert_eq!(adapter.channel_type().as_str(), "deltachat");
         assert!(!adapter.supports_threads());
+        adapter.shutdown().await;
+    }
+
+    /// Deliberately uncapped: Delta Chat is email, and email has no
+    /// send-side character reject. Pinned as `None` so a future "add caps
+    /// everywhere" sweep has to argue with this test first.
+    #[tokio::test]
+    async fn max_message_chars_is_uncapped_because_deltachat_is_email() {
+        let m: Arc<dyn RpcTransport> = Arc::new(MockTransport::new());
+        let (adapter, _dir, _rx) = build(m, 1);
+        assert_eq!(adapter.max_message_chars(), None);
         adapter.shutdown().await;
     }
 

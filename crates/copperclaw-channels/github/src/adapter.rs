@@ -103,6 +103,15 @@ impl ChannelAdapter for GithubAdapter {
         false
     }
 
+    /// The REST API rejects an over-long issue/PR comment body with a hard
+    /// 422 — `Body is too long (maximum is 65536 characters)` — and the
+    /// limit is stated in characters, matching this trait. Generous enough
+    /// that splitting is rare, but a declared cap turns a permanent drop
+    /// into a two-comment reply.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(65536)
+    }
+
     async fn set_typing(
         &self,
         _platform_id: &str,
@@ -254,6 +263,15 @@ mod tests {
         let adapter = adapter_for(&server);
         assert_eq!(adapter.channel_type().as_str(), "github");
         assert!(!adapter.supports_threads());
+    }
+
+    /// 65536 is the documented comment-body maximum; the REST API returns
+    /// a hard 422 above it rather than truncating.
+    #[tokio::test]
+    async fn max_message_chars_is_the_comment_body_limit() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        assert_eq!(adapter.max_message_chars(), Some(65536));
     }
 
     #[tokio::test]

@@ -102,6 +102,22 @@ impl ChannelAdapter for IMessageAdapter {
         &self.channel_type
     }
 
+    /// Apple publishes no per-message limit for Messages.app, so this is a
+    /// self-imposed practical ceiling rather than a documented one. Two
+    /// real constraints motivate it: the body is interpolated into an
+    /// AppleScript string literal and handed to `osascript`, where very
+    /// long literals get unreliable, and user reports of send failures
+    /// cluster well below 20 000 chars. 4000 keeps us in the range every
+    /// other chat surface here already targets.
+    ///
+    /// Caveat: when the recipient is not on iMessage the message falls
+    /// back to SMS relay, which segments/truncates around 160 chars. We
+    /// cannot detect the blue/green path from AppleScript, so this cap
+    /// does not protect that case.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(4000)
+    }
+
     async fn deliver(
         &self,
         platform_id: &str,
@@ -316,6 +332,16 @@ mod tests {
         let m = Arc::new(MockBridge::always_applescript_ok(""));
         let (a, _rx, _d) = make_adapter(m, IMessageConfig::default());
         assert!(!a.supports_threads());
+        a.shutdown().await;
+    }
+
+    /// Self-imposed 4000-char ceiling: Apple documents no limit, but very
+    /// long AppleScript string literals are unreliable through `osascript`.
+    #[tokio::test]
+    async fn max_message_chars_is_the_practical_applescript_ceiling() {
+        let m = Arc::new(MockBridge::always_applescript_ok(""));
+        let (a, _rx, _d) = make_adapter(m, IMessageConfig::default());
+        assert_eq!(a.max_message_chars(), Some(4000));
         a.shutdown().await;
     }
 

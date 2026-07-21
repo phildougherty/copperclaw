@@ -5,7 +5,7 @@
 | Capability | Native | Notes |
 |---|---|---|
 | Chat (text) | yes | Graph `chatMessage` POST on channel or chat targets |
-| Auto-split long messages | yes | 28 000-char cap declared via `max_message_chars()` (adapter.rs:337) |
+| Auto-split long messages | yes | 28 000 **bytes** (the Graph 28 KB budget) via `max_message_bytes()`, plus 28 000 as a char ceiling via `max_message_chars()` |
 | Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
 | Typing indicator | no | trait default; Graph has no typing indicator on channel messages |
 | Native cards (buttons/sections) | no | falls back via trait-default text render. Adaptive Cards are a future override |

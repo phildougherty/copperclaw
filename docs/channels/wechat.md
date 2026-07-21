@@ -5,7 +5,7 @@
 | Capability | Native | Notes |
 |---|---|---|
 | Chat (text) | yes | `message/send` text type |
-| Auto-split long messages | yes | 600-char cap declared via `max_message_chars()` (adapter.rs:169) — under-approximation of the 2 KiB byte cap to stay safe with CJK content |
+| Auto-split long messages | yes | 2048 **bytes** (the documented `message/send` cap) via `max_message_bytes()`, plus 2048 as a char ceiling via `max_message_chars()`. Replaces the old 600-char under-approximation, which existed only because the splitter was char-only |
 | Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
 | Typing indicator | no | trait default; no Work Weixin typing API |
 | Native cards (buttons/sections) | yes | `template_card` passthrough via `content.template_card` (adapter.rs:188) — opaque, no schema validation |

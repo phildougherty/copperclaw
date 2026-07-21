@@ -5,7 +5,7 @@
 | Capability | Native | Notes |
 |---|---|---|
 | Chat (text) | yes | `POST /messages` text or markdown |
-| Auto-split long messages | yes | 7439-char cap declared via `max_message_chars()` (adapter.rs:298) |
+| Auto-split long messages | yes | 7439 **bytes** (the API's documented unit) declared via `max_message_bytes()`, plus 7439 as a char ceiling via `max_message_chars()`. CJK/emoji bodies are chunked to fit the byte budget; ASCII splits unchanged |
 | Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
 | Typing indicator | no | trait default; Webex has no public typing API |
 | Native cards (buttons/sections) | yes | Adaptive Cards via `attachments[]` on `POST /messages` (handled inside `deliver_chat`); no trait-level `deliver_card` override — cards ride the deliver path with a `card` content field |

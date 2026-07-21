@@ -58,6 +58,16 @@ pub enum CrashCause {
     /// memory-limited session container almost always means the OOM
     /// killer even when the flag is unset, e.g. cgroup-v2 child kills).
     OomKill,
+    /// The *host* was out of resources when the container died — the disk
+    /// probe reported free space below the failure floor at crash time.
+    ///
+    /// Added after 2026-07-18, where 235 crash-restarts were logged as
+    /// `cause="generic"` while the real cause was a full disk sitting
+    /// right there in a different log line (`StorageFull`, `SQLite` `disk
+    /// I/O error`). An operator reading the crash lines had no thread back
+    /// to the disk. This variant is that thread. It is never *guessed*:
+    /// it is set only when the probe actually read a full filesystem.
+    ResourceExhausted,
     /// Any other crash: stale heartbeat with a nonzero exit, an
     /// uninspectable/already-gone container, a runner panic, etc.
     Generic,
@@ -75,11 +85,31 @@ impl CrashCause {
         }
     }
 
+    /// Refine this cause with what the host's disk probe saw at crash
+    /// time. A [`Self::Generic`] crash on a box whose filesystem is below
+    /// the failure floor is almost certainly dying *of* the full disk, so
+    /// it is relabelled [`Self::ResourceExhausted`].
+    ///
+    /// [`Self::OomKill`] is deliberately NOT overridden: the memory
+    /// ceiling is both more specific and more actionable (raise
+    /// `memory_mb`), and a full disk does not make an OOM kill any less of
+    /// an OOM kill. And an exhausted disk is never *guessed* — this only
+    /// ever fires when a probe actually read a full filesystem.
+    #[must_use]
+    pub fn with_host_disk(self, disk_exhausted: bool) -> Self {
+        if disk_exhausted && self == Self::Generic {
+            Self::ResourceExhausted
+        } else {
+            self
+        }
+    }
+
     /// Stable lowercase token for logs (and the M1 metrics rider).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OomKill => "oom_kill",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::Generic => "generic",
         }
     }
@@ -445,6 +475,34 @@ mod tests {
     #[test]
     fn crash_cause_tokens_are_stable() {
         assert_eq!(CrashCause::OomKill.as_str(), "oom_kill");
+        assert_eq!(CrashCause::ResourceExhausted.as_str(), "resource_exhausted");
         assert_eq!(CrashCause::Generic.as_str(), "generic");
+    }
+
+    #[test]
+    fn a_full_disk_relabels_generic_crashes_but_not_oom_kills() {
+        // The 2026-07-18 shape: 235 crashes logged `cause="generic"` while
+        // the box was out of disk. A generic crash on a full filesystem
+        // now names the disk.
+        assert_eq!(
+            CrashCause::Generic.with_host_disk(true),
+            CrashCause::ResourceExhausted
+        );
+        // Healthy disk: untouched. Exhaustion is never guessed.
+        assert_eq!(
+            CrashCause::Generic.with_host_disk(false),
+            CrashCause::Generic
+        );
+        // An OOM kill keeps its own (more specific, more actionable)
+        // classification even when the disk is also full.
+        assert_eq!(
+            CrashCause::OomKill.with_host_disk(true),
+            CrashCause::OomKill
+        );
+        // Idempotent — a second pass cannot re-label it into something else.
+        assert_eq!(
+            CrashCause::ResourceExhausted.with_host_disk(true),
+            CrashCause::ResourceExhausted
+        );
     }
 }

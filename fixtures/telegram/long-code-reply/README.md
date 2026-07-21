@@ -17,11 +17,20 @@ ladder:
 - Chunk 0 (43 chars): the natural cut falls inside the fence, but a
   pre-fence cut exists within the limit, so the intro is cut off
   BEFORE the fence and delivered alone.
-- Chunk 1 (3946 chars): the fence itself outruns the cap, so the
+- Chunk 1 (3604 chars): the fence itself outruns the cap, so the
   splitter cuts at a code-line boundary (no line torn in half) and
   closes the fence at the cut — the chunk ends with a bare ```.
-- Chunk 2 (355 chars): the fence is reopened with the same info
+- Chunk 2 (697 chars): the fence is reopened with the same info
   string (```python) and runs to the original closing fence.
+
+Note the chunk sizes are governed by `markdown::effective_max`, not by
+the raw 4096 cap: adapters render markdown to HTML *after* the split,
+and escaping expands the text, so the splitter reserves
+`RENDER_HEADROOM_PERCENT` (10%) and cuts at 3686. The boundary moved
+from row 22 to row 20 when that headroom landed — chunk 1 was
+previously 3946 chars, which is under 4096 but would have overrun the
+cap once rendered. Balanced fences, the reopen info string, and total
+line count are the invariants here; the exact cut row is not.
 
 Every delivered chunk parses with balanced fences. The fixture also
 asserts exactly one `messages_out` row (splitting is a delivery-layer

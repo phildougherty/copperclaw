@@ -37,14 +37,14 @@ flow; Thread = `supports_threads`; Sig = webhook secret verification.
 | linear | no | yes | no | text | text | no | yes (always true) | action | action | no | yes | yes (HMAC-SHA256) |
 | resend | no | yes | no | text | text | n/a | n/a | no | no | yes | yes (RFC 2822) | n/a (outbound) |
 | mattermost | no | yes | no | text | text | no | no | action | action | yes | yes | yes (shared token, ct) |
-| teams | yes (28000) | yes | no | text | text | yes | yes | action | action | yes (channel only) | yes | n/a (Graph bearer) |
+| teams | yes (28000 B) | yes | no | text | text | yes | yes | action | action | yes (channel only) | yes | n/a (Graph bearer) |
 | gchat | yes (4096) | yes | no | yes (content.card) | yes (cards v2) | no | yes | action | action | yes | yes | yes (query token, ct) |
-| webex | yes (7439) | yes | no | yes (attachments[]) | text | no | yes | action | action | yes | yes | yes (HMAC-SHA1 or 256, auto) |
+| webex | yes (7439 B) | yes | no | yes (attachments[]) | text | no | yes | action | action | yes | yes | yes (HMAC-SHA1 or 256, auto) |
 | line | yes (5000) | yes | no | text | text | no | yes | no | no | no | no | yes (HMAC-SHA256) |
 | imessage | no | yes | no | text | text | no | yes | no | no | yes | no | n/a (local) |
 | signal | no | yes | yes | text | text | yes | yes | action | action | yes | no | n/a (RPC) |
 | deltachat | no | yes | no | text | text | no | yes | no | action | yes | no | n/a (RPC) |
-| wechat | yes (600) | yes | no | yes (template_card) | text | no | no | no | no | yes | no | yes (SHA1 sorted-concat) |
+| wechat | yes (2048 B) | yes | no | yes (template_card) | text | no | no | no | no | yes | no | yes (SHA1 sorted-concat) |
 | whatsapp-cloud | yes (4096) | yes | partial (mark_read) | text | text | yes | no | no | action | yes | no | yes (HMAC-SHA256, ct) |
 | emacs | no | yes | no | text | text | no | no | no | no | no | no | n/a (local) |
 | x | no | yes | no | text | text | no | no | no | no | yes | no | n/a (poll) |

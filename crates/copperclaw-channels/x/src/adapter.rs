@@ -208,6 +208,19 @@ impl ChannelAdapter for XAdapter {
         false
     }
 
+    /// `POST /2/tweets` rejects `text` over 280 characters on a standard
+    /// (non-premium) account — the platform's oldest hard limit, and the
+    /// source of the `text is too long` rejections in the host log.
+    ///
+    /// Caveat: X counts *weighted* characters, not `char`s — CJK and emoji
+    /// count 2 each, and every URL counts a flat 23 regardless of its real
+    /// length. So 280 is an upper bound the splitter can still overshoot on
+    /// link-heavy or CJK text; the shared render-headroom margin
+    /// (`markdown::effective_max`) absorbs the common cases.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(280)
+    }
+
     async fn set_typing(
         &self,
         _platform_id: &str,
@@ -348,6 +361,18 @@ mod tests {
         assert_eq!(adapter.channel_type().as_str(), "x");
         assert!(!adapter.supports_threads());
         assert_eq!(adapter.bot_user_id(), "bot");
+        adapter.shutdown().await;
+    }
+
+    /// 280 is X's standard-account post limit. Pinned so a refactor cannot
+    /// silently drop the cap back to `None` — uncapped, an over-long reply
+    /// is rejected with `text is too long` and permanently dropped.
+    #[tokio::test]
+    async fn max_message_chars_is_the_standard_post_limit() {
+        let s = MockServer::start().await;
+        mount_empty_poll(&s).await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        assert_eq!(adapter.max_message_chars(), Some(280));
         adapter.shutdown().await;
     }
 

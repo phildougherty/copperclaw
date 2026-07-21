@@ -47,6 +47,91 @@ pub trait ChannelAdapter: Send + Sync {
         None
     }
 
+    /// Maximum size (in UTF-8 **bytes**) of a single chat message the
+    /// platform will accept, when the platform documents its limit in
+    /// bytes rather than chars.
+    ///
+    /// Webex is the motivating case: `POST /messages` caps `text` /
+    /// `markdown` / `html` at 7 439 *bytes*. A char-only cap is wrong
+    /// there — a CJK reply (3 bytes/char in UTF-8) or an emoji-heavy one
+    /// (4 bytes/char) passes a 7 439-char split and still arrives at up
+    /// to ~3-4x the byte budget, and the render headroom in
+    /// [`crate::markdown::effective_max`] does not cover a 3x overshoot.
+    ///
+    /// Declaring BOTH caps is the intended shape for such channels: the
+    /// char cap keeps ordinary ASCII replies split at the natural
+    /// boundary, and the byte cap only tightens the chunking for the
+    /// multi-byte text that actually needs it (see
+    /// [`crate::markdown::split_into_chunks_within_bytes`]). Declaring
+    /// `bytes / 4` as a char cap instead would fragment every plain
+    /// English reply fourfold for no benefit.
+    ///
+    /// Returning `None` (the default) means "no byte-denominated limit" —
+    /// only [`Self::max_message_chars`] applies.
+    fn max_message_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Deliver a plain-text chat body, splitting it against this
+    /// adapter's declared caps first.
+    ///
+    /// This is the trait's cap-aware send surface, and the reason the
+    /// rich-kind defaults below (`deliver_card`, `deliver_breadcrumb`,
+    /// `deliver_diff`, `deliver_collapsible`, `deliver_todo_list`,
+    /// `deliver_error`, `deliver_thinking`) are safe. Those defaults
+    /// render their payload with a `to_text_fallback()` whose output is
+    /// UNBOUNDED, and they call [`Self::deliver`] from *inside* the
+    /// adapter — they never return `Unsupported`, so they never reach the
+    /// host's cap-aware `call_adapter`. Without a split here, a long
+    /// thinking block, error card, or diff is handed to the platform
+    /// whole and comes back as a permanent `BadRequest` ("message is too
+    /// long") — the reply is dropped, not truncated.
+    ///
+    /// The headroom margin ([`crate::markdown::effective_max`]) is applied
+    /// for exactly the reason the host applies it: adapters render markdown
+    /// to their own flavor AFTER the split, and rendering only ever grows
+    /// the string.
+    ///
+    /// Returns the FIRST part's platform id — the anchor a later edit or
+    /// reaction should target — mirroring the host's `deliver_parts`.
+    /// Adapters that declare no cap get exactly one `deliver` call, as
+    /// before.
+    async fn deliver_text_capped(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        let chat = |body: String| OutboundMessage {
+            kind: MessageKind::Chat,
+            content: serde_json::json!({ "text": body }),
+            files: vec![],
+        };
+        let max_chars = crate::markdown::effective_max(self.max_message_chars()).filter(|m| *m > 0);
+        let max_bytes = crate::markdown::effective_max(self.max_message_bytes()).filter(|m| *m > 0);
+        let fits = max_chars.is_none_or(|m| text.chars().count() <= m)
+            && max_bytes.is_none_or(|b| text.len() <= b);
+        if fits {
+            return self
+                .deliver(platform_id, thread_id, &chat(text.to_owned()))
+                .await;
+        }
+        let chunks = crate::markdown::split_into_chunks_within_bytes(
+            text,
+            max_chars.unwrap_or(usize::MAX),
+            max_bytes,
+            self.channel_type().as_str(),
+        );
+        let mut first = None;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let id = self.deliver(platform_id, thread_id, &chat(chunk)).await?;
+            if i == 0 {
+                first = id;
+            }
+        }
+        Ok(first)
+    }
+
     /// Begin observing the given conversation for inbound events. For
     /// channels that already stream everything (e.g. long-polling bots)
     /// this is a no-op. Defaults to `Ok(())`.
@@ -130,12 +215,8 @@ pub trait ChannelAdapter: Send + Sync {
     ) -> Result<Option<String>, AdapterError> {
         let _ = to;
         let text = card.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Render and deliver a [`Breadcrumb`] chip.
@@ -177,12 +258,8 @@ pub trait ChannelAdapter: Send + Sync {
     ) -> Result<Option<String>, AdapterError> {
         let _ = existing_message_id;
         let text = breadcrumb.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Render and deliver a [`DiffCard`] — the slice-3.1 "file edit
@@ -220,12 +297,8 @@ pub trait ChannelAdapter: Send + Sync {
         diff: &DiffCard,
     ) -> Result<Option<String>, AdapterError> {
         let text = diff.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Render and deliver a "summary + collapsible expander" treatment
@@ -271,12 +344,8 @@ pub trait ChannelAdapter: Send + Sync {
         preview_lines: &[String],
     ) -> Result<Option<String>, AdapterError> {
         let body = render_collapsible_text_fallback(text, summary, preview_lines);
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": body }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &body)
+            .await
     }
 
     /// Render and deliver a portable [`TodoList`] — the slice-3.2
@@ -321,12 +390,8 @@ pub trait ChannelAdapter: Send + Sync {
     ) -> Result<Option<String>, AdapterError> {
         let _ = (existing_message_id, pin_hint);
         let text = list.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Render and deliver a portable [`ErrorCard`] — the slice-3.3
@@ -361,12 +426,8 @@ pub trait ChannelAdapter: Send + Sync {
         err: &ErrorCard,
     ) -> Result<Option<String>, AdapterError> {
         let text = err.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Render and deliver a portable [`ThinkingBlock`] — the slice-3.5
@@ -405,12 +466,8 @@ pub trait ChannelAdapter: Send + Sync {
         thinking: &ThinkingBlock,
     ) -> Result<Option<String>, AdapterError> {
         let text = thinking.to_text_fallback();
-        let outbound = OutboundMessage {
-            kind: MessageKind::Chat,
-            content: serde_json::json!({ "text": text }),
-            files: vec![],
-        };
-        self.deliver(platform_id, thread_id, &outbound).await
+        self.deliver_text_capped(platform_id, thread_id, &text)
+            .await
     }
 
     /// Open a direct-message thread with the given user. Defaults to
@@ -1050,6 +1107,227 @@ mod tests {
             .unwrap();
         assert!(text.starts_with("[reasoning]"));
         assert!(text.contains("> Let me think about this question."));
+    }
+
+    /// Adapter that declares caps but implements NONE of the rich-kind
+    /// delivery methods — so every `deliver_*` call below exercises the
+    /// trait's DEFAULT impl. `deliver` records through the shared
+    /// `MockAdapter` so the tests can inspect what reached the wire.
+    struct CappedMock {
+        inner: MockAdapter,
+        chars: Option<usize>,
+        bytes: Option<usize>,
+    }
+
+    impl CappedMock {
+        fn new(chars: Option<usize>, bytes: Option<usize>) -> Self {
+            Self {
+                inner: MockAdapter::new("capped"),
+                chars,
+                bytes,
+            }
+        }
+
+        /// Text bodies of every `deliver` call the defaults produced.
+        fn texts(&self) -> Vec<String> {
+            self.inner
+                .deliveries()
+                .iter()
+                .map(|d| {
+                    d.message
+                        .content
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for CappedMock {
+        fn channel_type(&self) -> &ChannelType {
+            self.inner.channel_type()
+        }
+        fn max_message_chars(&self) -> Option<usize> {
+            self.chars
+        }
+        fn max_message_bytes(&self) -> Option<usize> {
+            self.bytes
+        }
+        async fn deliver(
+            &self,
+            platform_id: &str,
+            thread_id: Option<&str>,
+            message: &OutboundMessage,
+        ) -> Result<Option<String>, AdapterError> {
+            self.inner.deliver(platform_id, thread_id, message).await
+        }
+    }
+
+    /// Every chunk fits the headroom-adjusted cap, and reassembling them
+    /// recovers the whole body (nothing was dropped or truncated).
+    fn assert_within_cap(texts: &[String], declared: usize) {
+        let eff = crate::markdown::effective_max(Some(declared)).expect("Some in, Some out");
+        assert!(texts.len() > 1, "body was not split at all: {texts:?}");
+        for (i, t) in texts.iter().enumerate() {
+            assert!(
+                t.chars().count() <= eff,
+                "part {i} is {} chars, over the effective cap {eff}",
+                t.chars().count()
+            );
+        }
+    }
+
+    /// REGRESSION (fix 1): the default `deliver_thinking` used to render an
+    /// UNBOUNDED `to_text_fallback()` and call `self.deliver` directly from
+    /// inside the adapter. It never returns `Unsupported`, so it never
+    /// reached the host's cap-aware `call_adapter` — an over-long reasoning
+    /// block went to the platform whole and came back a permanent
+    /// `BadRequest`. It must split against the adapter's own cap instead.
+    #[tokio::test]
+    async fn default_deliver_thinking_splits_over_length_body() {
+        let a = CappedMock::new(Some(200), None);
+        let long = "reasoning step. ".repeat(120); // ~1 900 chars
+        a.deliver_thinking("p", None, &crate::thinking::ThinkingBlock::visible(&long))
+            .await
+            .unwrap();
+        let texts = a.texts();
+        assert_within_cap(&texts, 200);
+        // The body survived the split — no silent truncation.
+        assert!(texts.concat().contains("reasoning step."));
+        assert!(texts[0].starts_with("[reasoning]"));
+    }
+
+    /// Same hole in `deliver_error` (fix 1).
+    #[tokio::test]
+    async fn default_deliver_error_splits_over_length_body() {
+        let a = CappedMock::new(Some(200), None);
+        let detail = "stack frame line here. ".repeat(100);
+        let card =
+            crate::error_card::ErrorCard::new(crate::error_card::ErrorCardKind::Internal, &detail);
+        a.deliver_error("p", None, &card).await.unwrap();
+        assert_within_cap(&a.texts(), 200);
+    }
+
+    /// Same hole in `deliver_diff` (fix 1). A diff's text fallback is a
+    /// fenced block, so this also pins the fence-balance invariant: a
+    /// split diff must never leave a code fence dangling open.
+    #[tokio::test]
+    async fn default_deliver_diff_splits_over_length_body_keeping_fences_balanced() {
+        let lines: Vec<crate::diff::DiffLine> = (0..200)
+            .map(|i| crate::diff::DiffLine {
+                kind: crate::diff::DiffLineKind::Add,
+                text: format!("let added_{i:03} = compute_something(i);"),
+            })
+            .collect();
+        let card = crate::diff::DiffCard {
+            path: "src/main.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![crate::diff::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 200,
+                lines,
+            }],
+            added: 200,
+            removed: 0,
+            truncated: false,
+        };
+        let a = CappedMock::new(Some(500), None);
+        a.deliver_diff("p", None, &card).await.unwrap();
+        let texts = a.texts();
+        assert_within_cap(&texts, 500);
+        for (i, t) in texts.iter().enumerate() {
+            assert!(
+                crate::markdown::is_balanced(t),
+                "diff part {i} has an unbalanced fence:\n{t}"
+            );
+        }
+    }
+
+    /// The remaining four defaults share the same shape and the same fix.
+    #[tokio::test]
+    async fn other_default_deliverers_split_over_length_bodies() {
+        let body = "alpha beta gamma delta. ".repeat(100);
+
+        let a = CappedMock::new(Some(200), None);
+        let card = crate::card::Card {
+            title: Some("T".into()),
+            body: Some(body.clone()),
+            ..crate::card::Card::default()
+        };
+        a.deliver_card("p", None, &card, None).await.unwrap();
+        assert_within_cap(&a.texts(), 200);
+
+        let a = CappedMock::new(Some(200), None);
+        let bc = crate::breadcrumb::Breadcrumb::running("shell").with_detail(&body);
+        a.deliver_breadcrumb("p", None, &bc, None).await.unwrap();
+        assert_within_cap(&a.texts(), 200);
+
+        let a = CappedMock::new(Some(200), None);
+        let list = crate::todo_list::TodoList {
+            items: (0..60)
+                .map(|i| crate::todo_list::TodoListItem {
+                    id: i,
+                    text: format!("task number {i} with a reasonably long description"),
+                    status: crate::todo_list::TodoItemStatus::Pending,
+                    blocked_reason: None,
+                })
+                .collect(),
+            title: Some("Big list".into()),
+        };
+        a.deliver_todo_list("p", None, &list, None, false)
+            .await
+            .unwrap();
+        assert_within_cap(&a.texts(), 200);
+
+        let a = CappedMock::new(Some(200), None);
+        let preview: Vec<String> = (0..6).map(|i| format!("preview line {i} {body}")).collect();
+        a.deliver_collapsible("p", None, &body, "summary", &preview)
+            .await
+            .unwrap();
+        assert_within_cap(&a.texts(), 200);
+    }
+
+    /// An in-cap body still goes out as exactly ONE `deliver` call — the
+    /// split path must not fragment ordinary short messages.
+    #[tokio::test]
+    async fn default_deliverers_do_not_split_in_cap_bodies() {
+        let a = CappedMock::new(Some(4096), None);
+        a.deliver_thinking(
+            "p",
+            None,
+            &crate::thinking::ThinkingBlock::visible("a short thought"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.texts().len(), 1);
+    }
+
+    /// REGRESSION (fix 2): a byte-denominated cap must be honoured by the
+    /// trait's default delivery path too. A CJK body is 3 bytes/char, so a
+    /// char-only split would pass while every part blew the byte budget.
+    #[tokio::test]
+    async fn default_deliverers_honour_byte_cap_on_multibyte_bodies() {
+        // Webex-shaped: same number for both, byte cap is the real one.
+        let a = CappedMock::new(Some(600), Some(600));
+        let cjk = "这是一个很长的回复内容。".repeat(60); // 720 chars, 2160 bytes
+        a.deliver_thinking("p", None, &crate::thinking::ThinkingBlock::visible(&cjk))
+            .await
+            .unwrap();
+        let texts = a.texts();
+        let eff = crate::markdown::effective_max(Some(600)).expect("Some in, Some out");
+        assert!(texts.len() > 1, "multibyte body was not split");
+        for (i, t) in texts.iter().enumerate() {
+            assert!(
+                t.len() <= eff,
+                "part {i} is {} BYTES, over the effective byte cap {eff}",
+                t.len()
+            );
+        }
     }
 
     #[tokio::test]

@@ -1818,6 +1818,13 @@ pub const DELIVERY_DEAD_LETTER_TOTAL: &str = "copperclaw_delivery_dead_letter_to
 pub const DEAD_LETTER_REASON_RETRY_EXHAUSTED: &str = "retry_exhausted";
 /// The row's channel had no live adapter past the age ceiling (S5).
 pub const DEAD_LETTER_REASON_NO_ADAPTER: &str = "no_adapter";
+/// No dispatch target was resolvable for the row — neither the row itself nor
+/// the session's `session_routing` carried a channel + platform id. The common
+/// producer is a session deliberately spawned WITHOUT routing (the `delegate`
+/// profile's contained children). Host-local control rows no longer land here
+/// (they are processed route-free); anything that does reach this reason is a
+/// genuinely user-facing row with nowhere to go, dead-lettered for inspection.
+pub const DEAD_LETTER_REASON_NO_ROUTE: &str = "no_route";
 
 /// Increment `copperclaw_delivery_retry_resumed_total` — the delivery loop
 /// rehydrated a still-pending outbound row's persisted retry counter

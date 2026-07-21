@@ -120,7 +120,27 @@ impl ContainerManager {
     /// tests can assert a reset session classifies as `Spawn`.
     pub(crate) fn classify(&self, session: &Session) -> ReconcileAction {
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
-        let pending = Self::has_pending_inbound(&paths).unwrap_or(false);
+        // "No pending work" and "I could not read the inbound DB" are very
+        // different facts that used to collapse into the same `false` via
+        // `.unwrap_or(false)`. On a full disk `open_inbound` fails, every
+        // Stopped session reads as idle, and the reconcile loop quietly
+        // stops spawning anything — a total stall with NOT ONE log line to
+        // find it by. The action is still Noop (there is nothing useful to
+        // do with an unreadable DB, and spawning blind would be worse), but
+        // it is now a stall you can see.
+        let pending = match Self::has_pending_inbound(&paths) {
+            Ok(pending) => pending,
+            Err(err) => {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    ?err,
+                    status = ?session.container_status,
+                    "cannot read the session's inbound DB; treating as no pending work this tick \
+                     (a full disk or an I/O error will stall this session until it clears)"
+                );
+                false
+            }
+        };
         match session.container_status {
             ContainerStatus::Stopped => {
                 if pending {
@@ -201,8 +221,21 @@ impl ContainerManager {
                 // Err(HostDegraded) into Ok here. The startup
                 // banner and the metric are the source of truth
                 // for "host is degraded".
+                //
+                // `HostResourceExhausted` rides the same collapse for the
+                // same reason, with one difference worth naming: it is
+                // self-clearing. The box being out of disk is an expected,
+                // transient, ALREADY-LOGGED condition (the tick's
+                // `refresh_host_resources` edge-logs it once), and the
+                // session stays Stopped with its inbound pending until the
+                // environment recovers. Returning Err here would print one
+                // "session reconcile failed" line per session per tick —
+                // which is the 2026-07-18 log storm, just relabelled.
                 match self.maybe_spawn(session).await {
-                    Ok(_) | Err(ManagerError::HostDegraded) => Ok(()),
+                    Ok(_)
+                    | Err(ManagerError::HostDegraded | ManagerError::HostResourceExhausted) => {
+                        Ok(())
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -329,6 +362,16 @@ impl ContainerManager {
             }
             RestartReason::StuckTool => CrashCause::Generic,
         };
+        // Upgrade a generic crash to `ResourceExhausted` when the host's
+        // disk probe says the box is full. An OOM kill keeps its own
+        // classification (the memory ceiling is the more specific and more
+        // actionable fact); everything else that dies on a full disk is
+        // almost certainly dying *of* the full disk, and saying so here is
+        // the difference between an operator following the thread and an
+        // operator reading 235 identical `cause="generic"` lines.
+        let disk = self.current_disk();
+        let cause =
+            cause.with_host_disk(disk.is_some_and(super::host_resources::DiskSpace::is_exhausted));
 
         // 1b. Tear down the session's previews before the container is
         //     removed — the crashed container's bridge IP is dead and may be
@@ -422,14 +465,25 @@ impl ContainerManager {
             copperclaw_metrics::inc_container_oom_kill();
         }
         copperclaw_metrics::observe_crash_backoff_level(record.streak);
+        // Free disk rides along on EVERY crash line, not just the ones we
+        // classified as resource-exhausted: the whole failure of the
+        // 2026-07-18 logs was that the crash record and the disk state
+        // lived in different lines and nothing joined them.
         warn!(
             session = %session.id.as_uuid(),
             cause = cause.as_str(),
             crash_streak = record.streak,
             oom_count = record.oom_count,
             respawn_backoff_secs = record.delay.as_secs(),
+            free_disk_bytes = disk.map(|d| d.free_bytes),
             "crash-restart recorded; respawn deferred by backoff"
         );
+        // Feed the global circuit breaker. Per-session backoff (just
+        // recorded above) answers "this session keeps crashing"; this
+        // answers "several DIFFERENT sessions just crashed, so what they
+        // share is broken." Only the trip edge has side effects, so a
+        // fleet-wide fault costs exactly one operator alert.
+        self.note_crash_for_env_breaker(session);
         if record.emit_oom_card {
             if let Err(err) = emit_oom_error_card(&paths) {
                 // Non-fatal, same posture as the apology emit above: the
@@ -2026,5 +2080,299 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tries, APOLOGY_TRIES_MARKER);
+    }
+}
+
+/// Host-resource preflight + global circuit breaker (the 2026-07-18
+/// full-disk incident).
+///
+/// Everything here exercises a gap the pre-existing state-machine tests
+/// left wide open: none of them ever ran `classify` / `maybe_spawn`
+/// against a host that could not actually support a container, so the
+/// storm those conditions produce was invisible to the suite.
+#[cfg(test)]
+mod host_resource_tests {
+    use super::super::config::{ManagerConfig, SkillsMode};
+    use super::super::host_resources::{
+        ENV_FAULT_SESSION_THRESHOLD, ENV_FAULT_WINDOW, clear_disk_override, set_disk_override,
+    };
+    use super::super::spawn::{
+        DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS,
+    };
+    use super::*;
+    use copperclaw_cclaw::disk::GIB;
+    use copperclaw_db::central::CentralDb;
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
+    use std::path::PathBuf;
+
+    /// A filesystem with 64 KiB left on a 100 GiB volume — the shape the
+    /// host was in when `tasks_snapshot: write failed err=Os { code: 28,
+    /// StorageFull }` started appearing.
+    const FULL_DISK: (u64, u64) = (64 * 1024, 100 * GIB);
+    /// A comfortably healthy filesystem.
+    const HEALTHY_DISK: (u64, u64) = (500 * GIB, 1024 * GIB);
+
+    fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
+        ManagerConfig {
+            install_slug: "test".into(),
+            data_dir,
+            default_image_tag: "copperclaw/session:test".into(),
+            default_provider: "anthropic".into(),
+            default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
+            anthropic_api_key: Some("sk-test".into()),
+            anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            skills_dir: None,
+            groups_dir: None,
+            skills_mode: SkillsMode::Inline,
+            gpu_passthrough: false,
+            forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+        }
+    }
+
+    fn make_mgr(tmp: &tempfile::TempDir) -> (ContainerManager, CentralDb) {
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        (mgr, db)
+    }
+
+    fn fixture_session(db: &CentralDb) -> Session {
+        // Unique name/folder per call: these tests deliberately create
+        // SEVERAL sessions against one DB (distinct sessions being the
+        // entire point of the breaker), and agent-group folders are unique.
+        let slug = format!("demo-{}", uuid::Uuid::new_v4());
+        let ag = create_ag(
+            db,
+            CreateAgentGroup {
+                name: slug.clone(),
+                folder: slug,
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        create_session(
+            db,
+            CreateSession {
+                agent_group_id: ag.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A session with one pending chat inbound waiting — i.e. one that
+    /// `classify` will want to `Spawn`.
+    fn session_with_pending_inbound(tmp: &tempfile::TempDir, db: &CentralDb) -> Session {
+        let session = fixture_session(db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn spawn_preflight_refuses_a_container_when_the_disk_is_full() {
+        // The core regression. Before the preflight, this session spawned
+        // a container into a filesystem with no room, the container died
+        // mid-boot, and the reconcile loop read the dead container as a
+        // per-session crash — the first step of the storm.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = session_with_pending_inbound(&tmp, &db);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+
+        assert!(
+            mgr.spawn_blocked_by_host_resources().is_some(),
+            "a full disk must block the spawn preflight"
+        );
+        let err = mgr
+            .maybe_spawn(&session)
+            .await
+            .expect_err("spawn must be refused on a full disk");
+        assert!(
+            matches!(err, ManagerError::HostResourceExhausted),
+            "expected HostResourceExhausted, got {err:?}"
+        );
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn refused_spawn_leaves_the_session_stopped_with_its_inbound_pending() {
+        // Refusing is only correct if it loses nothing: the session must
+        // stay Stopped (so a later tick retries) and the inbound must stay
+        // pending (so the user's message is not dropped on the floor).
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = session_with_pending_inbound(&tmp, &db);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+
+        assert_eq!(mgr.classify(&session), ReconcileAction::Spawn);
+        // `apply` collapses the refusal to Ok — one edge-logged warning
+        // per episode, NOT one "session reconcile failed" line per session
+        // per tick, which would just be the old log storm relabelled.
+        mgr.apply(&session, ReconcileAction::Spawn)
+            .await
+            .expect("resource exhaustion collapses to Ok, like HostDegraded");
+
+        let row = copperclaw_db::tables::sessions::get(&db, session.id).unwrap();
+        assert_eq!(row.container_status, ContainerStatus::Stopped);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        assert!(
+            ContainerManager::has_pending_inbound(&paths).unwrap(),
+            "the inbound must still be pending after a refused spawn"
+        );
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn a_healthy_disk_does_not_block_anything() {
+        // Guard against the preflight over-firing: WARN-level free space
+        // (low but not critical) must NOT stop work.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        // 50% free but under the 20 GiB absolute floor → WARN, not FAIL.
+        set_disk_override(15 * GIB, 30 * GIB);
+        mgr.refresh_host_resources();
+        assert!(
+            mgr.spawn_blocked_by_host_resources().is_none(),
+            "a WARN-level disk must not freeze the fleet"
+        );
+        assert!(!mgr.is_env_exhausted());
+        clear_disk_override();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn env_breaker_pauses_spawns_globally_then_re_arms_when_the_disk_recovers() {
+        // The piece that actually caps the storm. N distinct sessions
+        // crashing against one shared fault must produce ONE global pause,
+        // not N independent per-session backoff curves all retrying
+        // forever against the same full disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        mgr.refresh_host_resources();
+
+        let sessions: Vec<Session> = (0..ENV_FAULT_SESSION_THRESHOLD)
+            .map(|_| fixture_session(&db))
+            .collect();
+        for (i, session) in sessions.iter().enumerate() {
+            mgr.note_crash_for_env_breaker(session);
+            let last = i + 1 == ENV_FAULT_SESSION_THRESHOLD;
+            assert_eq!(
+                mgr.is_env_exhausted(),
+                last,
+                "the breaker trips on the crossing, not before (crash {})",
+                i + 1
+            );
+        }
+        // Spawns are now blocked for EVERY session, including ones that
+        // never crashed — the fault is the box, not the session.
+        let bystander = session_with_pending_inbound(&tmp, &db);
+        assert!(mgr.spawn_blocked_by_host_resources().is_some());
+        let err = mgr.maybe_spawn(&bystander).await.expect_err("blocked");
+        assert!(matches!(err, ManagerError::HostResourceExhausted));
+
+        // Mid-window: still paused, even with a perfectly healthy disk.
+        tokio::time::advance(ENV_FAULT_WINDOW / 2).await;
+        mgr.refresh_host_resources();
+        assert!(mgr.is_env_exhausted(), "the hold must survive one tick");
+
+        // Past the hold with a healthy disk: work resumes on its own.
+        tokio::time::advance(ENV_FAULT_WINDOW).await;
+        mgr.refresh_host_resources();
+        assert!(!mgr.is_env_exhausted(), "self-clears once the box is well");
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn operator_can_clear_the_environment_fault_by_hand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        for _ in 0..ENV_FAULT_SESSION_THRESHOLD {
+            let session = fixture_session(&db);
+            mgr.note_crash_for_env_breaker(&session);
+        }
+        assert!(mgr.is_env_exhausted());
+        mgr.clear_env_exhausted();
+        assert!(!mgr.is_env_exhausted());
+        assert!(mgr.spawn_blocked_by_host_resources().is_none());
+        clear_disk_override();
+    }
+
+    #[tokio::test]
+    async fn a_full_disk_alone_flips_and_clears_the_environment_state() {
+        // No crashes needed: the probe alone is enough to stop burning
+        // doomed spawns, and enough to resume once space comes back.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _db) = make_mgr(&tmp);
+        set_disk_override(FULL_DISK.0, FULL_DISK.1);
+        mgr.refresh_host_resources();
+        assert!(mgr.is_env_exhausted());
+
+        set_disk_override(HEALTHY_DISK.0, HEALTHY_DISK.1);
+        mgr.refresh_host_resources();
+        assert!(!mgr.is_env_exhausted());
+        clear_disk_override();
+    }
+
+    #[test]
+    fn classify_noops_and_warns_when_the_inbound_db_cannot_be_read() {
+        // Silent-stall regression. `has_pending_inbound` used to be
+        // `.unwrap_or(false)`, so an unreadable inbound DB looked exactly
+        // like "no work to do": every Stopped session went Noop forever
+        // and NOT ONE log line said why. The action is still Noop (there
+        // is nothing useful to do with a DB you cannot read), but it is
+        // now an observable stall rather than an invisible one.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Make `open_inbound` fail the way a broken filesystem does: put a
+        // directory where the DB file belongs.
+        std::fs::create_dir_all(&paths.inbound_db).unwrap();
+
+        assert!(
+            ContainerManager::has_pending_inbound(&paths).is_err(),
+            "the fixture must actually break the inbound open"
+        );
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
     }
 }

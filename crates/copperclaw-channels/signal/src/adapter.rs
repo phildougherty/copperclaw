@@ -274,6 +274,15 @@ impl ChannelAdapter for SignalAdapter {
         false
     }
 
+    /// Signal has no published protocol-level body cap, but every official
+    /// client enforces 2000 characters on the composer (Signal-Desktop
+    /// #724, Signal-Android #5146, which carries a legacy 2048 constant).
+    /// Bodies past it are silently truncated rather than rejected — a
+    /// worse failure than a split, since the tail just vanishes.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(2000)
+    }
+
     async fn subscribe(
         &self,
         _platform_id: &str,
@@ -552,6 +561,16 @@ mod tests {
         let (adapter, _ctl, _dir, _rx) = build_adapter().await;
         assert_eq!(adapter.channel_type().as_str(), "signal");
         assert!(!adapter.supports_threads());
+        adapter.shutdown().await;
+    }
+
+    /// 2000 is the composer limit every official Signal client enforces.
+    /// Uncapped, a longer body is silently truncated on the recipient's
+    /// device, so the tail vanishes with no error anywhere.
+    #[tokio::test]
+    async fn max_message_chars_is_the_client_composer_limit() {
+        let (adapter, _ctl, _dir, _rx) = build_adapter().await;
+        assert_eq!(adapter.max_message_chars(), Some(2000));
         adapter.shutdown().await;
     }
 

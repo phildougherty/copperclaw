@@ -109,6 +109,16 @@ impl ChannelAdapter for MattermostAdapter {
         true
     }
 
+    /// Mattermost's server-side post limit is `MaxPostSize`, which defaults
+    /// to `PostMessageMaxRunesV1 = 4000` (`server/public/model/post.go`).
+    /// Installs that ran the v2 migration allow `PostMessageMaxRunesV2 =
+    /// 16383`, but that is opt-in and admin-configurable, so we target the
+    /// default every server accepts. The server counts *runes*, which is
+    /// what this trait counts, so no byte/char mismatch here.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(4000)
+    }
+
     /// Publish the bot's typing indicator via `POST
     /// /api/v4/users/me/typing`. The server fans the `user_typing` event
     /// out to connected clients, giving users an "agent is working"
@@ -574,6 +584,16 @@ mod tests {
         let mock = MockServer::start().await;
         let a = make(&mock, None);
         assert!(a.supports_threads());
+    }
+
+    /// 4000 is `PostMessageMaxRunesV1`, the default `MaxPostSize` on every
+    /// Mattermost server. The v2 limit (16383) requires an opt-in
+    /// migration, so we target the value that always works.
+    #[tokio::test]
+    async fn max_message_chars_is_the_default_max_post_size() {
+        let mock = MockServer::start().await;
+        let a = make(&mock, None);
+        assert_eq!(a.max_message_chars(), Some(4000));
     }
 
     #[tokio::test]

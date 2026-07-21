@@ -21,6 +21,13 @@ use serde_json::Value;
 use std::sync::Mutex;
 use tokio::task::JoinHandle;
 
+/// The documented MS Graph `chatMessage` body budget: 28 KB, expressed
+/// here as 28 000 UTF-8 **bytes** (conservative — the real 28 KB also has
+/// to cover @-mentions and reactions). Declared through both
+/// `max_message_chars` (a valid ceiling) and `max_message_bytes` (the real
+/// constraint) on the `ChannelAdapter` impl below.
+pub const TEAMS_MAX_MESSAGE_BYTES: usize = 28_000;
+
 /// The two shapes a Teams `platform_id` can take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TeamsTarget {
@@ -320,10 +327,23 @@ impl ChannelAdapter for TeamsAdapter {
     }
 
     /// MS Graph `chatMessage` body content is documented as supporting up
-    /// to 28 KB. We treat that as a char cap (the host's splitter is char-
-    /// based; 28 KB is a safe under-approximation in any UTF-8 input).
+    /// to 28 KB — a **byte** budget (see [`Self::max_message_bytes`]).
+    /// 28 000 remains a valid CHAR ceiling (one char is at least one UTF-8
+    /// byte) and is what keeps ordinary ASCII replies splitting at the
+    /// natural boundary.
     fn max_message_chars(&self) -> Option<usize> {
-        Some(28_000)
+        Some(TEAMS_MAX_MESSAGE_BYTES)
+    }
+
+    /// The 28 KB Graph limit expressed as what it actually is: bytes.
+    ///
+    /// Without this a CJK reply (3 bytes/char in UTF-8) passes a 28 000-
+    /// char split and arrives at ~84 KB — three times the budget — and is
+    /// rejected outright. The prior comment here claimed 28 000 chars was
+    /// "a safe under-approximation in any UTF-8 input"; that is only true
+    /// for single-byte input.
+    fn max_message_bytes(&self) -> Option<usize> {
+        Some(TEAMS_MAX_MESSAGE_BYTES)
     }
 
     async fn deliver(
@@ -2134,5 +2154,16 @@ mod tests {
         let card_json = last_adaptive_card(&server).await;
         // Card serialised without any actions (skipped via the filter).
         assert!(card_json.get("actions").is_none());
+    }
+
+    /// REGRESSION (fix 2, sibling of the Webex case): the MS Graph 28 KB
+    /// `chatMessage` budget is denominated in BYTES. Declaring only a
+    /// 28 000-char cap let a CJK reply through at ~84 KB.
+    #[tokio::test]
+    async fn max_message_caps_are_byte_denominated() {
+        let server = MockServer::start().await;
+        let a = adapter_for(&server);
+        assert_eq!(a.max_message_bytes(), Some(TEAMS_MAX_MESSAGE_BYTES));
+        assert_eq!(a.max_message_chars(), Some(TEAMS_MAX_MESSAGE_BYTES));
     }
 }

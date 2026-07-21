@@ -211,6 +211,15 @@ impl ChannelAdapter for ResendAdapter {
         false
     }
 
+    /// Intentionally uncapped — the "email" case in the trait docs. Resend
+    /// sends mail; the only ceiling is the provider's total message size
+    /// (megabytes), and chopping one email into a numbered sequence of
+    /// short emails would be a strictly worse user experience than a long
+    /// one.
+    fn max_message_chars(&self) -> Option<usize> {
+        None
+    }
+
     async fn deliver(
         &self,
         platform_id: &str,
@@ -276,6 +285,15 @@ mod tests {
         let a = adapter_for(&server);
         assert_eq!(a.channel_type().as_str(), "resend");
         assert!(!a.supports_threads());
+    }
+
+    /// Deliberately uncapped: splitting one email into a numbered burst of
+    /// short emails is worse than sending one long one.
+    #[tokio::test]
+    async fn max_message_chars_is_uncapped_because_resend_sends_email() {
+        let server = MockServer::start().await;
+        let a = adapter_for(&server);
+        assert_eq!(a.max_message_chars(), None);
     }
 
     #[tokio::test]
