@@ -178,6 +178,66 @@ adheres to [Semantic Versioning](https://semver.org/).
   SQLite-only with WAL-on-bind-mount and an API that 500'd the caller. Cross-
   linked from `web-app-scaffold`.
 
+### Changed
+
+- **`PLAN.md` moved to `docs/PLAN.md`.** The design + milestone history
+  document now lives with the rest of the operator docs; references in code
+  comments and older changelog entries still cite it by its bare name.
+- **Supervisor and sweep loops now survive mutex poisoning.** The eight
+  `.lock().expect(...)` sites in `crates/copperclaw-host/src/supervisor.rs` and
+  `crates/copperclaw-host-sweep/src/service.rs` switched to
+  `.lock().unwrap_or_else(PoisonError::into_inner)`, matching the survive-poison
+  policy `container_manager/crash_loop.rs` already used. The supervisor's six
+  sites route through a single private `tasks_guard()` accessor so the policy
+  lives in one place. Before, a panic while
+  holding either lock (near-unreachable, but the supervisor is the worst
+  possible loop to lose) would cascade into a panic on the next tick of the
+  long-running loop; now the loop recovers the guard and keeps going. Found by
+  a workspace-wide panic-policy audit that otherwise came back clean.
+- **One `escape_html`, not four.** The five-entity HTML escaper was
+  copy-pasted byte-identically in the telegram, matrix, and gchat adapters
+  while an identical private copy sat in
+  `crates/copperclaw-channels/core/src/markdown/render.rs`. The core one is now
+  `pub` (exported via `markdown::escape_html`) and the three adapter copies are
+  deleted, so future escaping fixes land in one place. Known remaining
+  duplication (deliberately left): the `Retry-After` header parser exists in
+  six adapters byte-identically, but hoisting it into channels-core would add a
+  `reqwest` dependency to a crate every adapter builds on.
+- **~35 redundant `.clone()` / needless `.collect()` calls removed**
+  workspace-wide (16 files, lib and test code), found by a one-off
+  `clippy::redundant_clone` + `clippy::needless_collect` pass; each hunk was
+  reviewed by hand since `redundant_clone` is a nursery lint.
+- **One truncate-with-ellipsis helper, not five.** `vocab::truncate_chars`
+  (new in `crates/copperclaw-channels/core/src/vocab.rs`, unit-tested) now
+  backs the near-identical private helpers in the line and telegram adapters,
+  the runner HUD's `cap_chars`, and Discord's four inline embed truncations,
+  all of which delegate to it. Unlike the old copies (which always reserved one
+  char), it counts the ellipsis's real char length toward `max`, and on a
+  degenerate budget (`max` at or below the ellipsis length) it truncates the
+  ellipsis itself, so the result never exceeds a platform field cap. The line
+  and discord adapters read the ellipsis from their vocab binding instead of
+  hardcoding it, which changes LINE truncation markers and Discord embed
+  titles from `…` (U+2026) to the ASCII binding's `"..."`.
+- **Five operator env vars documented in README's Configuration table** that
+  were previously read in code but written down nowhere:
+  `COPPERCLAW_DEFAULT_EFFORT`, `COPPERCLAW_CREDENTIAL_BROKER`,
+  `COPPERCLAW_BROKER_TOKEN_TTL_SECS`, `COPPERCLAW_EXPECTED_IMAGE_DIGEST`,
+  `COPPERCLAW_TODO_NOTIFICATIONS` (and the broker TTL's enable dependency).
+  Found by a docs-vs-code env-var drift audit.
+- **Narrowed over-exposed channels-core API.** `TodoList::to_text_fallback_with`,
+  `Breadcrumb::to_text_fallback_with`, and `REACTION_ACTOR_KEY` had zero
+  callers outside the crate and are now `pub(crate)`.
+
+### Removed
+
+- **Dead code swept.** Two no-op lint-suppression stubs (`_value_alias` in
+  `crates/copperclaw-channels/wechat/src/events/router.rs`, `_path_unused` in
+  `crates/copperclaw-setup/src/steps/image.rs`) plus
+  `MockAdapter::set_reaction_unsupported` and its never-true
+  `reaction_returns_unsupported` field/branch in
+  `crates/copperclaw-channels/core/src/testing.rs` — all had zero callers
+  workspace-wide (audit included integration tests and re-export aliases).
+
 ### Fixed
 
 - **`ChannelAdapter` default rich-kind renderers no longer bypass the

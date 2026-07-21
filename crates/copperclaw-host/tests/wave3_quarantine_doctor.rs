@@ -145,7 +145,7 @@ fn o2_quarantine_artifact_is_read_by_the_o1_doctor_contract_and_excluded_from_sw
 
     let root: Arc<dyn copperclaw_host_sweep::SessionRoot> =
         Arc::new(FilesystemSessionRoot::new(data_root.to_path_buf()));
-    let sweep = SweepService::new(central.clone(), Arc::clone(&root));
+    let sweep = SweepService::new(central, Arc::clone(&root));
 
     // The per-session integrity probe is a rotating one: a session is only
     // `quick_check`ed on the pass whose slot matches its stable rotation

@@ -147,7 +147,7 @@ impl SessionRoot for FsSessionRoot {
         paths
             .ensure_dirs()
             .map_err(|e| RouterError::session_create(format!("ensure_dirs: {e}")))?;
-        Ok(paths.root.clone())
+        Ok(paths.root)
     }
 }
 

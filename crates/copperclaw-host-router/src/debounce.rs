@@ -215,7 +215,7 @@ mod tests {
             session_id: "x".into(),
         };
         {
-            let _g = s.enter(k.clone()).unwrap();
+            let _g = s.enter(k).unwrap();
             assert_eq!(s.inner.len(), 1);
         }
         assert_eq!(s.inner.len(), 0);

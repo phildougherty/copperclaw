@@ -779,7 +779,7 @@ the operator has configured.
   operator only sets them once in `.env`. Empty values are
   skipped so an unset var doesn't leak into the container env.
 - [x] **`skills/web-search/SKILL.md`** + operator-facing
-  [`docs/web-search.md`](docs/web-search.md).
+  [`docs/web-search.md`](web-search.md).
 
 **Slice totals**: 4540 → 4576 passing (+36 tests: 25 in the
 web_search module, 11 in host edge-case / delivery-apply / config
@@ -1038,7 +1038,6 @@ Background loops on host:
 copperclaw/
 ├── Cargo.toml                          # workspace + shared deps
 ├── rust-toolchain.toml                 # pin edition 2024 / rust 1.85+
-├── PLAN.md                             # this document
 ├── README.md
 ├── LICENSE
 ├── .github/workflows/                  # ci.yml (fmt+clippy+test)
@@ -1070,6 +1069,7 @@ copperclaw/
 ├── groups/                             # per-agent workspaces (created at runtime)
 ├── skills/                             # copperclaw skill content (authored under T10)
 ├── docs/                               # architecture docs
+│   └── PLAN.md                         # this document
 ├── config-examples/
 ├── launchd/                            # macOS plist template
 └── systemd/                            # Linux user unit template

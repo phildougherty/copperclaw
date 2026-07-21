@@ -143,7 +143,7 @@ pub fn envelope_to_inbound(envelope: &Value) -> Option<InboundEvent> {
     };
 
     Some(InboundEvent {
-        channel_type: channel_type.clone(),
+        channel_type,
         platform_id,
         thread_id: None,
         message: InboundMessage {

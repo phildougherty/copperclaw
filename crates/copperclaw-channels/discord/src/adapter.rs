@@ -520,7 +520,7 @@ impl ChannelAdapter for DiscordAdapter {
     ///
     /// Layout:
     /// - `title = "<path>  (+N / -M)"` (cap 256 — Discord embed
-    ///   limit; we truncate with `…` if needed).
+    ///   limit; we truncate with the vocab ellipsis if needed).
     /// - `description = " ```diff … ``` "` — capped at the embed's
     ///   4096-char description budget; over-budget hunks spill into
     ///   `fields` (Discord allows up to 25, each capped at 1024
@@ -771,10 +771,7 @@ pub(crate) fn build_diff_payload(diff: &DiffCard) -> Value {
     const FENCE_OVERHEAD: usize = "```diff\n```".len() + 1;
 
     let totals = format!("(+{} / -{})", diff.added, diff.removed);
-    let mut title = format!("{}  {totals}", diff.path);
-    if title.chars().count() > TITLE_CAP {
-        title = title.chars().take(TITLE_CAP - 1).collect::<String>() + "\u{2026}";
-    }
+    let title = truncate_chars(&format!("{}  {totals}", diff.path), TITLE_CAP);
     let color = match diff.added.cmp(&diff.removed) {
         std::cmp::Ordering::Greater => 0x0057_F287_u32,
         std::cmp::Ordering::Less => 0x00ED_4245_u32,
@@ -899,6 +896,12 @@ fn escape_backticks(s: &str) -> String {
 /// so all breadcrumb surfaces render identical markers.
 fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
     vocab::for_channel(CHANNEL_TYPE_STR).rail.for_status(status)
+}
+
+/// Truncate to at most `max` chars (ellipsis included), using this
+/// channel's vocab ellipsis (`"..."` under the ASCII binding).
+fn truncate_chars(s: &str, max: usize) -> String {
+    vocab::truncate_chars(s, max, vocab::for_channel(CHANNEL_TYPE_STR).layout.ellipsis)
 }
 
 /// Cap on steps rendered inside the spoiler — keeps the whole `content`
@@ -1209,7 +1212,7 @@ pub(crate) fn build_collapsible_payload(
         let extra = safe_body.len().saturating_sub(cut.len());
         (cut, extra)
     } else {
-        (safe_body.clone(), 0)
+        (safe_body, 0)
     };
     let body_block = format!("```\n{body_fragment}\n```");
     let mut description = String::with_capacity(preview_block.len() + body_block.len() + 64);
@@ -1219,9 +1222,7 @@ pub(crate) fn build_collapsible_payload(
     if truncated_bytes > 0 {
         description.push_str(&format!("\n…(truncated; {truncated_bytes} more bytes)"));
     }
-    if description.chars().count() > 4096 {
-        description = description.chars().take(4093).collect::<String>() + "...";
-    }
+    let description = truncate_chars(&description, 4096);
     json!({
         "embeds": [{
             "author": {"name": "long output"},
@@ -1263,9 +1264,7 @@ pub fn build_error_payload(err: &ErrorCard) -> Value {
     }
     // Final safety cap — should already be within the budget, but
     // guard against summary alone exceeding 4096.
-    if description.chars().count() > 4096 {
-        description = description.chars().take(4093).collect::<String>() + "...";
-    }
+    let description = truncate_chars(&description, 4096);
 
     let mut embed = json!({
         "title": err.title.trim(),
@@ -1416,9 +1415,7 @@ pub(crate) fn build_todo_list_payload(list: &TodoList) -> Value {
     if dropped > 0 {
         description.push_str(&format!("…(+{dropped} more)\n"));
     }
-    if description.chars().count() > 4096 {
-        description = description.chars().take(4093).collect::<String>() + "...";
-    }
+    let description = truncate_chars(&description, 4096);
 
     let title = format!("{} ({done}/{total})", list.title_or_default());
     let footer_text = format!("{done} done · {in_prog} in progress · {pending} pending");

@@ -4167,12 +4167,12 @@ async fn cli_post_edit_digest_feeds_diagnostics_back() {
     );
     let path_var = match std::env::var_os("PATH") {
         Some(p) => {
-            let mut prefix = shim_bin.clone().into_os_string();
+            let mut prefix = shim_bin.into_os_string();
             prefix.push(":");
             prefix.push(&p);
             prefix
         }
-        None => shim_bin.clone().into_os_string(),
+        None => shim_bin.into_os_string(),
     };
     let exe = std::env::current_exe().expect("current_exe");
     let output = std::process::Command::new(exe)

@@ -1104,11 +1104,7 @@ fn fmt_mmss(total_secs: u64) -> String {
 /// Char-cap `s` to `max`, appending an ASCII ellipsis marker when
 /// truncated (the HUD line is plain text on every channel).
 fn cap_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_owned();
-    }
-    let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
-    format!("{truncated}...")
+    copperclaw_channels_core::vocab::truncate_chars(s, max, "...")
 }
 
 /// On-disk shape of one `agent_todos.json` entry (see

@@ -4,6 +4,7 @@ use crate::api::GchatApi;
 use crate::emoji::emoji_codepoint;
 use crate::factory::CHANNEL_TYPE_STR;
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::escape_html;
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter, DiffCard,
     DmHandle, ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
@@ -545,7 +546,7 @@ pub(crate) fn build_breadcrumb_card(b: &Breadcrumb) -> Value {
 ///
 /// Each step widget is styled individually — bold tool, monospace
 /// detail, ASCII status marker, italic result — NOT raw text. Every
-/// dynamic field is run through [`escape_html_gchat`] so source paths /
+/// dynamic field is run through [`escape_html`] so source paths /
 /// commands / tracebacks can't inject card markup. Steps are capped at
 /// [`ACTIVITY_MAX_STEPS`] (newest-biased); a `+N earlier step(s)` note
 /// rides as the first widget when the turn ran more tools than the cap.
@@ -557,7 +558,7 @@ pub(crate) fn build_activity_card(b: &Breadcrumb) -> Value {
     header.push_str(marker);
     header.push(' ');
     match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => header.push_str(&escape_html_gchat(d)),
+        Some(d) => header.push_str(&escape_html(d)),
         None => header.push_str("working"),
     }
     if let Some(s) = b
@@ -567,7 +568,7 @@ pub(crate) fn build_activity_card(b: &Breadcrumb) -> Value {
         .filter(|s| !s.is_empty())
     {
         header.push_str(" · ");
-        header.push_str(&escape_html_gchat(s));
+        header.push_str(&escape_html(s));
     }
 
     let total = b.steps.len();
@@ -615,11 +616,11 @@ fn render_activity_step_line(s: &Breadcrumb) -> String {
     let mut out = String::with_capacity(64);
     out.push_str(activity_marker(s.status));
     out.push_str(" <b>");
-    out.push_str(&escape_html_gchat(&s.tool_name));
+    out.push_str(&escape_html(&s.tool_name));
     out.push_str("</b>");
     if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         out.push_str(" <font face=\"monospace\">");
-        out.push_str(&escape_html_gchat(d));
+        out.push_str(&escape_html(d));
         out.push_str("</font>");
     }
     if let Some(sum) = s
@@ -633,7 +634,7 @@ fn render_activity_step_line(s: &Breadcrumb) -> String {
         } else {
             out.push_str(" <i>— ");
         }
-        out.push_str(&escape_html_gchat(sum));
+        out.push_str(&escape_html(sum));
         out.push_str("</i>");
     }
     out
@@ -681,7 +682,7 @@ pub(crate) fn build_error_card(err: &ErrorCard) -> Value {
     let attention = vocab::for_channel(CHANNEL_TYPE_STR).todo.blocked;
     widgets.push(json!({
         "decoratedText": {
-            "text": format!("{attention} <b>{}</b>", escape_html_gchat(label)),
+            "text": format!("{attention} <b>{}</b>", escape_html(label)),
         }
     }));
     if let Some(d) = err.details.as_deref() {
@@ -689,7 +690,7 @@ pub(crate) fn build_error_card(err: &ErrorCard) -> Value {
         if !d.is_empty() {
             // Google Chat renders `<font face="monospace">` natively
             // inside text paragraphs; the `<br>` keeps line breaks.
-            let mono = escape_html_gchat(d).replace('\n', "<br>");
+            let mono = escape_html(d).replace('\n', "<br>");
             widgets.push(json!({
                 "textParagraph": {
                     "text": format!("<font face=\"monospace\">{mono}</font>"),
@@ -743,13 +744,13 @@ pub(crate) fn build_error_card(err: &ErrorCard) -> Value {
 /// blob never reaches the wire.
 pub(crate) fn build_thinking_card(t: &ThinkingBlock) -> Value {
     let header = match t.model.as_deref().map(str::trim) {
-        Some(m) if !m.is_empty() => format!("reasoning ({})", escape_html_gchat(m)),
+        Some(m) if !m.is_empty() => format!("reasoning ({})", escape_html(m)),
         _ => "reasoning".to_string(),
     };
     let body_html = if t.redacted {
         "<i>(redacted reasoning)</i>".to_string()
     } else {
-        let escaped = escape_html_gchat(&t.text).replace('\n', "<br>");
+        let escaped = escape_html(&t.text).replace('\n', "<br>");
         format!("<i>{escaped}</i>")
     };
     json!({
@@ -795,11 +796,11 @@ pub(crate) fn build_collapsible_card(text: &str, summary: &str, preview_lines: &
     for line in preview_lines {
         widgets.push(json!({
             "textParagraph": {
-                "text": escape_html_gchat(line),
+                "text": escape_html(line),
             }
         }));
     }
-    let body_mono = escape_html_gchat(text).replace('\n', "<br>");
+    let body_mono = escape_html(text).replace('\n', "<br>");
     widgets.push(json!({
         "textParagraph": {
             "text": format!("<font face=\"monospace\">{body_mono}</font>"),
@@ -825,7 +826,7 @@ pub(crate) fn build_collapsible_card(text: &str, summary: &str, preview_lines: &
 /// - `STAR` (pending; closest to "outstanding marker" in the known-
 ///   icon set)
 ///
-/// Item text goes through [`escape_html_gchat`]; completed items
+/// Item text goes through [`escape_html`]; completed items
 /// wrap the text in `<font color="#808080">...<s>...</s></font>` so
 /// the user sees finished work in muted strikethrough.
 pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
@@ -840,7 +841,7 @@ pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
             // colourful Material pictogram — visually
             // indistinguishable from emoji to the user.
             let marker = vocab::for_channel(CHANNEL_TYPE_STR).todo.get(item.status);
-            let escaped = escape_html_gchat(item.text.trim());
+            let escaped = escape_html(item.text.trim());
             let mut body = if item.status == TodoItemStatus::Completed {
                 // <s> = strikethrough; muted grey reinforces "done".
                 format!("{marker} <font color=\"#808080\"><s>{escaped}</s></font>")
@@ -850,7 +851,7 @@ pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
             if let Some(reason) = item.blocked_reason_text() {
                 body.push_str(&format!(
                     " <font color=\"#d93025\"><i>(blocked: {})</i></font>",
-                    escape_html_gchat(reason)
+                    escape_html(reason)
                 ));
             }
             json!({
@@ -894,14 +895,14 @@ pub(crate) fn build_portable_card(card: &Card) -> Value {
         .map(str::trim)
         .filter(|b| !b.is_empty())
     {
-        let html = escape_html_gchat(body).replace('\n', "<br>");
+        let html = escape_html(body).replace('\n', "<br>");
         widgets.push(json!({ "textParagraph": { "text": html } }));
     }
     for f in &card.fields {
         widgets.push(json!({
             "decoratedText": {
-                "topLabel": escape_html_gchat(f.label.trim()),
-                "text": escape_html_gchat(&f.value),
+                "topLabel": escape_html(f.label.trim()),
+                "text": escape_html(&f.value),
             }
         }));
     }
@@ -970,24 +971,6 @@ fn button_color_gchat(style: Option<&str>) -> Option<Value> {
         Some("danger") => Some(json!({ "red": 0.85, "green": 0.19, "blue": 0.15, "alpha": 1.0 })),
         _ => None,
     }
-}
-
-/// Google Chat's text-paragraph HTML subset uses the same five XML
-/// escapes as Telegram; mirrors that pattern so user-supplied stderr /
-/// tracebacks can't break the parser.
-fn escape_html_gchat(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 impl GchatAdapter {

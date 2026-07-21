@@ -395,7 +395,7 @@ where
     }
     // Pull the message-row arrays out so the session row renders as a
     // clean KV table and each direction gets its own table below it.
-    let mut session = data.clone();
+    let mut session = data;
     let (inbound, outbound) = match session.as_object_mut() {
         Some(o) => (o.remove("recent_inbound"), o.remove("recent_outbound")),
         None => (None, None),
@@ -5004,16 +5004,12 @@ mod tests {
         assert_eq!(state.status_line.as_deref(), Some("task(building)"));
 
         // Edit frame: step2 completed, one NEW step appended, summary set.
-        let step2_done = step2.clone().finished(true, Some("wrote 12 lines".into()));
+        let step2_done = step2.finished(true, Some("wrote 12 lines".into()));
         let step3 = Breadcrumb::running("web_search").with_detail("rust select");
         let hud2 = CliFrame::Breadcrumb {
             breadcrumb: Breadcrumb {
                 summary: Some("Exploring (0:12)".into()),
-                ..Breadcrumb::running("task").with_steps(vec![
-                    step1.clone(),
-                    step2_done,
-                    step3.clone(),
-                ])
+                ..Breadcrumb::running("task").with_steps(vec![step1, step2_done, step3])
             },
         };
         let out = render_plain(&hud2, &mut state);

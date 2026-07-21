@@ -507,7 +507,12 @@ fn strike_delims(flavor: Flavor) -> (&'static str, &'static str) {
     }
 }
 
-fn escape_html(s: &str) -> String {
+/// Escape the five XML entities (`& < > " '`) — the shared minimum for
+/// every HTML-subset channel (Telegram HTML, Matrix `formatted_body`,
+/// Google Chat text paragraphs). Mirrors what every mainstream HTML
+/// escape util does so adapters don't pull in a dependency (or keep a
+/// private copy) for one function.
+pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

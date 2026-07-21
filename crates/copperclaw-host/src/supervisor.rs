@@ -159,6 +159,14 @@ impl SupervisorStatus {
         }
     }
 
+    /// Lock the task table, surviving poisoning: a panicked supervisor
+    /// loop must not cascade into every status reader and mutator.
+    fn tasks_guard(&self) -> std::sync::MutexGuard<'_, Vec<TaskState>> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// True when any supervised loop has exhausted its backoff curve and
     /// not yet healed.
     pub fn degraded(&self) -> bool {
@@ -179,7 +187,7 @@ impl SupervisorStatus {
     /// even if it never exits again.
     pub fn snapshot(&self) -> Vec<LoopStatus> {
         let now = Instant::now();
-        let mut tasks = self.tasks.lock().expect("supervisor status lock");
+        let mut tasks = self.tasks_guard();
         for t in tasks.iter_mut() {
             heal_if_window_elapsed(t, now);
             // M21 S1 (M1 rider): refresh the gauges at status-read time so a
@@ -212,7 +220,7 @@ impl SupervisorStatus {
 
     /// Register a loop; returns its index. Driver-only.
     fn add_task(&self, name: &'static str) -> usize {
-        let mut tasks = self.tasks.lock().expect("supervisor status lock");
+        let mut tasks = self.tasks_guard();
         tasks.push(TaskState {
             name,
             alive: false,
@@ -226,12 +234,12 @@ impl SupervisorStatus {
     }
 
     fn name(&self, idx: usize) -> &'static str {
-        self.tasks.lock().expect("supervisor status lock")[idx].name
+        self.tasks_guard()[idx].name
     }
 
     /// A (re)started incarnation is now running.
     fn mark_started(&self, idx: usize, now: Instant) {
-        let mut tasks = self.tasks.lock().expect("supervisor status lock");
+        let mut tasks = self.tasks_guard();
         let t = &mut tasks[idx];
         t.alive = true;
         t.started_at = now;
@@ -241,7 +249,7 @@ impl SupervisorStatus {
 
     /// The loop drained during shutdown — an expected exit.
     fn mark_stopped(&self, idx: usize) {
-        let mut tasks = self.tasks.lock().expect("supervisor status lock");
+        let mut tasks = self.tasks_guard();
         tasks[idx].alive = false;
         // M21 S1 (M1 rider): per-loop liveness gauge.
         copperclaw_metrics::set_supervised_loop_alive(tasks[idx].name, false);
@@ -258,7 +266,7 @@ impl SupervisorStatus {
         reason: String,
         now: Instant,
     ) -> (Duration, u64, bool) {
-        let mut tasks = self.tasks.lock().expect("supervisor status lock");
+        let mut tasks = self.tasks_guard();
         let t = &mut tasks[idx];
         heal_if_window_elapsed(t, now);
         t.alive = false;

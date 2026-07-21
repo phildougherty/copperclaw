@@ -61,8 +61,7 @@ async fn host_condition_checkin_fires_only_when_condition_holds_and_audits() {
         Arc::new(FsSessionRoot::new(tmp.path()));
     let store = Arc::new(ConditionStore::new());
     // Build the sweep exactly like boot.rs, then share the condition store.
-    let sweep =
-        SweepService::new(central.clone(), root.clone()).with_condition_store(store.clone());
+    let sweep = SweepService::new(central.clone(), root.clone()).with_condition_store(store);
 
     // M22 A4: register a flag-driven condition through the DURABLE registration
     // surface (the central `conditions` table). `run_once` reloads this into the

@@ -8,7 +8,7 @@ Copperclaw — a self-hosted Rust runtime for Claude-style AI agents. Four
 binaries: the host (`copperclaw`), the admin client (`cclaw`), the setup
 wizard (`copperclaw-setup`), and the in-container agent (`copperclaw-runner`).
 Per-session Linux containers brokered by 21 channel adapters. See `README.md`
-for the user-facing intro, `PLAN.md` for the design + milestone history.
+for the user-facing intro, `docs/PLAN.md` for the design + milestone history.
 
 ## Crate map (where each subsystem lives)
 

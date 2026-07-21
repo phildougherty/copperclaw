@@ -1609,7 +1609,7 @@ fn apply_send_card(
     // be rendered by any adapter, so we fall back to Chat-style
     // delivery on the inherited channel routing. This mirrors the
     // belt-and-braces logic in `apply_send_file`.
-    let mut routed = resolve_outbound_routing(to.clone(), origin);
+    let mut routed = resolve_outbound_routing(to, origin);
     if matches!(routed.kind, MessageKind::Agent) {
         routed.body_to = None;
         routed.in_reply_to = origin.in_reply_to;
@@ -1869,7 +1869,7 @@ fn apply_schedule_update(
             }
         }
     });
-    let id_for_ack = spec.id.clone();
+    let id_for_ack = spec.id;
     insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Task { id: id_for_ack })
 }

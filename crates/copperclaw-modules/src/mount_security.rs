@@ -76,7 +76,7 @@ pub fn validate_mount_target(host_path: &Path, root: &Path) -> Result<(), MountE
                     || s.chars().any(char::is_control)
                 {
                     return Err(MountError::UnsafeComponent {
-                        path: raw.clone(),
+                        path: raw,
                         component: s.into_owned(),
                     });
                 }

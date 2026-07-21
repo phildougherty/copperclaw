@@ -109,20 +109,21 @@ impl TodoGlyphs {
 /// Inline layout strings: the field separator, the truncation marker,
 /// and the progress-bar cells.
 ///
-/// `separator` and `ellipsis` absorb four hardcoded inconsistencies
-/// that exist in the tree today (call sites unchanged by this card —
-/// later cards migrate them to vocab lookups):
+/// `ellipsis` is the truncation marker, and every renderer that cuts
+/// to a char budget now routes through [`truncate_chars`]: telegram's
+/// `truncate_chars` wrapper and the LINE renderer look the marker up
+/// via [`for_channel`], discord's inline embed truncations call
+/// [`truncate_chars`] directly, and the runner HUD's `cap_chars`
+/// (`copperclaw-runner/src/run/hud.rs`) delegates with the ASCII
+/// `"..."` (the HUD line is plain text on every channel).
 ///
-/// 1. `" | "` — `copperclaw-runner/src/run/hud.rs` `running_frame`
-///    joins summary/detail fields with a pipe (`:604-622`).
-/// 2. `" · "` — `copperclaw-channels/telegram/src/adapter.rs`
-///    `render_breadcrumb_html` / `render_activity_html` join tool and
-///    detail with an interpunct (`:829`, `:875`).
-/// 3. `" — "` — `core/src/todo_list.rs:334` (`to_text_fallback`) joins
-///    a blocked item and its reason with an em dash.
-/// 4. The truncation marker is split: `hud.rs:675` `cap_chars` appends
-///    ASCII `"..."` while `telegram/src/adapter.rs:915` `truncate_chars`
-///    appends `'…'` (U+2026).
+/// `separator` joins fields on one status/summary line — telegram's
+/// `render_breadcrumb_html` / `render_activity_html` read it from
+/// their binding; the HUD's `" | "` join matches the ASCII binding's
+/// value. Deliberately NOT a separator: `core/src/todo_list.rs`
+/// (`to_text_fallback`) keeps its `" — "` blocked-reason join
+/// hardcoded — it is a reason join, not a status-line field separator
+/// (see the comment there).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// Joins fields on one status/summary line.
@@ -237,9 +238,58 @@ pub fn for_channel(channel_type: &str) -> &'static Vocabulary {
     }
 }
 
+/// Truncate `s` to at most `max` characters, appending `ellipsis` when it
+/// had to cut. The ellipsis counts toward `max` — with the ASCII binding's
+/// three-char `"..."` as much as the rail binding's one-char `"…"` — so the
+/// result never exceeds a platform's field cap. Degenerate budgets keep
+/// that guarantee: when a cut is needed but `max` is at or below the
+/// ellipsis's own char count, the result is the ellipsis itself truncated
+/// to `max` chars (so `max == 0` yields the empty string).
+#[must_use]
+pub fn truncate_chars(s: &str, max: usize, ellipsis: &str) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let ellipsis_chars = ellipsis.chars().count();
+    if max <= ellipsis_chars {
+        return ellipsis.chars().take(max).collect();
+    }
+    let mut out: String = s.chars().take(max - ellipsis_chars).collect();
+    out.push_str(ellipsis);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_chars_counts_the_ellipsis_toward_max() {
+        // No cut: returned verbatim, no ellipsis.
+        assert_eq!(truncate_chars("short", 10, "…"), "short");
+        assert_eq!(truncate_chars("exact", 5, "…"), "exact");
+        // One-char ellipsis (rail binding): result is exactly `max` chars.
+        assert_eq!(truncate_chars("abcdef", 5, "…"), "abcd…");
+        // Three-char ellipsis (ASCII binding): still never exceeds `max`.
+        assert_eq!(truncate_chars("abcdef", 5, "..."), "ab...");
+        // Multibyte input cuts on char boundaries, not bytes.
+        assert_eq!(truncate_chars("héllo wörld", 6, "…"), "héllo…");
+    }
+
+    #[test]
+    fn truncate_chars_never_exceeds_max_on_degenerate_budgets() {
+        // max below the ellipsis length: the ellipsis itself is cut to
+        // `max` chars rather than blowing the cap.
+        assert_eq!(truncate_chars("abcdef", 2, "..."), "..");
+        // max exactly the ellipsis length: the whole ellipsis, nothing
+        // of the input.
+        assert_eq!(truncate_chars("abcdef", 3, "..."), "...");
+        assert_eq!(truncate_chars("abcdef", 1, "…"), "…");
+        // max of zero yields the empty string.
+        assert_eq!(truncate_chars("abcdef", 0, "..."), "");
+        // Input already within a tiny budget is still returned verbatim.
+        assert_eq!(truncate_chars("ab", 2, "..."), "ab");
+    }
 
     #[test]
     fn for_channel_binds_cli_and_telegram_to_rail() {

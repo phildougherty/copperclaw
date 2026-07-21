@@ -567,8 +567,8 @@ pub fn interaction_create_to_inbound(
     // canonical CardButton::value). Callback metadata rides in a sub-object
     // so agents that care can branch on it without parsing the text.
     let mut callback = json!({
-        "value": custom_id.clone(),
-        "interaction_id": interaction_id.clone(),
+        "value": custom_id,
+        "interaction_id": interaction_id,
     });
     if let Some(ct) = component_type {
         callback["component_type"] = Value::from(ct);
@@ -577,7 +577,7 @@ pub fn interaction_create_to_inbound(
         callback["original_message_id"] = Value::String(mid.clone());
     }
     let content = json!({
-        "text": custom_id.clone(),
+        "text": custom_id,
         "callback": callback,
     });
 

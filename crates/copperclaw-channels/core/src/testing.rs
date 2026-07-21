@@ -61,8 +61,6 @@ pub struct MockAdapter {
     /// instead of recording the call. Used to simulate channels (CLI,
     /// webhooks, etc.) whose default impl falls through.
     edit_returns_unsupported: Mutex<bool>,
-    /// Same shape as `edit_returns_unsupported` but for `add_reaction`.
-    reaction_returns_unsupported: Mutex<bool>,
 }
 
 impl MockAdapter {
@@ -81,7 +79,6 @@ impl MockAdapter {
             edits: Mutex::new(vec![]),
             reactions: Mutex::new(vec![]),
             edit_returns_unsupported: Mutex::new(false),
-            reaction_returns_unsupported: Mutex::new(false),
         }
     }
 
@@ -99,11 +96,6 @@ impl MockAdapter {
     /// of recording the call. Used to drive the host's fallback path.
     pub fn set_edit_unsupported(&self, on: bool) {
         *self.edit_returns_unsupported.lock().expect("poisoned") = on;
-    }
-
-    /// Same as [`Self::set_edit_unsupported`] but for `add_reaction`.
-    pub fn set_reaction_unsupported(&self, on: bool) {
-        *self.reaction_returns_unsupported.lock().expect("poisoned") = on;
     }
 
     /// Toggle whether the adapter reports thread support.
@@ -207,9 +199,6 @@ impl ChannelAdapter for MockAdapter {
         external_id: &str,
         emoji: &str,
     ) -> Result<(), AdapterError> {
-        if *self.reaction_returns_unsupported.lock().expect("poisoned") {
-            return Err(AdapterError::Unsupported("add_reaction".into()));
-        }
         self.reactions
             .lock()
             .expect("poisoned")
