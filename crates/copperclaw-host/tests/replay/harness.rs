@@ -622,7 +622,7 @@ impl ReplayHarness {
                 );
                 let target = copperclaw_modules::DispatchTarget::channel(
                     mg.channel_type.clone(),
-                    mg.platform_id.clone(),
+                    mg.platform_id,
                     None,
                 );
                 let message = copperclaw_types::OutboundMessage {

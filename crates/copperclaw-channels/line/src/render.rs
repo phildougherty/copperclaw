@@ -27,7 +27,7 @@
 //! LINE has no message-edit and no pin API, so none of these surfaces edit
 //! in place — the runner posts a fresh message on each update.
 
-use copperclaw_channels_core::{Card, CardButton, DiffCard, TodoList};
+use copperclaw_channels_core::{Card, CardButton, DiffCard, TodoList, vocab};
 use serde_json::{Value, json};
 
 const MAX_ACTIONS: usize = 4;
@@ -151,17 +151,15 @@ pub fn render_todo_list(list: &TodoList) -> String {
     list.to_chip_plaintext()
 }
 
-/// Truncate `s` to at most `max` characters, appending an ellipsis when it
-/// had to cut (the ellipsis counts toward `max` so the result never
-/// exceeds LINE's field cap).
+/// Truncate `s` to at most `max` characters, appending the vocabulary
+/// ellipsis when it had to cut (the ellipsis counts toward `max` so the
+/// result never exceeds LINE's field cap).
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
-    out.push('…');
-    out
+    vocab::truncate_chars(
+        s,
+        max,
+        vocab::for_channel(crate::CHANNEL_TYPE_STR).layout.ellipsis,
+    )
 }
 
 #[cfg(test)]
@@ -275,7 +273,7 @@ mod tests {
         let msg = render_card_message(&card);
         let label = msg["template"]["actions"][0]["label"].as_str().unwrap();
         assert_eq!(label.chars().count(), MAX_LABEL_CHARS);
-        assert!(label.ends_with('…'));
+        assert!(label.ends_with("..."));
     }
 
     #[test]

@@ -515,9 +515,6 @@ fn which_runner() -> Option<PathBuf> {
     None
 }
 
-#[allow(dead_code)]
-fn _path_unused(_: &Path) {}
-
 /// Outcome of the optional pre-build pull attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullOutcome {

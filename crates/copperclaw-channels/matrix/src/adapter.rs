@@ -9,7 +9,7 @@ use crate::config::MatrixConfig;
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
-use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
+use copperclaw_channels_core::markdown::{Flavor, escape_html, render as render_markdown};
 use copperclaw_channels_core::vocab;
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
@@ -520,7 +520,7 @@ impl ChannelAdapter for MatrixAdapter {
 pub(crate) fn render_diff_html_matrix(diff: &DiffCard) -> String {
     let mut out = String::with_capacity(128 + diff.hunks.len() * 64);
     out.push_str("<b>");
-    out.push_str(&escape_html_matrix(&diff.path));
+    out.push_str(&escape_html(&diff.path));
     out.push_str("</b> <i>(+");
     out.push_str(&diff.added.to_string());
     out.push_str(" / -");
@@ -582,13 +582,13 @@ pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
     out.push_str(glyph);
     out.push(' ');
     out.push_str("<code>");
-    out.push_str(&escape_html_matrix(&b.tool_name));
+    out.push_str(&escape_html(&b.tool_name));
     out.push_str("</code>");
     if let Some(d) = b.detail.as_deref() {
         let d = d.trim();
         if !d.is_empty() {
             out.push_str(" · ");
-            out.push_str(&escape_html_matrix(d));
+            out.push_str(&escape_html(d));
         }
     }
     if let Some(s) = b.summary.as_deref() {
@@ -599,7 +599,7 @@ pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
             } else {
                 out.push_str(" — ");
             }
-            out.push_str(&escape_html_matrix(s));
+            out.push_str(&escape_html(s));
         }
     }
     out
@@ -634,7 +634,7 @@ fn render_activity_html_matrix(b: &Breadcrumb) -> String {
     out.push_str(breadcrumb_glyph_matrix(b.status));
     out.push(' ');
     match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => out.push_str(&escape_html_matrix(d)),
+        Some(d) => out.push_str(&escape_html(d)),
         None => out.push_str("working"),
     }
     if let Some(s) = b
@@ -644,7 +644,7 @@ fn render_activity_html_matrix(b: &Breadcrumb) -> String {
         .filter(|s| !s.is_empty())
     {
         out.push_str(" · ");
-        out.push_str(&escape_html_matrix(s));
+        out.push_str(&escape_html(s));
     }
     out.push_str("</summary>");
     // Body — one styled line per step, newest-biased when the turn ran
@@ -671,11 +671,11 @@ fn render_step_line_html_matrix(s: &Breadcrumb) -> String {
     let mut out = String::with_capacity(48);
     out.push_str(breadcrumb_glyph_matrix(s.status));
     out.push_str(" <b>");
-    out.push_str(&escape_html_matrix(&s.tool_name));
+    out.push_str(&escape_html(&s.tool_name));
     out.push_str("</b>");
     if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         out.push_str(" <code>");
-        out.push_str(&escape_html_matrix(d));
+        out.push_str(&escape_html(d));
         out.push_str("</code>");
     }
     if let Some(sum) = s
@@ -689,7 +689,7 @@ fn render_step_line_html_matrix(s: &Breadcrumb) -> String {
         } else {
             out.push_str(" <i>— ");
         }
-        out.push_str(&escape_html_matrix(sum));
+        out.push_str(&escape_html(sum));
         out.push_str("</i>");
     }
     out
@@ -759,14 +759,14 @@ pub(crate) fn render_error_html_matrix(err: &ErrorCard) -> String {
     out.push_str("\"><b>");
     out.push_str(label);
     out.push_str(": ");
-    out.push_str(&escape_html_matrix(err.title.trim()));
+    out.push_str(&escape_html(err.title.trim()));
     out.push_str("</b></font><br>");
-    out.push_str(&escape_html_matrix(err.summary.trim()));
+    out.push_str(&escape_html(err.summary.trim()));
     if let Some(d) = err.details.as_deref() {
         let d = d.trim();
         if !d.is_empty() {
             out.push_str("<pre><code>");
-            out.push_str(&escape_html_matrix(d));
+            out.push_str(&escape_html(d));
             out.push_str("</code></pre>");
         }
     }
@@ -803,10 +803,10 @@ pub(crate) fn render_collapsible_html_matrix(
     let mut out = String::with_capacity(text.len() + summary.len() + 64);
     out.push_str("<details>");
     out.push_str("<summary><em>");
-    out.push_str(&escape_html_matrix(summary.trim()));
+    out.push_str(&escape_html(summary.trim()));
     out.push_str("</em></summary>");
     out.push_str("<pre><code>");
-    out.push_str(&escape_html_matrix(text));
+    out.push_str(&escape_html(text));
     out.push_str("</code></pre>");
     out.push_str("</details>");
     out
@@ -835,7 +835,7 @@ pub(crate) fn render_collapsible_html_matrix(
 pub(crate) fn render_thinking_html_matrix(t: &ThinkingBlock) -> String {
     let mut out = String::with_capacity(t.text.len() + 64);
     let label_suffix = match t.model.as_deref().map(str::trim) {
-        Some(m) if !m.is_empty() => format!(" ({})", escape_html_matrix(m)),
+        Some(m) if !m.is_empty() => format!(" ({})", escape_html(m)),
         _ => String::new(),
     };
     out.push_str("<details>");
@@ -846,7 +846,7 @@ pub(crate) fn render_thinking_html_matrix(t: &ThinkingBlock) -> String {
     if t.redacted {
         out.push_str("(redacted reasoning)");
     } else {
-        out.push_str(&escape_html_matrix(&t.text));
+        out.push_str(&escape_html(&t.text));
     }
     out.push_str("</blockquote>");
     out.push_str("</details>");
@@ -863,13 +863,13 @@ pub(crate) fn render_thinking_html_matrix(t: &ThinkingBlock) -> String {
 /// `[ ]` pending) — matrix binds [`vocab::ASCII`], per the project's
 /// no-emoji rule (Element on iOS renders symbol codepoints like
 /// U+2705 / U+25B6 / U+2610 as colourful emoji). Item text goes
-/// through [`escape_html_matrix`].
+/// through [`escape_html`].
 pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
     let done = list.completed_count();
     let total = list.items.len();
     let mut out = String::with_capacity(64 + list.items.len() * 48);
     out.push_str("<h4>");
-    out.push_str(&escape_html_matrix(list.title_or_default()));
+    out.push_str(&escape_html(list.title_or_default()));
     out.push_str(&format!(" ({done}/{total})"));
     out.push_str("</h4>");
     out.push_str("<ul>");
@@ -881,14 +881,14 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
         out.push(' ');
         if item.status == TodoItemStatus::Completed {
             out.push_str("<s>");
-            out.push_str(&escape_html_matrix(item.text.trim()));
+            out.push_str(&escape_html(item.text.trim()));
             out.push_str("</s>");
         } else {
-            out.push_str(&escape_html_matrix(item.text.trim()));
+            out.push_str(&escape_html(item.text.trim()));
         }
         if let Some(reason) = item.blocked_reason_text() {
             out.push_str(" <i>(blocked: ");
-            out.push_str(&escape_html_matrix(reason));
+            out.push_str(&escape_html(reason));
             out.push_str(")</i>");
         }
         out.push_str("</li>");
@@ -912,7 +912,7 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
 /// - `image_url` → a labelled `[image]` link.
 ///
 /// Every dynamic field is HTML-escaped individually; the quote-escaping
-/// in [`escape_html_matrix`] also prevents a button `url` from breaking
+/// in [`escape_html`] also prevents a button `url` from breaking
 /// out of the `href` attribute (the [`Card`] validator already restricts
 /// URLs to http/https upstream).
 pub(crate) fn render_card_html_matrix(card: &Card) -> String {
@@ -924,7 +924,7 @@ pub(crate) fn render_card_html_matrix(card: &Card) -> String {
         .filter(|t| !t.is_empty())
     {
         out.push_str("<b>");
-        out.push_str(&escape_html_matrix(t));
+        out.push_str(&escape_html(t));
         out.push_str("</b>");
     }
     if let Some(b) = card
@@ -936,7 +936,7 @@ pub(crate) fn render_card_html_matrix(card: &Card) -> String {
         if !out.is_empty() {
             out.push_str("<br>");
         }
-        out.push_str(&escape_html_matrix(b).replace('\n', "<br>"));
+        out.push_str(&escape_html(b).replace('\n', "<br>"));
     }
     if !card.fields.is_empty() {
         if !out.is_empty() {
@@ -945,9 +945,9 @@ pub(crate) fn render_card_html_matrix(card: &Card) -> String {
         out.push_str("<ul>");
         for f in &card.fields {
             out.push_str("<li><b>");
-            out.push_str(&escape_html_matrix(f.label.trim()));
+            out.push_str(&escape_html(f.label.trim()));
             out.push_str("</b>: ");
-            out.push_str(&escape_html_matrix(&f.value));
+            out.push_str(&escape_html(&f.value));
             out.push_str("</li>");
         }
         out.push_str("</ul>");
@@ -962,21 +962,21 @@ pub(crate) fn render_card_html_matrix(card: &Card) -> String {
             match (b.value.as_deref(), b.url.as_deref()) {
                 (None, Some(u)) => {
                     out.push_str("<a href=\"");
-                    out.push_str(&escape_html_matrix(u));
+                    out.push_str(&escape_html(u));
                     out.push_str("\">");
-                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str(&escape_html(b.label.trim()));
                     out.push_str("</a>");
                 }
                 (Some(v), None) => {
-                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str(&escape_html(b.label.trim()));
                     out.push_str(" — <code>callback:");
-                    out.push_str(&escape_html_matrix(v));
+                    out.push_str(&escape_html(v));
                     out.push_str("</code>");
                 }
                 // Malformed shapes the validator rejects upstream — render
                 // just the label rather than panic.
                 (Some(_), Some(_)) | (None, None) => {
-                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str(&escape_html(b.label.trim()));
                 }
             }
             out.push_str("</li>");
@@ -993,23 +993,8 @@ pub(crate) fn render_card_html_matrix(card: &Card) -> String {
             out.push_str("<br>");
         }
         out.push_str("<a href=\"");
-        out.push_str(&escape_html_matrix(img));
+        out.push_str(&escape_html(img));
         out.push_str("\">[image]</a>");
-    }
-    out
-}
-
-fn escape_html_matrix(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
     }
     out
 }

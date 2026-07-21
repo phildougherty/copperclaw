@@ -7008,7 +7008,7 @@ mod tests {
         let central = CentralDb::open_in_memory().unwrap();
         let root: Arc<dyn SessionRoot> = Arc::new(MockRoot::new(tmp.path().to_path_buf()));
         let adapters: DashMap<ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
-        let service = DeliveryService::new(central, root, adapters, dispatcher.clone());
+        let service = DeliveryService::new(central, root, adapters, dispatcher);
         let _ = service.dispatcher();
         // Smoke test ensures the dispatcher Arc round-trips cleanly.
     }

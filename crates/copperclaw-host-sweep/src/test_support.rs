@@ -181,8 +181,8 @@ pub fn corrupt_session_db(root: &MemSessionRoot, session: &Session, db: &str) {
         .unwrap();
     let paths = root.session_paths(&session.agent_group_id, &session.id);
     let target = match db {
-        "inbound.db" => paths.inbound_db.clone(),
-        "outbound.db" => paths.outbound_db.clone(),
+        "inbound.db" => paths.inbound_db,
+        "outbound.db" => paths.outbound_db,
         other => panic!("unknown db file: {other}"),
     };
     // Drop WAL sidecars so the garbage file is authoritative.

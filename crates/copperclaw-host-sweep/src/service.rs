@@ -643,7 +643,7 @@ impl SweepService {
             let last = self
                 .central_integrity_last
                 .lock()
-                .expect("central integrity mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(prev) = *last {
                 if now.signed_duration_since(prev) < day {
                     return (false, false);
@@ -655,7 +655,7 @@ impl SweepService {
         *self
             .central_integrity_last
             .lock()
-            .expect("central integrity mutex poisoned") = Some(now);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
 
         let conn = match self.central.conn() {
             Ok(c) => c,
@@ -1499,7 +1499,7 @@ mod tests {
         // "Restart": a fresh service over the same on-disk root. Its very
         // first pass (pass 0) must already exclude the session — the
         // sidecar file, not in-memory state, is the source of truth.
-        let dyn_root2: Arc<dyn SessionRoot> = root.clone();
+        let dyn_root2: Arc<dyn SessionRoot> = root;
         let svc2 = SweepService::new(central, dyn_root2);
         let report = svc2.run_once().unwrap();
         assert!(report.integrity_excluded.contains(&session.id));
@@ -1625,7 +1625,7 @@ mod tests {
         // Clock: two hours after last_active (set at seed time) → well idle.
         let now = Utc::now() + ChDuration::hours(2);
         let clock = Arc::new(MockClock::new(now));
-        let svc = SweepService::with_clock(central, root.clone(), clock.clone());
+        let svc = SweepService::with_clock(central, root.clone(), clock);
 
         // First pass: reload from DB → rising edge → one fire.
         let report = svc.run_once().unwrap();
@@ -1676,7 +1676,7 @@ mod tests {
         .unwrap();
 
         let clock = Arc::new(MockClock::new(Utc::now()));
-        let svc = SweepService::with_clock(central.clone(), root.clone(), clock);
+        let svc = SweepService::with_clock(central.clone(), root, clock);
         assert_eq!(svc.run_once().unwrap().condition_checkins_fired.len(), 1);
 
         // Deregister → next pass reloads without it → clear the flag would also
@@ -1777,7 +1777,7 @@ mod tests {
         let clock = Arc::new(MockClock::new(t));
         let central = fresh_central();
         let root = Arc::new(MemSessionRoot::new());
-        let svc = SweepService::with_clock(central, root, clock.clone());
+        let svc = SweepService::with_clock(central, root, clock);
         assert_eq!(svc.clock().now(), t);
         // Round-trip accessor coverage.
         let _ = svc.session_root();

@@ -631,6 +631,11 @@ populated copy; production overrides go in your service unit.
 | `TAVILY_API_KEY` / `EXA_API_KEY` / `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` | Forwarded into the container so `web_search` auto-selects a backend. |
 | `COPPERCLAW_CODEX_BINARY` | Runner-side: absolute path to the Codex CLI inside the container. Read by the runner only when `provider == "codex"`. Defaults to `/usr/local/bin/codex`. Host forwards this through. |
 | `COPPERCLAW_CODEX_ARGS` | Runner-side: comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Defaults to `--json`. |
+| `COPPERCLAW_DEFAULT_EFFORT` | Reasoning-effort tier (`low` / `medium` / `high`, case-insensitive). `low` and `high` are sent to providers that support it; `medium` (the default) sends no effort field, leaving the model's own default — as does unset or unrecognised. |
+| `COPPERCLAW_CREDENTIAL_BROKER` | Truthy (`1`/`true`/`yes`/`on`/`enable`) turns on the in-host credential broker: containers receive short-lived broker tokens instead of the raw `ANTHROPIC_API_KEY`, so a compromised container can't exfiltrate the master key. Strictly opt-in; off by default. |
+| `COPPERCLAW_BROKER_TOKEN_TTL_SECS` | Override the broker token lifetime (seconds). Only read when the credential broker is enabled. |
+| `COPPERCLAW_EXPECTED_IMAGE_DIGEST` | Pin the expected session-image content digest (`sha256:<hex>` or bare hex) for the boot-time attestation check. Unset means no baseline — the check reports `no-baseline` and changes nothing. |
+| `COPPERCLAW_TODO_NOTIFICATIONS` | Set to `1` to enable host-side notifications when an agent's todo list changes. Default off. |
 
 The table lists the keys most installs touch — it is not exhaustive
 (runner deadlines, compaction thresholds, breadcrumb styling, and

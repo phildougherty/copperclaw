@@ -65,7 +65,7 @@ pub const REACTION_EMOJI_KEY: &str = "emoji";
 pub const REACTION_TARGET_KEY: &str = "target_seq";
 
 /// Sub-key: best-effort display name / id of who reacted (informational).
-pub const REACTION_ACTOR_KEY: &str = "actor";
+pub(crate) const REACTION_ACTOR_KEY: &str = "actor";
 
 /// A parsed inbound reaction.
 #[derive(Debug, Clone, PartialEq, Eq)]

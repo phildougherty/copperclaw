@@ -40,7 +40,7 @@ use axum::{
 use chrono::{TimeZone, Utc};
 use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc::Sender};
@@ -275,13 +275,6 @@ fn build_inbound_event(
         reply_to: None,
         sender: Some(sender),
     })
-}
-
-/// Re-export of the standard `Value` import to silence unused-warnings on
-/// `serde_json::Value` (used only inside one of the conditional arms).
-#[allow(dead_code)]
-fn _value_alias() -> Value {
-    Value::Null
 }
 
 #[cfg(test)]

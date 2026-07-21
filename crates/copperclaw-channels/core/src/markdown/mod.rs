@@ -22,7 +22,7 @@ mod render;
 mod split;
 
 pub use fence::is_balanced;
-pub use render::{Flavor, render};
+pub use render::{Flavor, escape_html, render};
 pub use split::{
     RENDER_HEADROOM_PERCENT, effective_max, split_into_chunks, split_into_chunks_within_bytes,
 };

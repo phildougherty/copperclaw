@@ -332,7 +332,7 @@ impl TodoList {
     /// not this em-dash reason join, so routing it through the vocabulary
     /// would change bytes. It can move once `Layout` grows a slot with
     /// the right granularity.
-    pub fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
+    pub(crate) fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
         let mut out = String::with_capacity(64 + self.items.len() * 32);
         out.push_str(self.title_or_default());
         for item in &self.items {

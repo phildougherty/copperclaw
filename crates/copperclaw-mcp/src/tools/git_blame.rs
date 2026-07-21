@@ -106,7 +106,7 @@ fn compute(root: &Path, input: &Input) -> Result<serde_json::Value, ToolError> {
 
     let rel = match repo.workdir() {
         Some(w) => abs_path.strip_prefix(w).unwrap_or(&abs_path).to_path_buf(),
-        None => abs_path.clone(),
+        None => abs_path,
     };
 
     let mut opts = git2::BlameOptions::new();

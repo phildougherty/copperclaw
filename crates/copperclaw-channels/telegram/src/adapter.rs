@@ -7,7 +7,7 @@ use crate::api::{InlineKeyboardButton, TelegramApi, escape_markdown_v2};
 use crate::config::{IngressMode, TelegramConfig};
 use crate::ingress::{IngressSettings, long_poll, webhook};
 use async_trait::async_trait;
-use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
+use copperclaw_channels_core::markdown::{Flavor, escape_html, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList, vocab,
@@ -1001,12 +1001,7 @@ fn render_activity_html(b: &Breadcrumb) -> String {
 /// vocabulary ellipsis when cut. Keeps a single long detail from blowing
 /// the budget.
 fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push_str(vocab::for_channel(CHANNEL_TYPE_STR).layout.ellipsis);
-    out
+    vocab::truncate_chars(s, max, vocab::for_channel(CHANNEL_TYPE_STR).layout.ellipsis)
 }
 
 /// One styled step line for the expandable activity body: status marker,
@@ -1244,24 +1239,6 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
     out.push('_');
     out.push_str(&escape_markdown_v2(&format!("{done}/{total} done")));
     out.push('_');
-    out
-}
-
-/// Telegram's HTML parser only requires the five XML escapes; everything
-/// else is rendered literally. Mirrors what every mainstream HTML
-/// escape util does so we don't pull in a dependency for one function.
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
     out
 }
 

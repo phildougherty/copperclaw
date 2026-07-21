@@ -252,7 +252,7 @@ impl Breadcrumb {
     // accident, so it is allowed rather than "fixed" by dropping the
     // parameter.
     #[allow(clippy::only_used_in_recursion)]
-    pub fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
+    pub(crate) fn to_text_fallback_with(&self, vocab: &Vocabulary) -> String {
         // Rolling aggregate: a summary line plus one plain line per step.
         // Channels without a native collapse affordance still get the
         // low-churn rolling view (just not collapsed).
