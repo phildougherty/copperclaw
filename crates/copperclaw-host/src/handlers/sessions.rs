@@ -23,6 +23,32 @@ const TAIL_LIMIT_MAX: i64 = 500;
 /// (after secret redaction, on a char boundary).
 const PREVIEW_CHARS: usize = 120;
 
+// ---- W3.4: architect-state files surfaced by `sessions.get` ---------------
+//
+// The agent declares restartable services in `/data/.copperclaw/services`
+// (replayed at cold boot by the W2.2 runner hook, which logs to
+// `/data/.copperclaw/services.log`) and commits architecture decisions to
+// `/data/<project>/.copperclaw/DECISIONS.md`. All three are agent-authored
+// files on the host-side session root, so `sessions.get` surfaces them
+// best-effort — a missing or unreadable file yields an absent field, never
+// an error — with every read capped so a huge agent-written file cannot
+// bloat the response.
+
+/// Per-file byte cap for architect-state reads (head of the services
+/// file; tail of the log / DECISIONS.md).
+const STATE_FILE_READ_BYTES: u64 = 8 * 1024;
+/// Max declared-service lines attached.
+const SERVICES_LINES_MAX: usize = 20;
+/// Max `services.log` tail lines attached (timestamped lines only —
+/// the per-command output bodies are skipped).
+const SERVICES_LOG_TAIL_LINES: usize = 10;
+/// Max DECISIONS.md tail lines attached per project.
+const DECISIONS_TAIL_LINES: usize = 10;
+/// Max project entries scanned for DECISIONS.md.
+const DECISIONS_PROJECTS_MAX: usize = 10;
+/// Per-line char cap for architect-state lines (after redaction).
+const STATE_LINE_CHARS: usize = 200;
+
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let status = opt_str(args, "status");
     let mut rows = match status.as_deref() {
@@ -62,9 +88,152 @@ pub fn get(
         if let Some(o) = obj.as_object_mut() {
             o.insert("recent_inbound".into(), json!(inbound));
             o.insert("recent_outbound".into(), json!(outbound));
+            attach_architect_state(o, &paths.root);
         }
     }
     Ok(obj)
+}
+
+/// Attach the W3.4 architect-state fields (`services`,
+/// `services_log_tail`, `decisions`) to a `sessions.get` response when
+/// the corresponding files exist under the session root. Best-effort:
+/// anything missing or unreadable is simply absent.
+fn attach_architect_state(obj: &mut serde_json::Map<String, Value>, session_root: &Path) {
+    let dot = session_root.join(".copperclaw");
+    if let Some(services) = read_declared_services(&dot.join("services")) {
+        obj.insert("services".into(), json!(services));
+    }
+    if let Some(tail) = read_services_log_tail(&dot.join("services.log")) {
+        obj.insert("services_log_tail".into(), json!(tail));
+    }
+    let decisions = read_project_decisions(session_root);
+    if !decisions.is_empty() {
+        obj.insert("decisions".into(), json!(decisions));
+    }
+}
+
+/// The non-comment, non-blank lines of `.copperclaw/services` (first
+/// [`STATE_FILE_READ_BYTES`] only), sanitized, capped at
+/// [`SERVICES_LINES_MAX`]. `None` when the file is missing/unreadable;
+/// `Some(vec![])` when it exists but declares nothing.
+fn read_declared_services(path: &Path) -> Option<Vec<String>> {
+    let head = read_file_head(path, STATE_FILE_READ_BYTES)?;
+    Some(
+        head.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(sanitize_state_line)
+            .take(SERVICES_LINES_MAX)
+            .collect(),
+    )
+}
+
+/// The last [`SERVICES_LOG_TAIL_LINES`] timestamped lines of
+/// `.copperclaw/services.log` — the `[ts] $ cmd` / `[ts] status: ...`
+/// lines the W2.2 hook writes — skipping captured command output, from
+/// at most the trailing [`STATE_FILE_READ_BYTES`] of the file.
+fn read_services_log_tail(path: &Path) -> Option<Vec<String>> {
+    let tail = read_file_tail(path, STATE_FILE_READ_BYTES)?;
+    let stamped: Vec<String> = tail
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| l.starts_with('['))
+        .map(sanitize_state_line)
+        .collect();
+    let skip = stamped.len().saturating_sub(SERVICES_LOG_TAIL_LINES);
+    Some(stamped.into_iter().skip(skip).collect())
+}
+
+/// Scan the immediate child directories of the session root for
+/// `<project>/.copperclaw/DECISIONS.md` and return, per project, the
+/// last [`DECISIONS_TAIL_LINES`] non-blank lines of the file. Hidden
+/// directories are skipped; at most [`DECISIONS_PROJECTS_MAX`] projects
+/// are surfaced (name order, for determinism).
+fn read_project_decisions(session_root: &Path) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(session_root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let path = session_root
+                .join(&name)
+                .join(".copperclaw")
+                .join("DECISIONS.md");
+            let tail = read_file_tail(&path, STATE_FILE_READ_BYTES)?;
+            let lines: Vec<String> = tail
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| !l.trim().is_empty())
+                .map(sanitize_state_line)
+                .collect();
+            let skip = lines.len().saturating_sub(DECISIONS_TAIL_LINES);
+            let tail_lines: Vec<String> = lines.into_iter().skip(skip).collect();
+            Some(json!({
+                "project": sanitize_state_line(&name),
+                "tail": tail_lines,
+            }))
+        })
+        .take(DECISIONS_PROJECTS_MAX)
+        .collect()
+}
+
+/// Read at most the first `cap` bytes of a file (lossy UTF-8). `None`
+/// on any I/O failure — architect-state reads are strictly best-effort.
+fn read_file_head(path: &Path, cap: u64) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(cap).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read at most the last `cap` bytes of a file (lossy UTF-8), dropping
+/// the leading partial line when the file was longer than `cap`. `None`
+/// on any I/O failure.
+fn read_file_tail(path: &Path, cap: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let truncated = len > cap;
+    if truncated {
+        file.seek(SeekFrom::Start(len - cap)).ok()?;
+    }
+    let mut buf = Vec::new();
+    file.take(cap).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        // The seek almost certainly landed mid-line; drop the fragment.
+        return Some(
+            text.split_once('\n')
+                .map_or(String::new(), |(_, rest)| rest.to_string()),
+        );
+    }
+    Some(text)
+}
+
+/// Sanitize one agent-authored line for display: redact secrets (same
+/// pass the message previews use), replace control characters — which
+/// would otherwise reach the operator's terminal raw — with spaces, and
+/// cap at [`STATE_LINE_CHARS`] chars.
+fn sanitize_state_line(line: &str) -> String {
+    let redacted = copperclaw_runner::redact_secrets(line);
+    let cleaned: String = redacted
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out: String = cleaned.chars().take(STATE_LINE_CHARS).collect();
+    if cleaned.chars().count() > STATE_LINE_CHARS {
+        out.push_str("...");
+    }
+    out
 }
 
 /// `sessions.tail` — merged, time-ordered recent rows from both
@@ -772,6 +941,206 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "not_found");
+    }
+
+    // ---- W3.4: architect-state fields on sessions.get ---------------------
+
+    /// Seed `<root>/.copperclaw/{services,services.log}` and one project
+    /// `myapp/.copperclaw/DECISIONS.md` under the session root.
+    fn seed_architect_state(session_root: &Path) {
+        let dot = session_root.join(".copperclaw");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(
+            dot.join("services"),
+            "# started by the databases skill\n\nredis-server --daemonize yes --dir /data/redis\npg_ctl -D /data/pg start\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dot.join("services.log"),
+            "[2026-07-28T10:00:00Z] $ redis-server --daemonize yes --dir /data/redis\n\
+             some captured output line\n\
+             [2026-07-28T10:00:01Z] status: exit status: 0\n\
+             [2026-07-28T10:00:01Z] $ pg_ctl -D /data/pg start\n\
+             [2026-07-28T10:00:02Z] status: exit status: 0\n",
+        )
+        .unwrap();
+        let proj = session_root.join("myapp").join(".copperclaw");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("DECISIONS.md"),
+            "# Decisions\n\n- 2026-07-28: SQLite over Postgres — single writer, simpler ops\n- 2026-07-28: REST over gRPC\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn get_attaches_architect_state_when_files_exist() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionPaths::new(tmp.path(), ag, s).root;
+        std::fs::create_dir_all(&root).unwrap();
+        seed_architect_state(&root);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+
+        // Declared services: comment + blank lines excluded.
+        let services = v["services"].as_array().unwrap();
+        assert_eq!(services.len(), 2);
+        assert_eq!(
+            services[0],
+            "redis-server --daemonize yes --dir /data/redis"
+        );
+        assert_eq!(services[1], "pg_ctl -D /data/pg start");
+
+        // Log tail: timestamped lines only — command output skipped.
+        let tail = v["services_log_tail"].as_array().unwrap();
+        assert_eq!(tail.len(), 4);
+        assert!(
+            tail.iter()
+                .all(|l| l.as_str().unwrap().starts_with("[2026-07-28"))
+        );
+        assert!(
+            !tail
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("some captured output line"))
+        );
+
+        // Per-project decisions tail: blank lines excluded, content kept.
+        let decisions = v["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["project"], "myapp");
+        let dtail = decisions[0]["tail"].as_array().unwrap();
+        assert_eq!(dtail.len(), 3);
+        assert_eq!(dtail[0], "# Decisions");
+        assert!(dtail[2].as_str().unwrap().contains("REST over gRPC"));
+    }
+
+    #[test]
+    fn get_architect_state_absent_when_files_missing() {
+        let (db, s, _ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+        assert!(v.get("services").is_none());
+        assert!(v.get("services_log_tail").is_none());
+        assert!(v.get("decisions").is_none());
+    }
+
+    #[test]
+    fn get_architect_state_withheld_from_foreign_agent_caller() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionPaths::new(tmp.path(), ag, s).root;
+        std::fs::create_dir_all(&root).unwrap();
+        seed_architect_state(&root);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let foreign = Caller::Agent {
+            session_id: SessionId::new(),
+            agent_group_id: ag,
+            messaging_group_id: None,
+        };
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &foreign, &ctx).unwrap();
+        assert!(v.get("services").is_none());
+        assert!(v.get("services_log_tail").is_none());
+        assert!(v.get("decisions").is_none());
+    }
+
+    #[test]
+    fn get_architect_state_caps_are_enforced() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionPaths::new(tmp.path(), ag, s).root;
+        let dot = root.join(".copperclaw");
+        std::fs::create_dir_all(&dot).unwrap();
+
+        // 50 service lines, one of them very long.
+        let mut services = String::new();
+        for i in 0..50 {
+            services.push_str(&format!("service-command-{i}\n"));
+        }
+        services.insert_str(0, &format!("long-{}\n", "x".repeat(1000)));
+        std::fs::write(dot.join("services"), services).unwrap();
+
+        // A log far beyond the byte cap, ending with 40 stamped lines.
+        let mut log = "noise\n".repeat(10_000);
+        for i in 0..40 {
+            log.push_str(&format!(
+                "[2026-07-28T10:00:{i:02}Z] status: exit status: 0\n"
+            ));
+        }
+        std::fs::write(dot.join("services.log"), log).unwrap();
+
+        // 15 project dirs with DECISIONS.md, one file with 100 lines.
+        for p in 0..15 {
+            let proj = root.join(format!("proj-{p:02}")).join(".copperclaw");
+            std::fs::create_dir_all(&proj).unwrap();
+            let mut body = String::new();
+            for i in 0..100 {
+                body.push_str(&format!("- decision {i}\n"));
+            }
+            std::fs::write(proj.join("DECISIONS.md"), body).unwrap();
+        }
+
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+
+        let services = v["services"].as_array().unwrap();
+        assert_eq!(services.len(), SERVICES_LINES_MAX);
+        let capped_line = services[0].as_str().unwrap();
+        assert_eq!(capped_line.chars().count(), STATE_LINE_CHARS + 3);
+        assert!(capped_line.ends_with("..."));
+
+        let tail = v["services_log_tail"].as_array().unwrap();
+        assert_eq!(tail.len(), SERVICES_LOG_TAIL_LINES);
+        // The newest stamped lines survive the tail cut.
+        assert!(tail[9].as_str().unwrap().contains("10:00:39Z"));
+
+        let decisions = v["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), DECISIONS_PROJECTS_MAX);
+        for d in decisions {
+            let dtail = d["tail"].as_array().unwrap();
+            assert_eq!(dtail.len(), DECISIONS_TAIL_LINES);
+            // Newest entries win.
+            assert_eq!(dtail[DECISIONS_TAIL_LINES - 1], "- decision 99");
+        }
+    }
+
+    #[test]
+    fn architect_state_lines_are_sanitized() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionPaths::new(tmp.path(), ag, s).root;
+        let dot = root.join(".copperclaw");
+        std::fs::create_dir_all(&dot).unwrap();
+        let secret = format!("sk-ant-{}", "a1B2".repeat(20));
+        std::fs::write(
+            dot.join("services"),
+            format!("run --key {secret} \u{1b}[2Jcleared\n"),
+        )
+        .unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+        let line = v["services"][0].as_str().unwrap();
+        assert!(!line.contains(&secret), "secret must be redacted: {line}");
+        assert!(line.contains("[REDACTED]"));
+        assert!(
+            !line.contains('\u{1b}'),
+            "terminal escapes must not pass through raw: {line:?}"
+        );
+    }
+
+    #[test]
+    fn read_file_tail_drops_leading_partial_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.log");
+        // First line is huge; a capped tail read lands mid-line and the
+        // fragment must be dropped so only whole lines surface.
+        let body = format!("{}\nwhole line\n", "y".repeat(9000));
+        std::fs::write(&path, body).unwrap();
+        let tail = read_file_tail(&path, STATE_FILE_READ_BYTES).unwrap();
+        assert_eq!(tail, "whole line\n");
+        // Missing file: best-effort None, never an error.
+        assert!(read_file_tail(&tmp.path().join("missing"), 100).is_none());
     }
 
     #[test]

@@ -87,6 +87,34 @@ than expected? Each hole is either handled in the design, or written
 down as an accepted risk — never discovered by the user. (Same
 adversarial move as [[code-review]]'s pass, one level up.)
 
+## 7. For designs that earn it, spawn a critic before you scaffold
+
+The premortem is you attacking your own design — and the author's
+context has the author's blind spots. When a design is genuinely
+multi-component, hard to reverse, or owns user-facing data, spend ONE
+sibling agent on a dedicated design critic via `create_agent` (the
+design-level twin of [[code-review]]'s high-stakes diff critic). It
+costs a full sibling agent, so reserve it for builds that earn it —
+not for a single-module prototype.
+
+- **Hand it three things** in its instructions: the §1 requirements
+  bullets pasted verbatim, plus the paths to `DESIGN.md` and
+  `.copperclaw/DECISIONS.md` in its workspace. Commit those files
+  first — a sibling's worktree at `/workspace` sees only committed
+  content (outside a git repo it reads your files at `/parent`; see
+  [[create-agent]]). A doc the critic can't read is a critique you
+  won't get.
+- **One mandate, nothing else**: "review this design against the
+  stated requirements: find the failure mode, the seam that leaks,
+  the requirement it cannot meet — and say which decision to change."
+  A critic also asked to fix or to praise hedges; a critic asked only
+  to break the design finds the flaw.
+- **Close the loop before scaffolding starts.** The critic's report
+  arrives in your inbound queue; for each finding, either change the
+  decision (a new DECISIONS.md line superseding the old) or record it
+  as an accepted risk. A design review that moves nothing in
+  DECISIONS.md was theater.
+
 ## Related skills
 
 [[coding-task]] (file-level decomposition + verify gate),

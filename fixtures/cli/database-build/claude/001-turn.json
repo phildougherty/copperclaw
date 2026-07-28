@@ -1,0 +1,10 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_db_build_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_replay_db_install_001", "name": "install_packages", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"apt\":[\"postgresql\",\"postgresql-client\"],"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"reason\":\"Postgres server and client for the app database\",\"scope\":\"image\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

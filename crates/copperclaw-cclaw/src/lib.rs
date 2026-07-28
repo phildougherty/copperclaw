@@ -398,12 +398,19 @@ where
         }
         return RunOutput::success(out);
     }
-    // Pull the message-row arrays out so the session row renders as a
-    // clean KV table and each direction gets its own table below it.
+    // Pull the message-row arrays (and the W3.4 architect-state fields)
+    // out so the session row renders as a clean KV table and each
+    // extra gets its own section below it.
     let mut session = data;
-    let (inbound, outbound) = match session.as_object_mut() {
-        Some(o) => (o.remove("recent_inbound"), o.remove("recent_outbound")),
-        None => (None, None),
+    let (inbound, outbound, services, services_log, decisions) = match session.as_object_mut() {
+        Some(o) => (
+            o.remove("recent_inbound"),
+            o.remove("recent_outbound"),
+            o.remove("services"),
+            o.remove("services_log_tail"),
+            o.remove("decisions"),
+        ),
+        None => (None, None, None, None, None),
     };
     let mut out = render_with(&session, palette);
     if !out.ends_with('\n') {
@@ -421,7 +428,56 @@ where
             out.push_str(&render_with(&rows, palette));
         }
     }
+    for (label, lines) in [
+        ("declared services", services),
+        ("services log (tail)", services_log),
+    ] {
+        let Some(lines) = lines else { continue };
+        out.push('\n');
+        out.push_str(&palette.header(label));
+        out.push('\n');
+        push_line_section(&mut out, &lines);
+    }
+    if let Some(serde_json::Value::Array(projects)) = decisions {
+        for project in &projects {
+            let name = project
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            out.push('\n');
+            out.push_str(&palette.header(&format!("decisions: {name} (tail)")));
+            out.push('\n');
+            match project.get("tail") {
+                Some(tail) => push_line_section(&mut out, tail),
+                None => out.push_str("  (none)\n"),
+            }
+        }
+    }
     RunOutput::success(out)
+}
+
+/// Append a host-provided array of display lines as an indented block,
+/// or `(none)` when the array is empty or malformed. The host already
+/// sanitizes these lines (redaction, control-character stripping, char
+/// caps), so this only lays them out.
+fn push_line_section(out: &mut String, lines: &serde_json::Value) {
+    let lines: Vec<&str> = lines
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if lines.is_empty() {
+        out.push_str("  (none)\n");
+        return;
+    }
+    for line in lines {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 /// Direction marker for one tail row: `<-` inbound, `->` outbound, `--`
@@ -6307,6 +6363,86 @@ mod tests {
         let out = run_cli(["cclaw", "sessions", "get", "x"], &t).await;
         assert!(out.stdout.contains("active"));
         assert!(!out.stdout.contains("recent inbound"));
+        // W3.4 architect-state sections are absent when the host sent none.
+        assert!(!out.stdout.contains("declared services"));
+        assert!(!out.stdout.contains("services log"));
+        assert!(!out.stdout.contains("decisions:"));
+    }
+
+    // ---- W3.4: architect-state sections on sessions get -------------------
+
+    fn sessions_get_architect_payload() -> serde_json::Value {
+        json!({
+            "id": "0198c0de-0000-7000-8000-000000000001",
+            "status": "active",
+            "container_status": "running",
+            "recent_inbound": [],
+            "recent_outbound": [],
+            "services": [
+                "redis-server --daemonize yes --dir /data/redis",
+                "pg_ctl -D /data/pg start",
+            ],
+            "services_log_tail": [
+                "[2026-07-28T10:00:00Z] $ redis-server --daemonize yes --dir /data/redis",
+                "[2026-07-28T10:00:01Z] status: exit status: 0",
+            ],
+            "decisions": [
+                {"project": "myapp",
+                 "tail": ["- 2026-07-28: SQLite over Postgres", "- 2026-07-28: REST over gRPC"]},
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn sessions_get_renders_architect_state_sections() {
+        let t = SequencedTransport::new(vec![Ok(sessions_get_architect_payload())]);
+        let out = run_cli(["cclaw", "sessions", "get", "s1"], &t).await;
+        // Declared services section with its lines indented.
+        assert!(out.stdout.contains("declared services"));
+        assert!(
+            out.stdout
+                .contains("  redis-server --daemonize yes --dir /data/redis\n")
+        );
+        assert!(out.stdout.contains("  pg_ctl -D /data/pg start\n"));
+        // Services log tail section.
+        assert!(out.stdout.contains("services log (tail)"));
+        assert!(
+            out.stdout
+                .contains("  [2026-07-28T10:00:01Z] status: exit status: 0\n")
+        );
+        // Per-project decisions section.
+        assert!(out.stdout.contains("decisions: myapp (tail)"));
+        assert!(
+            out.stdout
+                .contains("  - 2026-07-28: SQLite over Postgres\n")
+        );
+        assert!(out.stdout.contains("  - 2026-07-28: REST over gRPC\n"));
+        // The raw arrays are not dumped into the KV table.
+        assert!(!out.stdout.contains("services_log_tail"));
+        assert!(!out.stdout.contains("\"services\""));
+    }
+
+    #[tokio::test]
+    async fn sessions_get_renders_empty_services_as_none() {
+        // File exists but declares nothing: the host sends an empty
+        // array and the section renders as (none).
+        let t = SequencedTransport::new(vec![Ok(json!({
+            "id": "x",
+            "status": "active",
+            "services": [],
+        }))]);
+        let out = run_cli(["cclaw", "sessions", "get", "x"], &t).await;
+        assert!(out.stdout.contains("declared services"));
+        assert!(out.stdout.contains("  (none)\n"));
+    }
+
+    #[tokio::test]
+    async fn sessions_get_json_keeps_architect_state_untouched() {
+        let payload = sessions_get_architect_payload();
+        let t = SequencedTransport::new(vec![Ok(payload.clone())]);
+        let out = run_cli(["cclaw", "--json", "sessions", "get", "s1"], &t).await;
+        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(parsed, payload, "--json must be the untouched wire payload");
     }
 
     fn tail_payload() -> serde_json::Value {

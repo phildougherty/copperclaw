@@ -1,0 +1,16 @@
+{
+  "name": "cli-database-build",
+  "channel": "cli",
+  "description": "M23 W3.3: one inbound ('set up a postgres database for the app') drives install_packages (apt: postgresql + postgresql-client, scope image) -> write_file of the .copperclaw/services start line -> final text. Pins the databases capability path: the install_packages system row is applied to container_configs.packages_apt by the delivery loop, and the services registration lands on disk.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

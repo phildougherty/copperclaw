@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M23 — software-architect capability, wave 3)
+
+- **Design-review critic in the architecture skill.** For designs that
+  earn it (multi-component, hard-to-reverse, user-facing data),
+  `skills/architecture` now teaches spawning one `create_agent` sibling
+  whose sole mandate is to break the design — find the failure mode, the
+  leaking seam, the unmeetable requirement — before any scaffolding; its
+  findings must change a DECISIONS.md decision or be recorded as accepted
+  risk. `code-review` cross-links the design-level twin.
+- **DECISIONS.md seeded for greenfield scaffolds.** The runner's
+  post-turn project scan (`copperclaw-runner/src/run/project.rs`) seeds
+  `.copperclaw/DECISIONS.md` for scaffolded projects (`.copperclaw/`
+  state present, no `origin` remote), reusing the repo-attach template;
+  create-only and best-effort, attach output unchanged. Six new tests.
+- **Database replay fixture.** `fixtures/cli/database-build/` +
+  `cli_database_build_installs_packages_and_registers_services`
+  (`copperclaw-host/tests/replay.rs`) replays "set up a postgres
+  database" through the real router, runner, and delivery loop:
+  asserts the `install_packages` outbound system row, the host-side
+  apply into `container_configs.packages_apt`, the
+  `.copperclaw/services` write, and the delivered reply — the
+  install-and-restart run-book is now CI-pinned end to end.
+- **Architect state in `cclaw sessions get`.** `sessions.get` now
+  returns best-effort `services` (declared restart commands),
+  `services_log_tail` (last cold-boot run), and `decisions`
+  (per-project DECISIONS.md tails) when present in the session dir —
+  size-capped, secret-redacted via the same pass as message previews,
+  control characters stripped, and withheld from foreign-session agent
+  callers; `cclaw sessions get` renders each as its own section and
+  `--json` stays the raw wire payload.
+
 ### Added (M23 — software-architect capability, wave 2)
 
 - **`libnss-wrapper` in every session image.** Added to
