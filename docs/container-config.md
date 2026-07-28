@@ -92,6 +92,31 @@ cclaw groups config set-egress-allow <group-id>
 A `set-egress-allow` mutation also lands in `audit_log` so the
 allow-list history is reconstructable.
 
+### Presets
+
+`cclaw egress list-presets` shows a curated catalog of known
+`host:port` sets, and `cclaw egress allow <preset>` merges one into a
+group's allow-list. Unlike `set-egress-allow` (which replaces the
+whole list), `allow` preserves the existing entries and appends the
+preset's, deduplicated — re-running is a no-op. The write goes through
+the same `set-egress-allow` mutation, so it is host-only and audited.
+
+### Database egress
+
+Under a deny-default posture the databases run-book's MongoDB tarball
+downloads need two endpoints on the group's allow-list:
+
+- `fastdl.mongodb.org:443` — the MongoDB server tarball
+- `downloads.mongodb.com:443` — the mongosh tarball
+
+Allow both with the `mongodb` preset:
+
+```
+cclaw egress allow mongodb --agent-group-id <group-id>
+```
+
+Takes effect at the next container spawn for the group.
+
 ## Resource caps
 
 Stored as `container_configs.resource_limits` JSON:

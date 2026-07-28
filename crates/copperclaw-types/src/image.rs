@@ -110,6 +110,30 @@ pub const RUFF_PINNED_BINARY: PinnedBinary = PinnedBinary {
 /// (today just `ruff`; grow this list rather than adding ad-hoc fetches).
 pub const PROTOTYPING_PINNED_BINARIES: &[PinnedBinary] = &[RUFF_PINNED_BINARY];
 
+/// Extra apt packages the `backend` profile bakes: everything
+/// `prototyping` bakes plus real database servers (Postgres, `MariaDB`,
+/// Redis — the engines the `databases` skill runs in-container;
+/// `libnss-wrapper` for Postgres already sits in the setup baseline).
+/// MUST remain a superset of [`PROTOTYPING_APT_PACKAGES`] — a group
+/// picking `backend` for databases must never lose the web-prototyping
+/// toolchain (test: `backend_apt_is_a_superset_of_prototyping`). Kept
+/// sorted so the rendered Dockerfile / fingerprint is deterministic.
+/// The five database packages add roughly 250MB on top of the
+/// prototyping image (`mariadb-server` dominates).
+pub const BACKEND_APT_PACKAGES: &[&str] = &[
+    "chromium",
+    "fonts-inter",
+    "fonts-jetbrains-mono",
+    "fonts-noto-color-emoji",
+    "mariadb-client",
+    "mariadb-server",
+    "postgresql",
+    "postgresql-client",
+    "redis-server",
+    "sqlite3",
+    "zip",
+];
+
 /// Which toolchain profile a group's session image is baked with.
 ///
 /// `Minimal` (the default) is the secure-by-default baseline: only the
@@ -133,6 +157,10 @@ pub enum ImageProfile {
     Minimal,
     /// Warm web-prototyping image — adds the prototyping apt + npm bundle.
     Prototyping,
+    /// Everything `Prototyping` bakes plus real database servers
+    /// (Postgres, `MariaDB`, Redis) for groups whose builds need a live
+    /// datastore the session they ask for it (see `skills/databases`).
+    Backend,
 }
 
 impl ImageProfile {
@@ -142,6 +170,7 @@ impl ImageProfile {
         match self {
             ImageProfile::Minimal => "minimal",
             ImageProfile::Prototyping => "prototyping",
+            ImageProfile::Backend => "backend",
         }
     }
 
@@ -151,6 +180,7 @@ impl ImageProfile {
         match s {
             "minimal" => Some(ImageProfile::Minimal),
             "prototyping" => Some(ImageProfile::Prototyping),
+            "backend" => Some(ImageProfile::Backend),
             _ => None,
         }
     }
@@ -161,6 +191,7 @@ impl ImageProfile {
         match self {
             ImageProfile::Minimal => &[],
             ImageProfile::Prototyping => PROTOTYPING_APT_PACKAGES,
+            ImageProfile::Backend => BACKEND_APT_PACKAGES,
         }
     }
 
@@ -170,7 +201,7 @@ impl ImageProfile {
     pub fn extra_npm_packages(self) -> &'static [&'static str] {
         match self {
             ImageProfile::Minimal => &[],
-            ImageProfile::Prototyping => PROTOTYPING_NPM_PACKAGES,
+            ImageProfile::Prototyping | ImageProfile::Backend => PROTOTYPING_NPM_PACKAGES,
         }
     }
 
@@ -180,7 +211,7 @@ impl ImageProfile {
     pub fn extra_pinned_binaries(self) -> &'static [PinnedBinary] {
         match self {
             ImageProfile::Minimal => &[],
-            ImageProfile::Prototyping => PROTOTYPING_PINNED_BINARIES,
+            ImageProfile::Prototyping | ImageProfile::Backend => PROTOTYPING_PINNED_BINARIES,
         }
     }
 }
@@ -196,10 +227,46 @@ mod tests {
 
     #[test]
     fn as_str_and_parse_round_trip() {
-        for p in [ImageProfile::Minimal, ImageProfile::Prototyping] {
+        for p in [
+            ImageProfile::Minimal,
+            ImageProfile::Prototyping,
+            ImageProfile::Backend,
+        ] {
             assert_eq!(ImageProfile::parse(p.as_str()), Some(p));
         }
         assert_eq!(ImageProfile::parse("nope"), None);
+    }
+
+    #[test]
+    fn backend_apt_is_a_superset_of_prototyping() {
+        for pkg in PROTOTYPING_APT_PACKAGES {
+            assert!(
+                BACKEND_APT_PACKAGES.contains(pkg),
+                "backend profile dropped prototyping package {pkg}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_apt_is_sorted_and_bakes_database_servers() {
+        let mut sorted = BACKEND_APT_PACKAGES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(BACKEND_APT_PACKAGES, sorted.as_slice(), "keep sorted");
+        for pkg in ["postgresql", "mariadb-server", "redis-server"] {
+            assert!(BACKEND_APT_PACKAGES.contains(&pkg));
+        }
+    }
+
+    #[test]
+    fn backend_shares_prototyping_npm_and_pinned_binaries() {
+        assert_eq!(
+            ImageProfile::Backend.extra_npm_packages(),
+            ImageProfile::Prototyping.extra_npm_packages()
+        );
+        assert_eq!(
+            ImageProfile::Backend.extra_pinned_binaries(),
+            ImageProfile::Prototyping.extra_pinned_binaries()
+        );
     }
 
     #[test]

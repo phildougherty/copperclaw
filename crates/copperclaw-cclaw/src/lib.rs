@@ -17,6 +17,7 @@
 pub mod client;
 pub mod commands;
 pub mod disk;
+pub mod egress;
 pub mod output;
 pub mod protocol;
 pub mod security;
@@ -264,6 +265,10 @@ where
         "chat" => run_chat(args, palette).await,
         "dashboard" => run_dashboard(transport, caller, as_json, palette).await,
         "groups.config-edit" => run_groups_config_edit(args, transport, caller).await,
+        "egress-list-presets" => egress::run_egress_list_presets(as_json, palette),
+        "egress-allow-preset" => {
+            egress::run_egress_allow_preset(args, transport, caller, as_json, palette).await
+        }
         "sessions-get" => run_sessions_get(args, transport, caller, as_json, palette).await,
         "sessions-tail" => run_sessions_tail(args, transport, caller, as_json, palette).await,
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),

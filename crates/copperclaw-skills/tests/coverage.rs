@@ -3,7 +3,7 @@
 //! Every Copperclaw agent boots with two parallel inventories spliced into its
 //! prompt:
 //!
-//! 1. The 28 in-process MCP tools registered by
+//! 1. The in-process MCP tools registered by
 //!    `copperclaw_mcp::tools::build_tool_set` (see
 //!    `crates/copperclaw-mcp/src/tools/mod.rs`).
 //! 2. The skill bundles in `<repo>/skills/<dirname>/SKILL.md`, each of which
@@ -34,12 +34,21 @@ use copperclaw_skills::{Frontmatter, skip_frontmatter};
 // Static inventories
 // -----------------------------------------------------------------------
 
-/// Canonical tool inventory. Mirror of
-/// `copperclaw_mcp::tools::build_tool_set` — see that crate's
+/// Canonical tool inventory. Hand-synced MIRROR of
+/// `copperclaw_mcp::tools::build_tool_set` (the authoritative source,
+/// `crates/copperclaw-mcp/src/tools/mod.rs`) — see that crate's
 /// `tool_set_lists_every_in_process_tool` test for the other half of the
-/// pin. Kept hardcoded so this crate doesn't have to depend on
-/// `copperclaw-mcp` (which would pull `rmcp`, `git2`, etc. into the
-/// skills-crate compile graph just to read a `&'static [&'static str]`).
+/// pin. It is a mirror, not a derivation, because `copperclaw-mcp`
+/// depends on `copperclaw-skills`, so a dev-dependency on
+/// `copperclaw-mcp` here would create a dependency cycle (and pull
+/// `rmcp`, `git2`, etc. into the skills-crate compile graph just to read
+/// a name list). When a tool is added to / removed from
+/// `build_tool_set`, update BOTH lists in the same change.
+///
+/// Ordering matches `build_tool_set`. `browser_interact` is deliberately
+/// absent: it is only registered under its separate opt-in
+/// (`COPPERCLAW_BROWSER_ENABLED` + `COPPERCLAW_BROWSER_INTERACTIVE`), so it
+/// is not part of the default tool surface the skills teach against.
 const REGISTRY_TOOLS: &[&str] = &[
     "send_message",
     "send_file",
@@ -48,6 +57,8 @@ const REGISTRY_TOOLS: &[&str] = &[
     "ask_user_question",
     "send_card",
     "create_agent",
+    "delegate",
+    "delegate_batch",
     "install_packages",
     "add_mcp_server",
     "save_skill",
@@ -57,20 +68,39 @@ const REGISTRY_TOOLS: &[&str] = &[
     "pause_task",
     "resume_task",
     "update_task",
+    "create_goal",
+    "list_goals",
+    "update_goal",
+    "register_condition",
+    "set_condition_flag",
     "shell",
     "edit_file",
+    "multi_edit",
+    "apply_patch",
+    "copy_file",
     "read_file",
     "write_file",
     "web_fetch",
+    "browser_render",
+    "ui_screenshot",
+    "ui_inspect",
+    "diagnostics",
+    "self_review",
+    "view_image",
     "git_blame",
     "git_diff",
     "git_log",
     "git_status",
     "glob",
     "grep",
+    "find_symbol",
     "web_search",
     "explore",
     "load_skill",
+    "list_skills",
+    "memory_search",
+    "memory_get",
+    "memory_save",
     "todo_add",
     "todo_list",
     "todo_update",

@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M23 — software-architect capability, wave 2)
+
+- **`libnss-wrapper` in every session image.** Added to
+  `DEFAULT_BASE_APT_PACKAGES` (`copperclaw-setup/src/steps/image.rs`), so
+  Postgres `initdb` works for the passwd-less uid 1000 the session it is
+  requested instead of waiting for an `install_packages` rebuild.
+- **`backend` image profile.** New `ImageProfile::Backend` in
+  `copperclaw-types/src/image.rs`: a test-enforced strict superset of
+  `prototyping` that additionally bakes `postgresql`, `postgresql-client`,
+  `mariadb-server`, `mariadb-client`, `redis-server` (~250MB), for groups
+  whose builds need a live datastore with zero bake latency. Selectable at
+  setup (`IMAGE_PROFILE`) or per group
+  (`image_profile="backend"` via `cclaw groups config update`).
+- **Runner cold-boot services hook.** New
+  `copperclaw-runner/src/run/services.rs`: once per container boot, each
+  line of `/data/.copperclaw/services` runs via bash (60s per-command
+  timeout, failures logged and skipped, never fatal) with output appended
+  to `/data/.copperclaw/services.log` (256 KiB log cap, 8 KiB per-command
+  cap). Database servers and dev daemons now restart transparently after
+  an idle-stop; the `databases`/`shell` skills teach the file.
+- **Egress presets.** `cclaw egress list-presets` and `cclaw egress allow
+  <preset> --agent-group-id <id>` (new `copperclaw-cclaw/src/egress.rs`),
+  built as composite ops over the existing audited
+  `groups.config.set-egress-allow` wire command with an idempotent
+  order-preserving merge. First preset: `mongodb`
+  (`fastdl.mongodb.org:443`, `downloads.mongodb.com:443`) so the Mongo
+  tarball run-book works under deny-default egress; documented in
+  `docs/container-config.md`.
+- **Verify-gate database health inference.** The runner's project-attach
+  inference (`copperclaw-runner/src/run/project.rs`) now reads
+  `.env.example`/`.env` for `DATABASE_URL`/`REDIS_URL`/`MONGO_URL`/
+  `MONGODB_URI` and emits `db:`/`db-redis:`/`db-mongo:` verify stages as
+  plain bash `/dev/tcp` reachability checks — no DB client binaries
+  required, hostile values rejected by a hostname-alphabet guard, and an
+  agent-authored `.copperclaw/verify` is never clobbered.
+
+### Changed (M23 — wave 2)
+
+- **Skills coverage-test tool mirror synced.** `REGISTRY_TOOLS` in
+  `crates/copperclaw-skills/tests/coverage.rs` caught up with
+  `copperclaw_mcp::tools::build_tool_set` (21 tools re-armed — `delegate`,
+  `delegate_batch`, goal/condition tools, `multi_edit`, `apply_patch`,
+  `copy_file`, `find_symbol`, `list_skills`, `memory_*`, `ui_*`,
+  `browser_render`, `self_review`, `view_image`, `diagnostics`; a true
+  derive would be a dependency cycle, so it stays a documented mirror with
+  `browser_interact` noted as the deliberate opt-in exclusion). Both
+  coverage directions now enforce for the full registry; `schedule-task`
+  gained real goal/condition tool copy and `save-skill`/
+  `discovering-tools` now name `list_skills`.
+- **`databases` skill** updated for wave 2: probe for `backend`-profile
+  pre-baked servers before baking, `libnss-wrapper` no longer requested
+  per-group (image baseline ships it), and daemon restart now goes
+  through `/data/.copperclaw/services` instead of a hand-run script.
+
 ### Added (M23 — software-architect capability, wave 1)
 
 - **`skills/architecture` (new).** System-level design discipline for

@@ -29,9 +29,10 @@ grouped roughly:
 - **Agent lifecycle** — `create_agent`, `delegate`, `delegate_batch`.
 - **Self-modification** — `install_packages`, `add_mcp_server`.
 - **Scheduling** — `schedule_task`, `list_tasks`, `cancel_task`,
-  `pause_task`, `resume_task`, `update_task`; plus goal-tracking and
-  condition-wake tools (create/list/update goals, register conditions,
-  set condition flags).
+  `pause_task`, `resume_task`, `update_task`; plus goal-tracking
+  (`create_goal`, `list_goals`, `update_goal`) and condition-wake
+  tools (`register_condition`, `set_condition_flag`) — see
+  [[schedule-task]].
 - **Computer use** — `shell`, `read_file`, `write_file`, `edit_file`,
   `multi_edit`, `apply_patch`, `copy_file`, `web_fetch`,
   `artifact_path`.
@@ -42,8 +43,8 @@ grouped roughly:
 - **UI verification / diagnostics** — `ui_screenshot`, `ui_inspect`,
   `diagnostics`, `self_review`, `view_image`.
 - **Group memory** — `memory_search`, `memory_get`, `memory_save`.
-- **Skill catalogue** — `load_skill`, `save_skill`, and a read-only
-  lister of this group's saved skills.
+- **Skill catalogue** — `load_skill`, `save_skill`, and `list_skills`
+  (read-only: each available skill's name, version, description).
 - **Planning scratchpad** — `todo_add`, `todo_list`, `todo_update`,
   `todo_delete`.
 - **Session control** — `compact_now`, `clear_history`.

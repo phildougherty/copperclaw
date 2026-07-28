@@ -875,7 +875,7 @@ pub const IMAGE_REBUILD_TOTAL: &str = "copperclaw_image_rebuild_total";
 pub const GROUP_IMAGE_PROFILE: &str = "copperclaw_group_image_profile";
 
 /// Increment `copperclaw_image_rebuild_total{image_profile, result}` — a session
-/// image rebuild attributed by profile (`minimal|prototyping`); `result` is
+/// image rebuild attributed by profile (`minimal|prototyping|backend`); `result` is
 /// `ok|failed`. (The legacy unlabeled `copperclaw_image_rebuild_failed_total`
 /// via [`inc_image_rebuild_failed`] is retained alongside.)
 pub fn inc_image_rebuild(image_profile: &str, result: &str) {

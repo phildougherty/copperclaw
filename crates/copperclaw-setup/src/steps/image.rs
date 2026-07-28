@@ -419,7 +419,7 @@ pub fn resolve_image_profile(prompt: &dyn Prompt) -> Result<ImageProfile, StepEr
     let answer = prompt
         .input(
             IMAGE_PROFILE_KEY,
-            "Base image profile (minimal | prototyping)",
+            "Base image profile (minimal | prototyping | backend)",
             Some(ImageProfile::Minimal.as_str()),
         )
         .map_err(|e| StepError::Other(format!("image profile prompt: {e}")))?;
@@ -464,6 +464,14 @@ pub const DEFAULT_BASE_APT_PACKAGES: &[&str] = &[
     // these must ship in the baseline rather than install on demand.
     "ripgrep",
     "universal-ctags",
+    // nss_wrapper (tiny, ~100KB): the container user is uid 1000 with no
+    // /etc/passwd entry, and Postgres's `initdb` refuses to run for a
+    // uid it cannot resolve. The databases skill's run-book fakes the
+    // passwd entry via LD_PRELOAD of libnss_wrapper.so, so baking this
+    // into the baseline makes Postgres work the same session it is
+    // requested instead of stalling on a per-group `install_packages`
+    // rebuild (see skills/databases/SKILL.md).
+    "libnss-wrapper",
 ];
 
 /// Find the `copperclaw-runner` binary that should be baked into the
@@ -917,6 +925,39 @@ mod tests {
         assert!(!mdf.contains("npm install -g"));
         // The two profiles produce different image tags.
         assert_ne!(spec.image_tag(), minimal.image_tag());
+    }
+
+    // ---- baseline apt packages (M23 W2.1) -----------------------------
+
+    #[test]
+    fn base_apt_packages_include_libnss_wrapper() {
+        // W2.1: the container user (uid 1000) has no /etc/passwd entry and
+        // Postgres's `initdb` refuses a uid it cannot resolve. The databases
+        // skill's run-book LD_PRELOADs libnss_wrapper.so to fake the entry,
+        // so the package must ship in the baseline — containers have no apt
+        // egress at runtime to install it on demand.
+        assert!(DEFAULT_BASE_APT_PACKAGES.contains(&"libnss-wrapper"));
+    }
+
+    #[test]
+    fn base_spec_renders_libnss_wrapper_for_every_profile() {
+        // The baseline list is profile-independent: minimal and prototyping
+        // session images must both render the libnss-wrapper install line.
+        for profile in [ImageProfile::Minimal, ImageProfile::Prototyping] {
+            let mut spec = fake_default_spec();
+            spec.apt_packages = DEFAULT_BASE_APT_PACKAGES
+                .iter()
+                .copied()
+                .map(String::from)
+                .collect();
+            spec.image_profile = profile;
+            let df = spec.dockerfile();
+            assert!(
+                df.contains("libnss-wrapper"),
+                "expected libnss-wrapper in `{}` dockerfile:\n{df}",
+                profile.as_str()
+            );
+        }
     }
 
     #[test]

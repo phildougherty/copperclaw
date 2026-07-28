@@ -16,27 +16,35 @@ The environment you are working in:
 - You are **uid 1000, not root**, with **no /etc/passwd entry**. No
   systemd, no `service`, no `sudo`. Start servers as plain background
   processes.
-- Server packages must be **baked into the image** via
-  `install_packages` — they appear in a *future* session, not this one
-  (see [[install-packages]]). Request them the moment you know you'll
-  need them, then continue with SQLite or a tarball fallback this
-  session if you can't wait.
+- **Probe before you bake**: groups on the `backend` image profile
+  already ship Postgres, MariaDB, and Redis — check `command -v
+  initdb mariadbd redis-server` first. Otherwise server packages must
+  be **baked into the image** via `install_packages` and appear in a
+  *future* session, not this one (see [[install-packages]]). Request
+  them the moment you know you'll need them, then continue with SQLite
+  or a tarball fallback this session if you can't wait.
 - Keep every data dir, socket, and pid file under `/data` — it is the
   only writable, session-persistent path. `/var/lib/*` and `/run/*`
   are root-owned; pointing a server at them is the #1 failure.
 - **Servers die when the container idle-stops; `/data` survives.** On
-  a fresh container your data is intact but nothing is running. Write
-  a `/data/start-dbs.sh` with your exact start commands and re-run it
-  whenever a connection is refused — don't debug a "down" DB that was
-  simply never restarted.
+  a fresh container your data is intact but nothing is running — so
+  write your exact start commands to `/data/.copperclaw/services`
+  (one bash command per line; `#` comments and blank lines skipped).
+  The runtime runs that file once on every container boot, appending
+  each command's output and exit status to
+  `/data/.copperclaw/services.log`. When a connection is refused,
+  read that log first — don't debug a "down" DB whose restart simply
+  failed.
 - Bind to `127.0.0.1`. Your app connects over localhost; nothing
   outside the container needs the port.
 
 ## Postgres
 
-Bake: `install_packages` with `apt: ["postgresql", "postgresql-client",
-"libnss-wrapper"]`. `libnss-wrapper` is required — `initdb` refuses a
-uid with no passwd entry without it.
+Bake: `install_packages` with `apt: ["postgresql",
+"postgresql-client"]`. The image baseline ships `libnss-wrapper`
+(`initdb` refuses a uid with no passwd entry without it) — if
+`/usr/lib/x86_64-linux-gnu/libnss_wrapper.so` is missing you are on an
+older image; add `"libnss-wrapper"` to the apt list too.
 
 ```bash
 # one-time init
@@ -46,7 +54,8 @@ export NSS_WRAPPER_PASSWD=/data/passwd NSS_WRAPPER_GROUP=/data/group
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libnss_wrapper.so
 export PATH=$(ls -d /usr/lib/postgresql/*/bin | head -1):$PATH
 initdb -D /data/pg --auth=trust -U agent
-# start (rerun after every container respawn; same env as above)
+# start — wrap the exports above + this line in /data/start-pg.sh and
+# add "bash /data/start-pg.sh" to /data/.copperclaw/services
 pg_ctl -D /data/pg -l /data/pg/log -o "-k /data/pg -p 5432 -h 127.0.0.1" start
 psql -h 127.0.0.1 -U agent -d postgres -c 'select 1'
 ```
@@ -63,7 +72,7 @@ Bake: `apt: ["mariadb-server", "mariadb-client"]`.
 # one-time init
 mariadb-install-db --datadir=/data/mysql \
   --auth-root-authentication-method=normal --skip-test-db
-# start (rerun after respawn) — socket + pid MUST live under /data
+# start (add to /data/.copperclaw/services) — socket + pid under /data
 mariadbd --datadir=/data/mysql --socket=/data/mysql/mysql.sock \
   --pid-file=/data/mysql/mysqld.pid --port=3306 \
   --bind-address=127.0.0.1 >/data/mysql/server.log 2>&1 &
@@ -105,10 +114,10 @@ curl -fsSL https://downloads.mongodb.com/compass/mongosh-2.3.8-linux-x64.tgz | t
 
 - App config reads `DATABASE_URL` / `REDIS_URL` from the environment
   ([[web-backend]] rule) — the URLs above, never hardcoded.
-- Add a `db:start` line to `/data/start-dbs.sh` *and* a health check
-  to `.copperclaw/verify` (e.g. `db: psql -h 127.0.0.1 -U agent -d
-  postgres -c 'select 1'`) so the verify gate catches a dead server
-  before you claim "done" ([[coding-task]]).
+- Add each server's start command to `/data/.copperclaw/services`
+  *and* a health check to `.copperclaw/verify` (e.g. `db: psql -h
+  127.0.0.1 -U agent -d postgres -c 'select 1'`) so the verify gate
+  catches a dead server before you claim "done" ([[coding-task]]).
 - Seed/migrate via scripts, not by hand — the datadir persists, but a
   reproducible schema beats an artisanal one.
 

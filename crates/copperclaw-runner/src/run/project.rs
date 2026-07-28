@@ -15,7 +15,9 @@
 //!
 //! 1. **Infers verify stages** from the repo's own toolchain manifests
 //!    (`Cargo.toml`, `package.json` scripts, `Makefile`, `pyproject.toml`)
-//!    and writes them to `<repo>/.copperclaw/verify` in the *exact* format
+//!    — plus, when the repo's `.env.example`/`.env` declares a database
+//!    URL, a client-free `db:` TCP health stage (M23 W2.4) — and writes
+//!    them to `<repo>/.copperclaw/verify` in the *exact* format
 //!    the M20 multi-stage verify gate already consumes
 //!    ([`copperclaw_mcp::tools::verify_gate::recorded_stages`]) — so the
 //!    stages round-trip through the gate's own parser unchanged.
@@ -200,6 +202,166 @@ fn infer_pyproject_stages(pyproject: &str, repo: &Path, out: &mut Vec<Stage>) {
     }
 }
 
+// ── M23 W2.4: database health-stage inference ───────────────────────────
+//
+// A project that declares a database dependency should not pass verify
+// while that database is dead or was never restarted after an idle-stop
+// (daemons die with the container; `/data` survives). Detection is the
+// conventional env-file contract: a `DATABASE_URL=` / `REDIS_URL=` /
+// `MONGO_URL=` / `MONGODB_URI=` line in `.env.example` or `.env` at the
+// repo root. The emitted check is a plain bash TCP dial
+// (`bash -c 'exec 3<>/dev/tcp/<host>/<port>'`) so it never depends on a
+// DB client binary being installed in the container — host and port are
+// parsed here, at inference time. Malformed or empty values are skipped
+// silently; this can never fail an attach.
+
+/// Env files probed for database URL declarations, in precedence order —
+/// the first file that declares a var wins for that var.
+const DB_ENV_FILES: &[&str] = &[".env.example", ".env"];
+
+/// The env vars we recognise as database declarations, each paired with
+/// the fixed stage name we emit. Stage names are *fixed here* — never
+/// derived from repo content — mirroring [`NPM_SCRIPT_STAGES`]. Both
+/// Mongo spellings map to the same stage name (deduped by
+/// [`push_unique_stage`]).
+const DB_URL_VARS: &[(&str, &str)] = &[
+    ("DATABASE_URL", "db"),
+    ("REDIS_URL", "db-redis"),
+    ("MONGO_URL", "db-mongo"),
+    ("MONGODB_URI", "db-mongo"),
+];
+
+/// Default TCP port per URL scheme, for URLs that omit an explicit port.
+/// Unknown schemes get no default — a portless URL with an unknown
+/// scheme is skipped rather than guessed at.
+fn scheme_default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "postgres" | "postgresql" => Some(5432),
+        "mysql" | "mariadb" => Some(3306),
+        "redis" | "rediss" => Some(6379),
+        "mongodb" => Some(27017),
+        _ => None,
+    }
+}
+
+/// Extract `var`'s value from dotenv-style `contents`: a `VAR=value`
+/// line, optionally `export`-prefixed, value optionally quoted. Empty
+/// values are skipped (scanning continues) so a commented-out template
+/// line like `DATABASE_URL=` never shadows a later real one.
+fn env_var_value(contents: &str, var: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some(rest) = line.strip_prefix(var) else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        if value.is_empty() {
+            continue;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Whether `host` is safe to splice into the single-quoted `bash -c`
+/// command: hostname / IPv4 / IPv6 characters only. Anything else (a
+/// quote, whitespace, a shell metacharacter from a hostile `.env`) makes
+/// the URL "malformed" and the stage is silently skipped — repo content
+/// can never smuggle shell syntax through this flow.
+fn is_safe_db_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
+/// Parse a database URL into the `(host, port)` a TCP reachability check
+/// should dial. `None` for anything malformed: no `scheme://`, an
+/// unparsable explicit port, an unknown scheme with no port, port 0, or
+/// a host containing characters outside the hostname alphabet. Host
+/// defaults to `127.0.0.1` when the URL omits it.
+fn db_endpoint(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    // Authority = up to the first path / query / fragment delimiter,
+    // with any `user:pass@` credentials stripped.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+
+    let (host, explicit_port) = if let Some(inner) = hostport.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]` or `[::1]:5433`.
+        let (host, after) = inner.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p.parse::<u16>().ok()?),
+            None if after.is_empty() => None,
+            None => return None,
+        };
+        (host, port)
+    } else if hostport.matches(':').count() > 1 {
+        // Bare (unbracketed) IPv6 — all colons belong to the address.
+        (hostport, None)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        (h, Some(p.parse::<u16>().ok()?))
+    } else {
+        (hostport, None)
+    };
+
+    let port = match explicit_port {
+        Some(0) => return None,
+        Some(p) => p,
+        None => scheme_default_port(&scheme)?,
+    };
+    let host = if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    };
+    if !is_safe_db_host(&host) {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Infer database health stages from the repo's env files: one stage per
+/// recognised URL var, in [`DB_URL_VARS`] order, each a client-free TCP
+/// dial bash can run alone. Best-effort — anything unreadable or
+/// malformed contributes nothing.
+fn infer_db_stages(repo: &Path, out: &mut Vec<Stage>) {
+    let mut values: Vec<Option<String>> = vec![None; DB_URL_VARS.len()];
+    for file in DB_ENV_FILES {
+        let Some(contents) = read_capped(&repo.join(file)) else {
+            continue;
+        };
+        for (i, (var, _)) in DB_URL_VARS.iter().enumerate() {
+            if values[i].is_none() {
+                values[i] = env_var_value(&contents, var);
+            }
+        }
+    }
+    for (i, (_, stage_name)) in DB_URL_VARS.iter().enumerate() {
+        let Some(url) = values[i].as_deref() else {
+            continue;
+        };
+        let Some((host, port)) = db_endpoint(url) else {
+            continue;
+        };
+        push_unique_stage(
+            out,
+            stage_name,
+            &format!("bash -c 'exec 3<>/dev/tcp/{host}/{port}'"),
+        );
+    }
+}
+
 /// Push a stage unless one with the same name is already present (first
 /// ecosystem wins). Keeps stage names unique — the verify gate keys its
 /// per-stage pass/fail state by name, so a duplicate name would corrupt
@@ -236,6 +398,7 @@ pub fn infer_verify_stages(repo: &Path) -> Vec<Stage> {
     if let Some(mk) = read_capped(&repo.join("Makefile")) {
         infer_make_stages(&mk, &mut stages);
     }
+    infer_db_stages(repo, &mut stages);
     stages
 }
 
@@ -592,7 +755,7 @@ fn has_recognised_manifest(dir: &Path) -> bool {
 /// `COPPERCLAW_DATA_ROOT` when set, else `/data`. Keeping the resolution
 /// identical means auto-attach and the verify gate always agree on which
 /// directories are projects.
-fn resolve_data_root() -> PathBuf {
+pub(super) fn resolve_data_root() -> PathBuf {
     std::env::var_os("COPPERCLAW_DATA_ROOT").map_or_else(|| PathBuf::from("/data"), PathBuf::from)
 }
 
@@ -819,6 +982,211 @@ mod tests {
                 "cargo clippy",
                 "cargo test"
             ],
+        );
+    }
+
+    // ── M23 W2.4: db health-stage inference (unit) ───────────────────
+
+    #[test]
+    fn infers_db_stage_from_env_example() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "# app config\nDATABASE_URL=postgres://app:secret@localhost/app\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "db".into(),
+                command: "bash -c 'exec 3<>/dev/tcp/localhost/5432'".into()
+            }],
+            ".env.example DATABASE_URL yields a client-free TCP db stage"
+        );
+    }
+
+    #[test]
+    fn infers_db_stages_from_env_when_no_example() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "REDIS_URL=redis://cache/0\nMONGODB_URI=\"mongodb://mongo\"\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert_eq!(
+            stages,
+            vec![
+                Stage {
+                    name: "db-redis".into(),
+                    command: "bash -c 'exec 3<>/dev/tcp/cache/6379'".into()
+                },
+                Stage {
+                    name: "db-mongo".into(),
+                    command: "bash -c 'exec 3<>/dev/tcp/mongo/27017'".into()
+                },
+            ],
+            "plain .env works too; quoted values are unwrapped; scheme defaults apply"
+        );
+    }
+
+    #[test]
+    fn db_stage_scheme_and_host_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No host in the URL → 127.0.0.1; mysql scheme → 3306.
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "export DATABASE_URL=mysql:///app\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "db".into(),
+                command: "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306'".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn db_stage_respects_explicit_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "DATABASE_URL=postgres://user@db.internal:6543/app?sslmode=disable\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "db".into(),
+                command: "bash -c 'exec 3<>/dev/tcp/db.internal/6543'".into()
+            }],
+            "an explicit port in the URL overrides the scheme default"
+        );
+    }
+
+    #[test]
+    fn malformed_db_url_lines_are_skipped_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No scheme, unparsable port, unknown scheme with no port, empty
+        // value, and a hostile host that would escape the single-quoted
+        // bash command — every one contributes nothing, no error.
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            concat!(
+                "DATABASE_URL=not-a-url\n",
+                "REDIS_URL=redis://cache:notaport/0\n",
+                "MONGO_URL=weird://host/db\n",
+                "MONGODB_URI=\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "DATABASE_URL=postgres://x'; rm -rf /'@evil/app\n",
+        )
+        .unwrap();
+        assert!(
+            infer_verify_stages(tmp.path()).is_empty(),
+            "malformed / hostile URL values are skipped, never a hard error"
+        );
+    }
+
+    #[test]
+    fn no_db_vars_means_no_db_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "APP_ENV=production\nLOG_LEVEL=info\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert!(
+            stages.iter().all(|s| !s.name.starts_with("db")),
+            "an env file with no recognised URL vars adds no db stage"
+        );
+    }
+
+    #[test]
+    fn db_stage_appends_after_manifest_stages() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "DATABASE_URL=postgres://localhost/app\n",
+        )
+        .unwrap();
+        let names: Vec<String> = infer_verify_stages(tmp.path())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, vec!["fmt", "check", "clippy", "test", "db"]);
+    }
+
+    #[test]
+    fn env_example_wins_over_env_for_the_same_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env.example"),
+            "DATABASE_URL=postgres://declared:5433/app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "DATABASE_URL=postgres://other:9999/app\n",
+        )
+        .unwrap();
+        let stages = infer_verify_stages(tmp.path());
+        assert_eq!(
+            stages[0].command,
+            "bash -c 'exec 3<>/dev/tcp/declared/5433'"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_stage_roundtrips_through_the_gate_parser() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join(".env.example"),
+            "DATABASE_URL=postgres://127.0.0.1/app\n",
+        )
+        .unwrap();
+        let inferred = infer_verify_stages(repo);
+        std::fs::create_dir_all(repo.join(STATE_DIR)).unwrap();
+        std::fs::write(
+            repo.join(STATE_DIR).join(VERIFY_FILE),
+            render_verify_file(&inferred),
+        )
+        .unwrap();
+        let parsed = copperclaw_mcp::tools::verify_gate::recorded_stages(repo, None).await;
+        assert_eq!(
+            parsed, inferred,
+            "the db stage parses back through the M20 gate unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_with_db_env_never_clobbers_existing_verify() {
+        let (_tmp, repo) = staged_fixture();
+        std::fs::write(
+            repo.join(".env.example"),
+            "DATABASE_URL=postgres://localhost/app\n",
+        )
+        .unwrap();
+        let sdir = repo.join(STATE_DIR);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join(VERIFY_FILE), "custom: ./my-check.sh\n").unwrap();
+        attach_project(&repo).await;
+        assert_eq!(
+            std::fs::read_to_string(sdir.join(VERIFY_FILE)).unwrap(),
+            "custom: ./my-check.sh\n",
+            "db inference only applies when attach is generating the verify file"
         );
     }
 
