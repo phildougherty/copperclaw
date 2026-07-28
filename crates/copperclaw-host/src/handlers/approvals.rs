@@ -33,6 +33,12 @@
 //!   grant and only then performs the action. The apply arm itself validates
 //!   the payload and records the grant — it never performs the external action,
 //!   so this dispatcher stays a pure DB mutation.
+//! - `"taint_clearance"` (M24 S4) — write the single-turn taint clearance
+//!   file (`taint_clearance.json`) into the host-computed
+//!   `payload.session_dir`, enforcing containment under
+//!   `payload.allowed_root`. The runner consumes and deletes it at its next
+//!   turn start, so one approval clears exactly one turn; unconsumed files
+//!   expire after ~1h.
 //!
 //! ## Idempotency
 //!
@@ -270,6 +276,13 @@ pub fn resolve_approve(
         // approved grant and only then performs the action. This arm never
         // performs the action itself, so the dispatcher stays a pure DB mutation.
         "credentialed_external_action" => apply_credentialed_external_action(&row),
+        // M24 S4: write the single-turn taint clearance into the session dir.
+        // The pending row was raised by the delivery service from the runner's
+        // `taint_approval_request`, with the host-computed `session_dir` /
+        // `allowed_root` stamped into the payload. The runner consumes AND
+        // deletes the file at its next turn start, so the approval clears
+        // exactly one turn; the file itself expires after ~1h if unconsumed.
+        "taint_clearance" => apply_taint_clearance(&row, decided_by)?,
         // Explicit refusal arm (M18 G1). `one_cli` (Agent Vault credential
         // grants) is never applied via this generic dispatcher; approving one
         // here would silently no-op, which is worse than a clear refusal. We
@@ -906,6 +919,95 @@ fn apply_credentialed_external_action(row: &pending_approvals::PendingApproval) 
                  requester (e.g. the public-tunnel broker) consults this approved \
                  grant before acting. No external action was performed by this approval.",
     })
+}
+
+/// `taint_clearance` family (M24 S4): write the single-turn taint clearance
+/// file into the session's data dir. The pending row was raised by the
+/// delivery service from the runner's `taint_approval_request` System row,
+/// with the host-computed `session_dir` (`<sessions_root>/<ag>/<sess>`) and
+/// containment root (`allowed_root` = the sessions root) stamped into the
+/// payload alongside the runner-named blocked `tool` + `taint_source`.
+///
+/// Approving writes `<session_dir>/taint_clearance.json` naming the session
+/// and carrying a hard expiry of [`pending_approvals::DEFAULT_APPROVAL_TTL`]
+/// (~1h) from approval. The runner consumes AND deletes the file at its next
+/// turn start (`external_approved = true` for exactly that turn), re-verifying
+/// the session id + expiry itself — so the clearance is session-scoped,
+/// single-turn, and cannot outlive the TTL or the session dir. Containment:
+/// the canonical `session_dir` must sit under the canonical `allowed_root`;
+/// a session dir that no longer exists is refused (the session is gone, so
+/// there is nothing to clear).
+fn apply_taint_clearance(
+    row: &pending_approvals::PendingApproval,
+    decided_by: &str,
+) -> Result<Value, ErrorPayload> {
+    let bad = |msg: String| ErrorPayload::new("bad_request", msg);
+    let get_str = |key: &str| {
+        row.payload
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad(format!("taint_clearance payload requires a string `{key}`")))
+    };
+    let session_id = get_str("session_id")?;
+    let session_dir = get_str("session_dir")?;
+    let allowed_root = get_str("allowed_root")?;
+    let tool = row
+        .payload
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let taint_source = row
+        .payload
+        .get("taint_source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    // Containment: the canonical session dir must sit under the canonical
+    // sessions root. Canonicalization also proves the dir still exists — a
+    // clearance for a deleted session is refused rather than resurrecting its
+    // directory.
+    let canon_dir = std::fs::canonicalize(session_dir).map_err(|e| {
+        bad(format!(
+            "taint_clearance session dir `{session_dir}` is not usable \
+             (session gone?): {e}"
+        ))
+    })?;
+    let canon_root = std::fs::canonicalize(allowed_root)
+        .map_err(|e| bad(format!("taint_clearance allowed_root is not usable: {e}")))?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err(bad(format!(
+            "taint_clearance session dir `{session_dir}` escapes the sessions root; refusing"
+        )));
+    }
+
+    let now = chrono::Utc::now();
+    let expires_at = now + pending_approvals::DEFAULT_APPROVAL_TTL;
+    let clearance = json!({
+        "session_id": session_id,
+        "tool": tool,
+        "taint_source": taint_source,
+        "approved_by": decided_by,
+        "approved_at": now,
+        "expires_at": expires_at,
+    });
+    let path = canon_dir.join("taint_clearance.json");
+    let bytes = serde_json::to_vec_pretty(&clearance)
+        .map_err(|e| ErrorPayload::new("internal", format!("serialise clearance: {e}")))?;
+    std::fs::write(&path, bytes)
+        .map_err(|e| ErrorPayload::new("internal", format!("write clearance: {e}")))?;
+
+    Ok(json!({
+        "kind": "taint_clearance",
+        "agent_group_id": row.agent_group_id.map(|g| g.as_uuid().to_string()),
+        "session_id": session_id,
+        "tool": tool,
+        "taint_source": taint_source,
+        "path": path.to_string_lossy(),
+        "expires_at": expires_at,
+        "note": "single-turn taint clearance written; the agent's NEXT turn may take \
+                 credentialed external actions, then the clearance is consumed. It \
+                 expires unconsumed after ~1h.",
+    }))
 }
 
 /// Helper: read `payload[key]` as an array of non-empty strings.
@@ -1692,15 +1794,20 @@ mod tests {
             &db,
             "credentialed_external_action",
             UpsertPendingApproval {
-                request_id: "tunnel:sess:8100".into(),
+                request_id: "tunnel:sess:8100:nonce-1".into(),
                 payload: json!({
                     "kind": "tunnel",
                     "provider": "cloudflared",
                     "host_port": 8100,
                     "upstream": "http://127.0.0.1:8100",
+                    "preview_nonce": "nonce-1",
+                    "preview_name": "shop-demo",
                 }),
                 agent_group_id: Some(ag),
-                title: "Expose this preview to the public internet?".into(),
+                // M24 S1 (b): the card names the app, host port, and session.
+                title: "Expose preview \"shop-demo\" (host port 8100, session sess) \
+                        to the public internet?"
+                    .into(),
                 options: vec![],
                 ..Default::default()
             },
@@ -1727,9 +1834,12 @@ mod tests {
             &db,
             "credentialed_external_action",
             UpsertPendingApproval {
-                request_id: "tunnel:sess:8101".into(),
+                request_id: "tunnel:sess:8101:nonce-2".into(),
                 payload: json!({"kind": "tunnel", "host_port": 8101}),
-                title: "Expose this preview to the public internet?".into(),
+                // M24 S1 (b): the card names the host port and session.
+                title: "Expose the preview on host port 8101 (session sess) to the \
+                        public internet?"
+                    .into(),
                 options: vec![],
                 ..Default::default()
             },
@@ -2269,6 +2379,124 @@ mod tests {
                 request_id: "r-noag".into(),
                 payload: json!({"apt": ["jq"]}),
                 agent_group_id: None,
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    // ── M24 S4: taint_clearance apply arm ───────────────────────────────────
+
+    /// Insert a pending `taint_clearance` row shaped exactly like the delivery
+    /// service raises it (host-computed `session_dir` + `allowed_root`).
+    fn insert_taint_clearance(
+        db: &CentralDb,
+        session_id: &str,
+        session_dir: &std::path::Path,
+        allowed_root: &std::path::Path,
+    ) -> copperclaw_types::ApprovalId {
+        insert_pending(
+            db,
+            "taint_clearance",
+            UpsertPendingApproval {
+                request_id: format!("taint-clearance:{session_id}"),
+                payload: json!({
+                    "tool": "install_packages",
+                    "taint_source": "web_fetch",
+                    "session_id": session_id,
+                    "session_dir": session_dir.to_string_lossy(),
+                    "allowed_root": allowed_root.to_string_lossy(),
+                }),
+                title: "Taint clearance: install_packages".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn approve_taint_clearance_writes_single_turn_clearance_file() {
+        let db = db();
+        let td = tempfile::tempdir().unwrap();
+        let sessions_root = td.path().join("sessions");
+        let sid = uuid::Uuid::now_v7().to_string();
+        let session_dir = sessions_root.join("ag-1").join(&sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let id = insert_taint_clearance(&db, &sid, &session_dir, &sessions_root);
+        let before = chrono::Utc::now();
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "taint_clearance");
+        assert_eq!(v["side_effect"]["tool"], "install_packages");
+
+        // The clearance landed, in exactly the shape the runner's
+        // `consume_taint_clearance` reads: session-scoped, ~1h expiry,
+        // audit fields naming who approved and what was blocked.
+        let path = session_dir.join("taint_clearance.json");
+        let clearance: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(clearance["session_id"], sid);
+        assert_eq!(clearance["tool"], "install_packages");
+        assert_eq!(clearance["taint_source"], "web_fetch");
+        assert_eq!(clearance["approved_by"], "host");
+        let expires_at: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(clearance["expires_at"].clone()).unwrap();
+        let ttl = expires_at - before;
+        assert!(
+            ttl > chrono::Duration::minutes(55) && ttl <= chrono::Duration::minutes(65),
+            "clearance TTL must mirror the ~1h approval TTL, got {ttl:?}"
+        );
+    }
+
+    #[test]
+    fn approve_taint_clearance_rejects_containment_escape() {
+        // A session_dir outside the sessions root (a tampered payload) must be
+        // refused — nothing written, row left pending.
+        let db = db();
+        let td = tempfile::tempdir().unwrap();
+        let sessions_root = td.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let outside = td.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let sid = uuid::Uuid::now_v7().to_string();
+        let id = insert_taint_clearance(&db, &sid, &outside, &sessions_root);
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("escapes"), "got: {}", err.message);
+        assert!(!outside.join("taint_clearance.json").exists());
+    }
+
+    #[test]
+    fn approve_taint_clearance_for_missing_session_dir_is_refused() {
+        // The session dir is gone (session deleted): the clearance has nothing
+        // to clear and must not resurrect the directory.
+        let db = db();
+        let td = tempfile::tempdir().unwrap();
+        let sessions_root = td.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let sid = uuid::Uuid::now_v7().to_string();
+        let gone = sessions_root.join("ag-1").join(&sid);
+
+        let id = insert_taint_clearance(&db, &sid, &gone, &sessions_root);
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn approve_taint_clearance_missing_payload_fields_is_bad_request() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "taint_clearance",
+            UpsertPendingApproval {
+                request_id: "taint-clearance:incomplete".into(),
+                payload: json!({"tool": "web_fetch"}),
                 title: "x".into(),
                 options: vec![],
                 ..Default::default()

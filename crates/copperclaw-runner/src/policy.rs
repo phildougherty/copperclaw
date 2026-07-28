@@ -617,7 +617,10 @@ pub struct TurnTrust {
     /// untrusted memory hit) has entered this turn's context.
     pub tainted: bool,
     /// True when the operator has granted a fresh approval for credentialed
-    /// external actions on this (tainted) turn. Clears the taint block.
+    /// external actions on this (tainted) turn. Clears the taint block. Live
+    /// source (M24 S4): the host-written single-turn clearance
+    /// (`taint_clearance.json`) consumed by `run_loop` at turn start — see
+    /// `run::consume_taint_clearance`. Never true on an autonomous turn.
     pub approved: bool,
     /// True when this is an autonomous turn (heartbeat / scheduled wake) with
     /// no triggering human message — read-then-propose only.
@@ -752,7 +755,7 @@ impl ToolPolicy {
             {
                 copperclaw_metrics::inc_policy_denied("provenance", tool);
                 return PolicyDecision::Deny(format!(
-                    "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh approval is required before a credentialed external action can run on a tainted turn."
+                    "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh operator approval is required: an approval request has been filed for this action. Tell the user what you were blocked from doing and that once they approve it (the approval card, or `cclaw approvals approve-id <id>`) the clearance covers exactly ONE turn — retry the action on your next turn after approval."
                 ));
             }
         }

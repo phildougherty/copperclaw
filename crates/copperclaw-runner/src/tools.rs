@@ -221,8 +221,13 @@ pub struct RunnerToolCtx {
     autonomous_turn: Arc<std::sync::atomic::AtomicBool>,
     /// Whether a fresh operator approval has cleared the provenance taint for
     /// credentialed external actions on this turn. Set per-turn by `run_loop`
-    /// via [`Self::set_turn_provenance`] (today always `false` — the live
-    /// approval wiring is a host follow-up; see the module / policy docs).
+    /// via [`Self::set_turn_provenance`]: `true` only when the host-written,
+    /// single-turn taint clearance (`taint_clearance.json`, M24 S4 — written
+    /// by the host when an operator approves the runner's
+    /// `taint_approval_request`) was consumed at this turn's start; always
+    /// `false` for autonomous turns. Cleared again on the next turn — the
+    /// clearance file is deleted on consumption, so an approval covers
+    /// exactly one turn.
     external_approved: Arc<std::sync::atomic::AtomicBool>,
     /// M18 R3 verification gate: whether the `todo_update(completed)`
     /// gate is enforced for this session. Set by

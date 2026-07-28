@@ -1066,13 +1066,17 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         // action UNLESS a live, human-approved capability grant (M22 A1) for the
         // firing task permits that specific action (M22 A2, decision (b)).
         //
-        // `set_turn_provenance`'s `approved` stays wired `false`: it is the
-        // *blanket* taint-clearing bool and must never be flipped on for an
-        // autonomous turn. The grant is capability-scoped, never blanket — the
-        // per-call decision (which action is pre-authorized, and consuming its
-        // fire) lives in `tool_dispatch::invoke_tool`, which reads
-        // `deps.active_grant`. Here we resolve the firing task's grant snapshot
-        // and stash it (or clear it for a human turn).
+        // `set_turn_provenance`'s `approved` (the *blanket* taint-clearing
+        // bool) has exactly one live source: a host-written, single-turn
+        // taint clearance (`taint_clearance.json`, M24 S4) consumed here at
+        // turn start — the fresh-approval route the taint gate's deny text
+        // promises. It must never flip on for an autonomous turn: the grant is
+        // capability-scoped, never blanket — the per-call decision (which
+        // action is pre-authorized, and consuming its fire) lives in
+        // `tool_dispatch::invoke_tool`, which reads `deps.active_grant`. Here
+        // we resolve the firing task's grant snapshot and stash it (or clear
+        // it for a human turn), and consume any pending taint clearance for a
+        // human turn.
         let autonomous = !formatted
             .rows
             .iter()
@@ -1091,8 +1095,15 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             // Reset the per-turn fire latch, then install this turn's grant.
             gate.fire_consumed = false;
             gate.grant = grant;
+            // Reset the per-turn taint bookkeeping (M24 S4) so this turn's
+            // taint source / approval card are tracked fresh.
+            gate.taint_source = None;
+            gate.taint_request_emitted = false;
         }
-        deps.tool_ctx.set_turn_provenance(autonomous, false);
+        let external_approved = !autonomous
+            && consume_taint_clearance(&deps.compaction.data_root, deps.session_id, Utc::now());
+        deps.tool_ctx
+            .set_turn_provenance(autonomous, external_approved);
 
         // Surface child-agent failure notices to the user channel
         // BEFORE the parent's LLM picks them up. Without this the
@@ -1286,6 +1297,76 @@ fn build_inbound_context_block(
 /// (companion plumbing — see the A2 security review); the runner reads it at
 /// turn start. Absent file ⇒ no grant ⇒ the autonomy brake stays closed.
 pub(super) const GRANT_SNAPSHOT_FILENAME: &str = "grant.json";
+
+/// M24 S4: filename of the host-written single-turn taint clearance, sitting
+/// alongside `grant.json` under the session data root (`/data` in-container).
+/// The host's approvals handler writes it when an operator approves a
+/// `taint_clearance` pending approval (raised from the runner's
+/// `taint_approval_request` System row); [`consume_taint_clearance`] reads AND
+/// DELETES it at turn start, so an approval clears exactly one turn. Absent
+/// file means no clearance and the taint gate stays closed.
+pub(super) const TAINT_CLEARANCE_FILENAME: &str = "taint_clearance.json";
+
+/// On-disk shape of [`TAINT_CLEARANCE_FILENAME`]. MUST match the host's
+/// `handlers::approvals::apply_taint_clearance` writer field-for-field (the
+/// host crate doesn't depend on this one — same circular-dep rationale as the
+/// grant snapshot). Extra fields (`tool`, `taint_source`, `approved_by`,
+/// `approved_at`) are operator-audit context and ignored here.
+#[derive(Debug, serde::Deserialize)]
+struct TaintClearance {
+    /// The session this clearance was approved for. Re-verified against the
+    /// runner's own session id so a clearance copied from another session's
+    /// dir can never authorize this one.
+    session_id: String,
+    /// Hard expiry (the host stamps ~1h from approval, mirroring the pending-
+    /// approval TTL). An expired clearance reads as no clearance.
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Consume the single-turn taint clearance for this session, if one is
+/// pending. Returns `true` — `external_approved` for exactly this turn — only
+/// when the host-written clearance file exists, parses, names THIS session,
+/// and has not expired at `now`. The file is REMOVED whenever it is present
+/// (valid, expired, foreign, or malformed alike), so the clearance can never
+/// cover more than one turn and a bad file cannot linger. Every failure path
+/// returns `false` — the taint gate fails closed.
+fn consume_taint_clearance(
+    data_root: &std::path::Path,
+    session_id: copperclaw_types::SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let path = data_root.join(TAINT_CLEARANCE_FILENAME);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    // Single-turn: whatever the file says, it is spent the moment we read it.
+    if let Err(err) = std::fs::remove_file(&path) {
+        // An unremovable clearance would re-approve every turn; refuse it.
+        tracing::warn!(?err, path = %path.display(), "taint clearance remove failed; ignoring clearance");
+        return false;
+    }
+    let clearance: TaintClearance = match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(?err, "taint clearance unparseable; ignoring");
+            return false;
+        }
+    };
+    if clearance.session_id != session_id.as_uuid().to_string() {
+        tracing::warn!(
+            clearance_session = %clearance.session_id,
+            own_session = %session_id.as_uuid(),
+            "taint clearance names a different session; ignoring"
+        );
+        return false;
+    }
+    if now >= clearance.expires_at {
+        tracing::info!("taint clearance expired; ignoring");
+        return false;
+    }
+    tracing::info!("taint clearance consumed; external actions approved for this turn");
+    true
+}
 
 /// The task id that fired this autonomous turn, if any. A scheduled fire is a
 /// `kind: Task` inbound row carrying `content.task_id` (and `series_id = task
@@ -4819,5 +4900,84 @@ mod tests {
         g.fires_remaining = Some(0);
         write_grant_snapshot(tmp.path(), &g);
         assert!(load_turn_grant(tmp.path(), Some("t-1"), Utc::now()).is_none());
+    }
+
+    // ── M24 S4: single-turn taint clearance consumption ─────────────────────
+
+    /// Write a taint clearance file into `dir` with the host's on-disk shape.
+    fn write_clearance(dir: &std::path::Path, session: &str, expires_at: chrono::DateTime<Utc>) {
+        let clearance = serde_json::json!({
+            "session_id": session,
+            "tool": "install_packages",
+            "taint_source": "web_fetch",
+            "approved_by": "host",
+            "approved_at": Utc::now(),
+            "expires_at": expires_at,
+        });
+        std::fs::write(
+            dir.join(TAINT_CLEARANCE_FILENAME),
+            serde_json::to_vec_pretty(&clearance).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn consume_taint_clearance_valid_approves_one_turn_and_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = copperclaw_types::SessionId::new();
+        write_clearance(
+            tmp.path(),
+            &sid.as_uuid().to_string(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        // First consume: approved for this turn, file spent.
+        assert!(consume_taint_clearance(tmp.path(), sid, Utc::now()));
+        assert!(
+            !tmp.path().join(TAINT_CLEARANCE_FILENAME).exists(),
+            "clearance must be deleted on consumption (single-turn)"
+        );
+        // Second turn: no clearance left — external_approved is false again.
+        assert!(!consume_taint_clearance(tmp.path(), sid, Utc::now()));
+    }
+
+    #[test]
+    fn consume_taint_clearance_expired_is_ignored_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = copperclaw_types::SessionId::new();
+        write_clearance(
+            tmp.path(),
+            &sid.as_uuid().to_string(),
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+        assert!(!consume_taint_clearance(tmp.path(), sid, Utc::now()));
+        assert!(!tmp.path().join(TAINT_CLEARANCE_FILENAME).exists());
+    }
+
+    #[test]
+    fn consume_taint_clearance_foreign_session_is_ignored_and_removed() {
+        // A clearance copied from another session's dir must never authorize
+        // this one (session-scoped).
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = copperclaw_types::SessionId::new();
+        write_clearance(
+            tmp.path(),
+            &foreign.as_uuid().to_string(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let own = copperclaw_types::SessionId::new();
+        assert!(!consume_taint_clearance(tmp.path(), own, Utc::now()));
+        assert!(!tmp.path().join(TAINT_CLEARANCE_FILENAME).exists());
+    }
+
+    #[test]
+    fn consume_taint_clearance_absent_or_malformed_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = copperclaw_types::SessionId::new();
+        // No file → closed gate.
+        assert!(!consume_taint_clearance(tmp.path(), sid, Utc::now()));
+        // Malformed file → closed gate, file removed.
+        std::fs::write(tmp.path().join(TAINT_CLEARANCE_FILENAME), b"not json").unwrap();
+        assert!(!consume_taint_clearance(tmp.path(), sid, Utc::now()));
+        assert!(!tmp.path().join(TAINT_CLEARANCE_FILENAME).exists());
     }
 }

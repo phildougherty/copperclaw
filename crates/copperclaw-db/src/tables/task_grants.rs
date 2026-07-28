@@ -117,6 +117,36 @@ pub struct TaskGrant {
     pub updated_at: DateTime<Utc>,
 }
 
+impl TaskGrant {
+    /// Operator-facing liveness summary at `now`, mirroring the gates
+    /// [`effective_grant`] applies (in the same precedence order):
+    /// `"revoked"`, `"expired"`, `"exhausted"` (token budget or fires spent),
+    /// or `"live"`. Purely descriptive — enforcement stays in
+    /// [`effective_grant`].
+    #[must_use]
+    pub fn effective_status(&self, now: DateTime<Utc>) -> &'static str {
+        if self.status != GrantStatus::Approved || self.revoked_at.is_some() {
+            return "revoked";
+        }
+        if let Some(exp) = self.expires_at {
+            if now >= exp {
+                return "expired";
+            }
+        }
+        if let Some(budget) = self.token_budget {
+            if self.tokens_consumed >= budget {
+                return "exhausted";
+            }
+        }
+        if let Some(max) = self.max_fires {
+            if self.fires_consumed >= max {
+                return "exhausted";
+            }
+        }
+        "live"
+    }
+}
+
 /// Insert spec for an already-APPROVED grant. There is deliberately no
 /// "insert pending" path here — the pending state is the `pending_approvals`
 /// row; a `task_grants` row exists only after a human approved it.
@@ -334,6 +364,57 @@ pub fn list_for_task(db: &CentralDb, task_id: &str) -> Result<Vec<TaskGrant>, Db
     ))?;
     let rows = stmt.query_map(params![task_id], row_to_grant)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One grant joined with its owning task's identity — the operator-facing
+/// `grants.list` row. Grants belong to tasks, and tasks to agent groups, so
+/// the group filter goes through the join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantWithTask {
+    pub grant: TaskGrant,
+    /// The owning task's human name (tasks may be unnamed).
+    pub task_name: Option<String>,
+    /// The owning task's agent group (uuid string, as stored).
+    pub agent_group_id: String,
+    /// The owning task's session (uuid string, as stored).
+    pub session_id: String,
+}
+
+/// All grants (any status), joined with their owning task, newest first.
+/// `agent_group_id` narrows to one group's grants; `None` lists every group.
+/// Powers the host's `grants.list` handler (M24 S3).
+pub fn list_with_tasks(
+    db: &CentralDb,
+    agent_group_id: Option<&str>,
+) -> Result<Vec<GrantWithTask>, DbError> {
+    let conn = db.conn()?;
+    let base = "SELECT g.id, g.task_id, g.capability_scope, g.token_budget, g.tokens_consumed,
+                g.max_fires, g.fires_consumed, g.expires_at, g.granted_by, g.status,
+                g.approved_at, g.revoked_at, g.created_at, g.updated_at,
+                t.name AS task_name, t.agent_group_id AS task_agent_group_id,
+                t.session_id AS task_session_id
+           FROM task_grants g
+           JOIN tasks t ON t.id = g.task_id";
+    let map = |row: &Row<'_>| -> rusqlite::Result<GrantWithTask> {
+        Ok(GrantWithTask {
+            grant: row_to_grant(row)?,
+            task_name: row.get("task_name")?,
+            agent_group_id: row.get("task_agent_group_id")?,
+            session_id: row.get("task_session_id")?,
+        })
+    };
+    let rows = if let Some(ag) = agent_group_id {
+        let mut stmt = conn.prepare(&format!(
+            "{base} WHERE t.agent_group_id = ?1 ORDER BY g.created_at DESC"
+        ))?;
+        let rows = stmt.query_map(params![ag], map)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(&format!("{base} ORDER BY g.created_at DESC"))?;
+        let rows = stmt.query_map([], map)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
 }
 
 /// Revoke a grant: flip `status` → `Revoked` and stamp `revoked_at`. After this
@@ -720,6 +801,112 @@ mod tests {
             consume_tokens(&db, "g-1", -5, Utc::now()).unwrap_err(),
             DbError::Invariant(_)
         ));
+    }
+
+    // -- list_with_tasks + effective_status (M24 S3 operator surface) --------
+
+    /// Seed a task in its own uniquely-named agent group (the shared
+    /// `seed_task` helper hardcodes the group folder, and folders are UNIQUE).
+    fn seed_task_in_new_group(db: &CentralDb, id: &str) -> String {
+        let ag: AgentGroupId = create_ag(
+            db,
+            CreateAgentGroup {
+                name: format!("g-{id}"),
+                folder: format!("g-{id}"),
+                agent_provider: None,
+            },
+        )
+        .unwrap()
+        .id;
+        tasks::insert(
+            db,
+            NewTask {
+                id: id.into(),
+                agent_group_id: ag,
+                session_id: SessionId::new(),
+                name: Some("standup".into()),
+                prompt: "post standup".into(),
+                when_spec: "daily at 09:00".into(),
+                recurrence: Some("0 9 * * *".into()),
+                next_fire: Some(Utc::now() + chrono::Duration::hours(1)),
+            },
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    #[test]
+    fn list_with_tasks_joins_task_identity_and_filters_by_group() {
+        let db = db();
+        // Two tasks in two different groups.
+        let t1 = seed_task_in_new_group(&db, "t-1");
+        let t2 = seed_task_in_new_group(&db, "t-2");
+        insert_approved(&db, new_grant("g-1", &t1, "send_message:telegram")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        insert_approved(&db, new_grant("g-2", &t2, "web_fetch")).unwrap();
+
+        // Unfiltered: both grants, newest first, with task identity attached.
+        let all = list_with_tasks(&db, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].grant.id, "g-2");
+        assert_eq!(all[1].grant.id, "g-1");
+        assert_eq!(all[1].task_name.as_deref(), Some("standup"));
+        assert!(!all[0].agent_group_id.is_empty());
+        assert!(!all[0].session_id.is_empty());
+        assert_ne!(all[0].agent_group_id, all[1].agent_group_id);
+
+        // Filtered by t1's group: only g-1.
+        let g1_group = all[1].agent_group_id.clone();
+        let filtered = list_with_tasks(&db, Some(&g1_group)).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].grant.id, "g-1");
+
+        // Unknown group: empty, not an error.
+        assert!(
+            list_with_tasks(&db, Some("no-such-group"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn effective_status_reports_each_inert_reason() {
+        let db = db();
+        let t = seed_task(&db, "t-1");
+        let now = Utc::now();
+
+        // Live.
+        insert_approved(&db, new_grant("g-live", &t, "web_fetch")).unwrap();
+        let g = get(&db, "g-live").unwrap().unwrap();
+        assert_eq!(g.effective_status(now), "live");
+
+        // Revoked wins over everything else.
+        revoke(&db, "g-live", now).unwrap();
+        let g = get(&db, "g-live").unwrap().unwrap();
+        assert_eq!(g.effective_status(now), "revoked");
+
+        // Expired.
+        let mut spec = new_grant("g-exp", &t, "web_fetch");
+        spec.expires_at = Some(now - chrono::Duration::minutes(1));
+        insert_approved(&db, spec).unwrap();
+        let g = get(&db, "g-exp").unwrap().unwrap();
+        assert_eq!(g.effective_status(now), "expired");
+
+        // Exhausted fires.
+        let mut spec = new_grant("g-fires", &t, "web_fetch");
+        spec.max_fires = Some(1);
+        insert_approved(&db, spec).unwrap();
+        consume_fire(&db, "g-fires", now).unwrap();
+        let g = get(&db, "g-fires").unwrap().unwrap();
+        assert_eq!(g.effective_status(now), "exhausted");
+
+        // Exhausted token budget.
+        let mut spec = new_grant("g-tokens", &t, "web_fetch");
+        spec.token_budget = Some(10);
+        insert_approved(&db, spec).unwrap();
+        consume_tokens(&db, "g-tokens", 10, now).unwrap();
+        let g = get(&db, "g-tokens").unwrap().unwrap();
+        assert_eq!(g.effective_status(now), "exhausted");
     }
 
     // -- capability_scope matching (A2's contract) --------------------------

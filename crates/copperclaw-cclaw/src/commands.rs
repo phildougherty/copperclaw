@@ -220,6 +220,16 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: BudgetsCmd,
     },
+    /// Task capability grants — the standing, bounded authorizations that
+    /// let an autonomous (scheduled/heartbeat) task fire take real external
+    /// actions. `list` shows every grant with its task, scope, bounds and
+    /// liveness; `revoke` withdraws one immediately (the revocation is
+    /// effective in the central DB at once and reaches the runner's autonomy
+    /// gate no later than the next fire attempt).
+    Grants {
+        #[command(subcommand)]
+        action: GrantsCmd,
+    },
     /// Per-group token usage rollup.
     Usage {
         /// Look-back window. Same format as `audit list --since`.
@@ -1199,6 +1209,27 @@ pub enum BudgetsCmd {
     },
 }
 
+/// `cclaw grants ...` — task capability grants (list + revoke).
+#[derive(Debug, Subcommand)]
+pub enum GrantsCmd {
+    /// List task capability grants, newest first: owning task, capability
+    /// scope, token/fire bounds and consumption, expiry, and effective
+    /// status (`live|revoked|expired|exhausted`).
+    List {
+        /// Narrow to one agent group's grants.
+        #[arg(long)]
+        agent_group_id: Option<String>,
+    },
+    /// Revoke a grant by id. Takes effect immediately in the central DB
+    /// (`effective_grant` reads the task inert) and the host withdraws the
+    /// session's `grant.json` in the same call, so the runner's autonomy
+    /// gate is closed no later than the next fire attempt.
+    Revoke {
+        /// The grant id (as shown by `cclaw grants list`).
+        id: String,
+    },
+}
+
 /// `cclaw audit ...` — read the mutation audit log.
 #[derive(Debug, Subcommand)]
 pub enum AuditCmd {
@@ -1284,6 +1315,7 @@ impl TopCommand {
             Self::Audit { action } => action.to_call(),
             Self::Attestation { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
+            Self::Grants { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
             Self::Db { action } => action.to_call(),
             Self::Mcp { action } => action.to_call(),
@@ -1930,6 +1962,19 @@ impl BudgetsCmd {
     }
 }
 
+impl GrantsCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { agent_group_id } => {
+                let mut o = Map::new();
+                insert_opt(&mut o, "agent_group_id", agent_group_id.clone());
+                ParsedCall::new("grants.list", Value::Object(o))
+            }
+            Self::Revoke { id } => ParsedCall::new("grants.revoke", json!({ "id": id })),
+        }
+    }
+}
+
 /// All `command` strings this binary can emit. Useful for the host to
 /// register matching handlers; also referenced by tests in this crate.
 pub const ALL_COMMANDS: &[&str] = &[
@@ -2003,6 +2048,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "attestation.list",
     "budgets.list",
     "budgets.set",
+    "grants.list",
+    "grants.revoke",
     "usage.rollup",
     "schema.version",
     "egress.status",
@@ -3109,6 +3156,8 @@ mod tests {
                 "--turns-per-hour",
                 "60",
             ],
+            &["cclaw", "grants", "list"],
+            &["cclaw", "grants", "revoke", "grant-1"],
             &["cclaw", "usage"],
             &["cclaw", "schema-version"],
             &["cclaw", "egress"],
@@ -3320,6 +3369,34 @@ mod tests {
     #[test]
     fn schema_version_is_in_all_commands() {
         assert!(ALL_COMMANDS.contains(&"schema.version"));
+    }
+
+    // --- grants (M24 S3) ---------------------------------------------------
+
+    #[test]
+    fn grants_list_no_filter() {
+        let p = parse(&["cclaw", "grants", "list"]);
+        assert_eq!(p.command, "grants.list");
+        assert_eq!(p.args, json!({}));
+    }
+
+    #[test]
+    fn grants_list_with_group_filter() {
+        let p = parse(&["cclaw", "grants", "list", "--agent-group-id", "ag-1"]);
+        assert_eq!(p.command, "grants.list");
+        assert_eq!(p.args, json!({"agent_group_id": "ag-1"}));
+    }
+
+    #[test]
+    fn grants_revoke_takes_positional_id() {
+        let p = parse(&["cclaw", "grants", "revoke", "grant-42"]);
+        assert_eq!(p.command, "grants.revoke");
+        assert_eq!(p.args, json!({"id": "grant-42"}));
+    }
+
+    #[test]
+    fn grants_revoke_requires_id() {
+        parse_err(&["cclaw", "grants", "revoke"]);
     }
 
     // --- budgets rate-limit flags ------------------------------------------

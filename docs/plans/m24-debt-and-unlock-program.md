@@ -41,7 +41,17 @@ debt, each verified against code, not prose:
   `Backend::LanguageServerAssisted` reads as what it is (a recorded
   server hint over a ctags index), comments only.
 
-## Wave 2 — security debt
+## Wave 2 — security debt (LANDED)
+
+All four cards landed together: S1 nonce-keyed tunnel approvals with
+consume-before-stand-up, legible cards, the `preview_enabled` kill
+switch, and the conditional `Secure` cookie; S2 enforcing the stored
+`unknown_sender_policy` value set (`open` admits; everything else,
+including unrecognized values, stays pending); S3 `grants.list`/
+`grants.revoke` + `cclaw grants` with eager snapshot withdrawal; S4 the
+full tappable-card taint-clearance loop (request row -> pending
+approval + card -> single-turn session-scoped clearance file,
+consume-and-delete). Details per card below.
 
 - **S1 Tunnel hardening (M19 A3 trio + cookie).** (a) Key the
   public-tunnel approval on a per-request nonce instead of the

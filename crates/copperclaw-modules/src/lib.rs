@@ -43,7 +43,7 @@ pub use agent_to_agent::{
 };
 pub use approvals::{
     ApprovalSummary, ApprovalsModule, DecisionOutcome, DecisionRecord, NewPendingCtx,
-    NewPendingNotifier, PairingNotifier,
+    NewPendingNotifier, PairingNotifier, UnknownSenderPolicy, UnknownSenderPolicyLookup,
 };
 pub use context::{
     ApprovalInterceptCtx, ApprovalInterceptDecision, ApprovalInterceptor, ChannelRequestCtx,

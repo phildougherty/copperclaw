@@ -91,10 +91,12 @@ impl TurnGrant {
     }
 }
 
-/// Per-turn autonomy-gate state stashed on [`RunnerDeps::active_grant`].
+/// Per-turn dispatch-gate state stashed on [`RunnerDeps::active_grant`]:
+/// the autonomy grant (M22 A2) plus the taint-clearance bookkeeping (M24 S4).
 /// `run_loop` rewrites it at the top of every turn (the grant for an
 /// autonomous fire, or `None` for a human turn), resetting `fire_consumed` so
-/// each fire is charged at most once.
+/// each fire is charged at most once and clearing the taint fields so each
+/// turn's taint provenance is tracked fresh.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GrantGateState {
     /// The live grant governing this autonomous turn, or `None` when the turn
@@ -103,6 +105,15 @@ pub struct GrantGateState {
     /// Set once this turn has charged its one fire against the grant, so a
     /// multi-action turn consumes exactly one fire (a fire = one turn).
     pub fire_consumed: bool,
+    /// The name of the tool whose result first tainted this turn's context
+    /// (e.g. `web_fetch`, `memory_search`, an `mcp__*` external tool). Recorded
+    /// by [`invoke_tool`]'s before/after taint observation so the operator's
+    /// approval card can name the taint source. `None` until the turn taints.
+    pub taint_source: Option<String>,
+    /// Set once this turn has emitted its one `taint_approval_request` System
+    /// row, so a model retrying the blocked action within the same turn does
+    /// not stack approval cards.
+    pub taint_request_emitted: bool,
 }
 
 /// Map a model-requested tool call to the capability token the autonomy gate
@@ -247,12 +258,106 @@ async fn charge_grant_fire_once(deps: &RunnerDeps, grant: &TurnGrant) {
     }
 }
 
+/// M24 S4: was the taint gate the DECIDING policy layer for a denied call?
+///
+/// True only when the turn is tainted, unapproved, and non-autonomous AND the
+/// same policy with the taint cleared (`approved = true`) would ALLOW the call
+/// — i.e. no earlier layer (role / skill / profile) would have blocked it
+/// anyway, and the autonomy block (which fresh approval never lifts) is not in
+/// play. This is the exact set of denials a fresh operator approval can
+/// actually unblock, so it is the exact set worth raising an approval card
+/// for.
+fn taint_was_deciding_layer(policy: &crate::policy::ToolPolicy, tool: &str) -> bool {
+    let trust = policy.trust();
+    if !trust.tainted || trust.approved || trust.autonomous {
+        return false;
+    }
+    let cleared = policy.clone().with_trust(crate::policy::TurnTrust {
+        approved: true,
+        ..trust
+    });
+    matches!(cleared.evaluate(tool), PolicyDecision::Allow)
+}
+
+/// M24 S4: emit ONE `taint_approval_request` System row for this turn — the
+/// runner's half of the fresh-approval route the taint gate promises. The
+/// host's delivery loop turns it into a pending approval + approve/deny card
+/// (mirroring `save_skill`'s flow); an operator approval writes a single-turn
+/// clearance file (`taint_clearance.json`) into the session dir, which
+/// `run_loop` consumes at the start of the NEXT turn as
+/// `external_approved = true`. Deduped per turn via the gate-state latch so a
+/// model retrying the blocked action doesn't stack cards. Best-effort: a
+/// failed emit must not abort the turn (the deny already stands on its own).
+async fn emit_taint_approval_request(deps: &RunnerDeps, tool: &str) {
+    use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
+    let taint_source = {
+        let mut gate = match deps.active_grant.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if gate.taint_request_emitted {
+            return;
+        }
+        gate.taint_request_emitted = true;
+        gate.taint_source
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let payload = serde_json::json!({
+        "taint_approval_request": {
+            "tool": tool,
+            "taint_source": taint_source,
+        }
+    });
+    let row = WriteOutbound {
+        id: copperclaw_types::MessageId::new(),
+        in_reply_to: None,
+        timestamp: Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: copperclaw_types::MessageKind::System,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        content: payload,
+    };
+    let outbound = deps.outbound.lock().await;
+    if let Err(err) = insert_out(&outbound, &row) {
+        tracing::warn!(?err, %tool, "taint_approval_request insert failed");
+    }
+}
+
 /// Execute one tool call against the runner's tool map. Returns
 /// `(content, images, is_error)`: the text for the `HistoryMessage::Tool`
 /// row, any image blocks the tool returned (each becomes a follow-on
 /// `HistoryMessage::Image` so vision models can see them), and whether
 /// the call errored.
+///
+/// Thin taint-provenance wrapper over [`invoke_tool_inner`] (M24 S4): observes
+/// the context's taint flag before and after the dispatch and records the name
+/// of the FIRST call that flipped it on the per-turn gate state, so a
+/// subsequent taint-blocked action can name its taint source on the approval
+/// card. Every dispatch path (local tool, external MCP, preview relay) funnels
+/// through here, so the observation covers them all.
 pub(super) async fn invoke_tool(
+    deps: &RunnerDeps,
+    call: &PendingToolCall,
+) -> (String, Vec<ToolImage>, bool) {
+    let tainted_before = deps.tool_ctx.is_context_tainted();
+    let out = invoke_tool_inner(deps, call).await;
+    if !tainted_before && deps.tool_ctx.is_context_tainted() {
+        let mut gate = match deps.active_grant.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if gate.taint_source.is_none() {
+            gate.taint_source = Some(call.name.clone());
+        }
+    }
+    out
+}
+
+async fn invoke_tool_inner(
     deps: &RunnerDeps,
     call: &PendingToolCall,
 ) -> (String, Vec<ToolImage>, bool) {
@@ -338,6 +443,13 @@ pub(super) async fn invoke_tool(
         .with_trust(trust);
     if let PolicyDecision::Deny(reason) = policy.evaluate(&call.name) {
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
+        // M24 S4: when the taint gate (and only the taint gate) blocked this
+        // call, raise the fresh-approval route the deny text promises — one
+        // structured approval request per turn, which the host turns into an
+        // operator card whose approval clears exactly one future turn.
+        if taint_was_deciding_layer(&policy, &call.name) {
+            emit_taint_approval_request(deps, &call.name).await;
+        }
         return (reason, Vec::new(), true);
     }
     // A2: a granted autonomous action survived every policy layer and is about
@@ -890,6 +1002,71 @@ mod tests {
         assert!(
             !mem.contains("untrusted-provenance"),
             "memory_search must stay reachable on a tainted turn; got: {mem}"
+        );
+    }
+
+    // ── M24 S4: taint-blocked action emits ONE structured approval request ──
+
+    /// Collect the `taint_approval_request` payloads the runner emitted to
+    /// `outbound`.
+    async fn taint_request_rows(deps: &RunnerDeps) -> Vec<serde_json::Value> {
+        let conn = deps.outbound.lock().await;
+        messages_out::list_due(&conn)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r.content.get("taint_approval_request").cloned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn taint_blocked_action_emits_one_approval_request_naming_source() {
+        // The fresh-approval route: a taint-blocked credentialed action must
+        // emit a structured `taint_approval_request` System row naming the
+        // blocked tool AND the tool whose result tainted the turn — and only
+        // ONE row per turn, however often the model retries.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        // Taint through the real dispatch path so the before/after observation
+        // records web_search as the taint source.
+        let _ = invoke_tool(
+            &deps,
+            &call_with("web_search", serde_json::json!({"query": "x"})),
+        )
+        .await;
+        assert!(ctx.is_context_tainted());
+        assert_eq!(
+            deps.active_grant.lock().unwrap().taint_source.as_deref(),
+            Some("web_search"),
+            "the first tainting call must be recorded as the taint source"
+        );
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(is_error && blocked.contains("untrusted-provenance"));
+        let rows = taint_request_rows(&deps).await;
+        assert_eq!(rows.len(), 1, "exactly one approval request per turn");
+        assert_eq!(rows[0]["tool"], "install_packages");
+        assert_eq!(rows[0]["taint_source"], "web_search");
+        // A retry within the same turn must NOT stack a second request.
+        let (_again, _i, _e) = invoke_tool(&deps, &call("install_packages")).await;
+        assert_eq!(taint_request_rows(&deps).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_taint_denies_do_not_emit_approval_requests() {
+        // Denies where fresh approval could not help must stay silent:
+        // (a) a profile deny on a clean turn; (b) the autonomy block on an
+        // autonomous turn (a blanket approval never lifts it).
+        let (_tmp, deps) = deps_with_policy(ToolPolicy::new(ToolProfile::Messaging, None));
+        let (_denied, _i, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(taint_request_rows(&deps).await.is_empty());
+
+        let (_tmp2, deps2, ctx2) = deps_with_runner_ctx();
+        ctx2.set_turn_provenance(true, false);
+        ctx2.mark_untrusted_context("web_fetch:https://evil.example");
+        let (blocked, _i, is_error) = invoke_tool(&deps2, &call("install_packages")).await;
+        assert!(is_error, "autonomous turn must block: {blocked}");
+        assert!(
+            taint_request_rows(&deps2).await.is_empty(),
+            "an autonomous deny must not promise a clearance that cannot lift it"
         );
     }
 

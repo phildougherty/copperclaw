@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M24 — security-debt wave)
+
+- **Public-tunnel approvals can no longer be replayed onto a reused
+  port.** The tunnel approval identity now includes a per-preview
+  128-bit nonce (`tunnel:<session>:<port>:<nonce>`), and grant
+  consumption is fail-closed and happens BEFORE stand-up (consume
+  failure aborts; an open failure after consumption spends the grant) —
+  closing M19 review A3 finding 1 (`copperclaw-modules/src/tunnel.rs`).
+- **Tunnel approval cards are legible**: they now name the app, host
+  port, and session instead of a bare "Expose this preview to the
+  public internet?" (A3 finding 2).
+- **`preview_enabled=false` is a real kill switch**: flipping it tears
+  down the group's live previews and fronting tunnels (new
+  `TeardownReason::Disabled`), not just future ones (A3 finding 3).
+- **Preview auth cookie sets `Secure` when fronted by HTTPS**
+  (`X-Forwarded-Proto: https` from the tunnel terminator); plain-HTTP
+  LAN previews keep a non-Secure cookie so browsers accept it.
+- **`unknown_sender_policy` is enforced, not advisory.** The sender
+  gate (`copperclaw-modules/src/approvals.rs`) now reads the stored
+  policy: `open` admits unknown senders without approval; `strict` /
+  `request_approval` / `approval-required` / any unrecognized value
+  fail to the secure pending posture (unchanged default). Wired live in
+  host boot; `cclaw security audit` copy corrected to match.
+- **Task capability grants are operator-revocable.** New `grants.list`
+  / `grants.revoke` wire commands (host-only, audited) and
+  `cclaw grants list|revoke`. Revocation flips the row immediately and
+  eagerly withdraws the session's `grant.json`, so the autonomy gate
+  closes no later than the next fire attempt; the reserved
+  `inc_task_grant("revoked")` metric outcome is now live.
+- **The taint gate's promised fresh-approval route exists.** A
+  credentialed action blocked purely by web-taint now emits one
+  `taint_approval_request` per turn; the host raises a pending approval
+  (1h TTL) with an approve/deny card via the existing intercept flow
+  (or `cclaw approvals approve-id`); approval writes a session-scoped,
+  single-turn `taint_clearance.json` the runner consumes-and-deletes at
+  next turn start, setting `external_approved` for exactly that turn.
+  The stale "today always false" comments and the policy deny text now
+  describe the real route.
+
 ### Fixed (M24 — truth wave)
 
 - **`install-packages` skill no longer denies session-scope installs.**
