@@ -85,23 +85,33 @@ constraints).
   deliberate opt-in exclusion. Goal/condition tools gained real copy in
   `schedule-task`; `list_skills` in `save-skill`/`discovering-tools`.
 
-## Wave 3 — deepen the architect loop
+## Wave 3 — deepen the architect loop (LANDED)
 
-- **W3.1 Design-review critic preset.** `code-review` already suggests a
-  `create_agent` adversarial critic for high-stakes diffs; add the
-  design-level twin — a one-call "review this DESIGN.md + DECISIONS.md
-  against the stated requirements" critic, documented in
-  `skills/architecture`.
-- **W3.2 DECISIONS.md for scaffolds.** Attach seeds DECISIONS.md for
-  cloned repos only; seed it at scaffold time too so greenfield builds
-  start with the decision log the architecture skill assumes.
-  Touch: project-open path in `copperclaw-runner`.
-- **W3.3 Replay fixture.** Add `fixtures/cli/database-build/` driving
-  install-packages → databases → verify-gate over the deterministic
-  pipeline, so run-book regressions surface in CI.
-- **W3.4 Operator visibility.** Surface per-project DECISIONS.md and
-  running-services state in `cclaw` (dashboard or `sessions get`), so
-  the operator sees the architecture the agent committed to.
+- **W3.1 Design-review critic — landed.** `skills/architecture` section 7
+  teaches spawning one `create_agent` design critic before scaffolding
+  (hand it the requirements bullets + DESIGN.md/DECISIONS.md paths —
+  committed first, since a sibling worktree sees only committed content;
+  each finding changes a decision or is recorded as accepted risk);
+  `code-review`'s adversarial section points at the twin.
+- **W3.2 DECISIONS.md for scaffolds — landed.** The runner's post-turn
+  project scan (`auto_attach_in` in `run/project.rs`) now seeds
+  `.copperclaw/DECISIONS.md` for greenfield projects (has `.copperclaw/`
+  state, no `origin` remote, not attached), reusing the attach template
+  via a `SeedKind`; create-only, never overwrites, attach output
+  byte-identical.
+- **W3.3 Replay fixture — landed.** `fixtures/cli/database-build/` +
+  registered test `cli_database_build_installs_packages_and_registers_services`
+  in `crates/copperclaw-host/tests/replay.rs`: asserts the
+  `install_packages` outbound row, the host-side apply into
+  `container_configs.packages_apt`, the services-file write, and the
+  delivered reply. The W2.2 boot hook and W2.4 `db:` stage are unit-
+  tested in the runner instead (the in-process harness has no container
+  boot or listening socket).
+- **W3.4 Operator visibility — landed.** `sessions.get` attaches
+  best-effort `services`, `services_log_tail`, and per-project
+  `decisions` tails (size-capped, secret-redacted, control-chars
+  stripped, withheld from foreign-session agent callers); `cclaw
+  sessions get` renders them as their own sections, `--json` unchanged.
 
 ## Non-goals
 

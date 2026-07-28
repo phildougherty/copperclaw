@@ -44,6 +44,18 @@
 //! exactly the clone case decision (a) describes, with no new tool and no
 //! heuristic guesswork.
 //!
+//! ## M23 W3.2: decision-log seeding for scaffolded projects
+//!
+//! Attach seeds `DECISIONS.md` for *cloned* repos only, but the
+//! architecture skill assumes every project carries a decision log. So the
+//! same scan also seeds `.copperclaw/DECISIONS.md` for *scaffolded*
+//! (origin-less, non-attached) projects the first time their `.copperclaw/`
+//! state dir materialises — which the verify gate creates when the agent
+//! records a verify or an edit marks the project dirty. The seed reuses the
+//! attach template ([`build_decisions_seed`]) with scaffold wording, is
+//! create-only (an existing `DECISIONS.md` is never touched), and is
+//! best-effort — a failed write is logged, never fatal.
+//!
 //! ## Security posture (see `docs/plans/m22-security-reviews.md`, C2)
 //!
 //! The repo is arbitrary external content. This flow therefore **only
@@ -420,30 +432,59 @@ pub fn render_verify_file(stages: &[Stage]) -> String {
 
 // ── DECISIONS.md seed ───────────────────────────────────────────────────
 
+/// How the working project came to exist — selects the wording of the
+/// seeded decision-log header and stage line while both flows share the
+/// same factual body (verify stages, README summary, top-level layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedKind {
+    /// M22 C2: an existing repository the agent cloned (has an origin).
+    Attached,
+    /// M23 W3.2: a greenfield project the agent scaffolded in place.
+    Scaffolded,
+}
+
 /// Build the seeded decision-log lines for `repo`: purely factual, drawn
 /// only from the repo's own README + on-disk structure (never invented).
-/// Returns the lines to append under a small attach header.
-fn build_decisions_seed(repo: &Path, stages: &[Stage]) -> String {
+/// Returns the lines to append under a small kind-specific header.
+fn build_decisions_seed(repo: &Path, stages: &[Stage], kind: SeedKind) -> String {
     let name = repo
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
     let date = chrono::Utc::now().format("%Y-%m-%d");
-    let mut body = format!(
-        "## Attached existing repository ({date})\n\n\
-         - Opened existing repository `{name}` as the working project (attached, not scaffolded).\n"
-    );
-    if let Some(url) = origin_remote_url(repo) {
-        body.push_str(&format!("- Clone origin: {url}\n"));
+    let mut body = match kind {
+        SeedKind::Attached => format!(
+            "## Attached existing repository ({date})\n\n\
+             - Opened existing repository `{name}` as the working project (attached, not scaffolded).\n"
+        ),
+        SeedKind::Scaffolded => format!(
+            "## Scaffolded project ({date})\n\n\
+             - Started `{name}` as a scaffolded working project (built in place, not cloned).\n"
+        ),
+    };
+    if kind == SeedKind::Attached {
+        if let Some(url) = origin_remote_url(repo) {
+            body.push_str(&format!("- Clone origin: {url}\n"));
+        }
     }
     if stages.is_empty() {
-        body.push_str("- No toolchain manifest recognised; no verify stages inferred.\n");
+        body.push_str(match kind {
+            SeedKind::Attached => {
+                "- No toolchain manifest recognised; no verify stages inferred.\n"
+            }
+            SeedKind::Scaffolded => "- No verify stages recorded yet.\n",
+        });
     } else {
         let names: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
-        body.push_str(&format!(
-            "- Inferred verify stages from repo manifests: {}.\n",
-            names.join(", ")
-        ));
+        body.push_str(&match kind {
+            SeedKind::Attached => format!(
+                "- Inferred verify stages from repo manifests: {}.\n",
+                names.join(", ")
+            ),
+            SeedKind::Scaffolded => {
+                format!("- Recorded verify stages: {}.\n", names.join(", "))
+            }
+        });
     }
     if let Some(summary) = readme_summary(repo) {
         body.push_str(&format!("- README summary: {summary}\n"));
@@ -702,7 +743,7 @@ pub async fn attach_project(repo: &Path) -> AttachSummary {
 /// Append the attach seed to `<repo>/.copperclaw/DECISIONS.md`, creating
 /// the file if absent. Returns whether a write happened.
 async fn append_decisions(repo: &Path, sdir: &Path, stages: &[Stage]) -> bool {
-    let seed = build_decisions_seed(repo, stages);
+    let seed = build_decisions_seed(repo, stages, SeedKind::Attached);
     let path = sdir.join(DECISIONS_FILE);
     let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
     let mut contents = existing;
@@ -751,6 +792,40 @@ fn has_recognised_manifest(dir: &Path) -> bool {
         .any(|m| dir.join(m).is_file())
 }
 
+// ── M23 W3.2: decision-log seeding for scaffolded projects ──────────────
+
+/// Whether `dir` is a scaffolded project whose decision log should be
+/// seeded: project state has materialised (the `.copperclaw/` dir exists
+/// — the verify gate creates it on the first recorded verify or dirty
+/// mark), it is not a clone the attach flow owns (no `origin` remote, not
+/// attached), and no `DECISIONS.md` exists yet.
+fn wants_scaffold_decisions_seed(dir: &Path) -> bool {
+    dir.is_dir()
+        && state_dir(dir).is_dir()
+        && !is_attached(dir)
+        && !has_origin_remote(dir)
+        && !state_dir(dir).join(DECISIONS_FILE).exists()
+}
+
+/// Seed `<dir>/.copperclaw/DECISIONS.md` for a scaffolded project, using
+/// the same template attach seeds ([`build_decisions_seed`]) with
+/// scaffold wording. The stages listed are whatever the agent has
+/// recorded in `.copperclaw/verify` — parsed by the gate's own parser —
+/// which may be none this early. Create-only by construction (the caller
+/// gates on [`wants_scaffold_decisions_seed`]) and best-effort: a failed
+/// write is logged, never fatal.
+async fn seed_scaffold_decisions(dir: &Path) {
+    let stages = copperclaw_mcp::tools::verify_gate::recorded_stages(dir, None).await;
+    let seed = build_decisions_seed(dir, &stages, SeedKind::Scaffolded);
+    write_best_effort(&state_dir(dir).join(DECISIONS_FILE), seed.as_bytes()).await;
+    tracing::info!(
+        target: "copperclaw_runner",
+        project = %dir.display(),
+        stages = stages.len(),
+        "W3.2: seeded DECISIONS.md for scaffolded project"
+    );
+}
+
 /// Resolve the container's data root the same way `verify_gate` does:
 /// `COPPERCLAW_DATA_ROOT` when set, else `/data`. Keeping the resolution
 /// identical means auto-attach and the verify gate always agree on which
@@ -760,10 +835,12 @@ pub(super) fn resolve_data_root() -> PathBuf {
 }
 
 /// Scan the data root and attach every not-yet-attached existing repo
-/// found directly beneath it. Returns the summaries of repos actually
-/// attached this pass (empty on the common steady-state poll where nothing
-/// new was cloned). Best-effort: an unreadable data root yields an empty
-/// result rather than an error. Called from the runner poll loop.
+/// found directly beneath it; also seed `DECISIONS.md` for any scaffolded
+/// project whose `.copperclaw/` state has appeared without one (M23 W3.2).
+/// Returns the summaries of repos actually attached this pass (empty on
+/// the common steady-state poll where nothing new was cloned).
+/// Best-effort: an unreadable data root yields an empty result rather
+/// than an error. Called from the runner poll loop.
 pub async fn auto_attach_pending() -> Vec<AttachSummary> {
     auto_attach_in(&resolve_data_root()).await
 }
@@ -786,6 +863,8 @@ pub async fn auto_attach_in(data_root: &Path) -> Vec<AttachSummary> {
             if summary.attached {
                 attached.push(summary);
             }
+        } else if wants_scaffold_decisions_seed(&path) {
+            seed_scaffold_decisions(&path).await;
         }
     }
     attached
@@ -1370,6 +1449,148 @@ mod tests {
         assert!(
             !verify_gate::is_dirty(&repo).await,
             "with every inferred stage green the completion gate passes"
+        );
+    }
+
+    // ── M23 W3.2: scaffold DECISIONS.md seeding ──────────────────────
+
+    /// Stage a scaffolded (origin-less `git init`) prototype with a
+    /// materialised `.copperclaw/` state dir, as the verify gate leaves
+    /// it once the agent records a verify.
+    fn staged_scaffold(root: &Path) -> PathBuf {
+        let proto = root.join("fresh-proto");
+        std::fs::create_dir_all(proto.join(".git")).unwrap();
+        std::fs::write(proto.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::write(proto.join("package.json"), r#"{"scripts":{"test":"jest"}}"#).unwrap();
+        std::fs::write(
+            proto.join("README.md"),
+            "# fresh-proto\n\nA scaffolded prototype.\n",
+        )
+        .unwrap();
+        let sdir = proto.join(STATE_DIR);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(
+            sdir.join(VERIFY_FILE),
+            "lint: npm run lint\ntest: npm test\n",
+        )
+        .unwrap();
+        proto
+    }
+
+    #[tokio::test]
+    async fn scaffolded_project_gets_decisions_seeded() {
+        let root = tempfile::tempdir().unwrap();
+        let proto = staged_scaffold(root.path());
+
+        let attached = auto_attach_in(root.path()).await;
+        assert!(attached.is_empty(), "a scaffold never auto-attaches");
+        assert!(
+            !proto.join(STATE_DIR).join(ATTACHED_MARKER).exists(),
+            "seeding must not mark the scaffold attached"
+        );
+        let decisions =
+            std::fs::read_to_string(proto.join(STATE_DIR).join(DECISIONS_FILE)).unwrap();
+        assert!(decisions.contains("## Scaffolded project"));
+        assert!(
+            decisions.contains("`fresh-proto`"),
+            "seed names the project"
+        );
+        assert!(
+            decisions.contains("Recorded verify stages: lint, test."),
+            "seed lists the agent-recorded verify stages"
+        );
+        assert!(
+            decisions.contains("README summary: fresh-proto"),
+            "seed folds in the project's own README prose"
+        );
+        assert!(
+            decisions.contains("Top-level layout:"),
+            "seed shares the attach template's structure line"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_seed_never_overwrites_existing_decisions() {
+        let root = tempfile::tempdir().unwrap();
+        let proto = staged_scaffold(root.path());
+        let path = proto.join(STATE_DIR).join(DECISIONS_FILE);
+        std::fs::write(&path, "# my own log\n\n- chose sqlite\n").unwrap();
+
+        auto_attach_in(root.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# my own log\n\n- chose sqlite\n",
+            "an existing DECISIONS.md is never touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_seed_is_idempotent_across_scans() {
+        let root = tempfile::tempdir().unwrap();
+        let proto = staged_scaffold(root.path());
+        auto_attach_in(root.path()).await;
+        let path = proto.join(STATE_DIR).join(DECISIONS_FILE);
+        let first = std::fs::read_to_string(&path).unwrap();
+        auto_attach_in(root.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            first,
+            "a second scan re-seeds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dir_without_state_dir_is_not_seeded() {
+        let root = tempfile::tempdir().unwrap();
+        // A manifest but no .copperclaw yet — the project hasn't
+        // materialised state, so nothing to seed (and nothing created).
+        let proto = root.path().join("pre-proto");
+        std::fs::create_dir_all(&proto).unwrap();
+        std::fs::write(proto.join("Cargo.toml"), "[package]\nname=\"p\"\n").unwrap();
+        // A non-project dir (e.g. the memory store) stays untouched too.
+        std::fs::create_dir_all(root.path().join("memory")).unwrap();
+
+        auto_attach_in(root.path()).await;
+        assert!(
+            !proto.join(STATE_DIR).exists(),
+            "seeding never creates the state dir itself"
+        );
+        assert!(!root.path().join("memory").join(STATE_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn dirty_only_scaffold_seeds_with_no_stages_line() {
+        let root = tempfile::tempdir().unwrap();
+        // State materialised via a dirty mark only — no verify recorded.
+        let proto = root.path().join("dirty-proto");
+        let sdir = proto.join(STATE_DIR);
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join("dirty"), "").unwrap();
+
+        auto_attach_in(root.path()).await;
+        let decisions = std::fs::read_to_string(sdir.join(DECISIONS_FILE)).unwrap();
+        assert!(decisions.contains("## Scaffolded project"));
+        assert!(
+            decisions.contains("No verify stages recorded yet."),
+            "a verify-less scaffold seeds honestly with no stage claims"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_repo_is_never_scaffold_seeded() {
+        let root = tempfile::tempdir().unwrap();
+        // A clone (origin remote) with a materialised state dir but no
+        // recognised manifest: not attachable, and the scaffold seeder
+        // must leave it to the attach flow's domain.
+        let repo = root.path().join("cloned-thing");
+        std::fs::create_dir_all(&repo).unwrap();
+        make_cloned(&repo, "https://example.com/acme/thing.git");
+        std::fs::create_dir_all(repo.join(STATE_DIR)).unwrap();
+
+        auto_attach_in(root.path()).await;
+        assert!(
+            !repo.join(STATE_DIR).join(DECISIONS_FILE).exists(),
+            "a repo with an origin remote is never seeded as a scaffold"
         );
     }
 

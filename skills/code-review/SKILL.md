@@ -71,6 +71,8 @@ anything hard to roll back), spin up a dedicated critic with
 that break this and prove it with a repro." A second context with an
 adversarial mandate sees what the author's context is blind to. It
 costs a full sibling agent, so reserve it for changes that earn it.
+The design-level twin of this move — a critic for a DESIGN.md before
+any code exists — lives in [[architecture]].
 
 ## Producing the summary
 

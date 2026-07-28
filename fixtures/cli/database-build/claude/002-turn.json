@@ -1,0 +1,10 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_db_build_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_replay_db_services_001", "name": "write_file", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"/tmp/copperclaw-m23-database-build/.copperclaw/services\","}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"content\":\"pg_ctl -D /data/pg -l /data/pg/log -o \\\"-k /data/pg -p 5432 -h 127.0.0.1\\\" start\\n\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

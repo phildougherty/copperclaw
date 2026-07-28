@@ -4999,3 +4999,129 @@ async fn run_transcript_render_child(dump: bool) {
         "the final chat answer must be delivered: {texts:?}",
     );
 }
+
+// ---- M23 W3.3: the databases capability path, deterministically ----
+
+/// Fixed on-disk root the `database-build` fixture's scripted `write_file`
+/// turn targets. In production the agent writes `/data/.copperclaw/services`
+/// (the container path the W2.2 cold-boot hook replays at the next spawn);
+/// the in-process harness runs no container and `/data` is an unwritable
+/// root-owned path on any host running the suite, so the fixture mirrors
+/// the same `.copperclaw/services` layout under a fixed /tmp root instead
+/// (the `transcript-render` / `prototype-golden` precedent). Distinct from
+/// the other fixtures' roots so concurrent runs never collide.
+const M23W3_DB_BUILD_ROOT: &str = "/tmp/copperclaw-m23-database-build";
+
+/// M23 W3.3 acceptance: "set up a postgres database for the app" drives
+/// the databases run-book's two capability legs through the real
+/// pipeline — no docker, no network, no postgres process:
+///
+/// - `install_packages` (apt: postgresql + postgresql-client, scope
+///   `image`) emits an `install_packages` System row into `messages_out`,
+///   and the delivery loop's host-side apply path
+///   (`apply_install_packages`) merges both packages into central
+///   `container_configs.packages_apt` — the exact config the next spawn's
+///   image bake reads. This is the "packages bake at the NEXT spawn"
+///   contract the databases skill teaches.
+/// - `write_file` registers the `pg_ctl` start line in
+///   `.copperclaw/services` (under the /tmp stand-in root — see
+///   [`M23W3_DB_BUILD_ROOT`]), the file W2.2's service-restart hook runs
+///   line-by-line at container cold boot.
+///
+/// What this fixture deliberately does NOT exercise: the W2.4 verify-gate
+/// db: stage (needs a project attach + a listening socket) and the runner
+/// cold-boot hook itself (`copperclaw-runner/src/run/services.rs` runs
+/// once per real container boot; the harness's in-process runner has no
+/// container boot to hook). Both are covered by their own unit tests.
+#[tokio::test]
+async fn cli_database_build_installs_packages_and_registers_services() {
+    // Always start from a clean root so the scripted `write_file` is a
+    // fresh create — an overwrite of a leftover file from a prior run
+    // would emit a Diff card row and break the byte-stable streams.
+    let _ = std::fs::remove_dir_all(M23W3_DB_BUILD_ROOT);
+
+    // Fixture-authoring path: regenerate expected/*.jsonl from a real
+    // run. Never taken under a normal `cargo test`.
+    if std::env::var_os("COPPERCLAW_M23W3_GENERATE").is_some() {
+        let path = fixture_path("cli", "database-build");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        let _ = std::fs::remove_dir_all(M23W3_DB_BUILD_ROOT);
+        return;
+    }
+
+    let harness = run_fixture_into_harness("cli", "database-build").await;
+
+    // (1) The runner emitted exactly ONE `install_packages` System row
+    // carrying both apt packages, the audited reason, and image scope.
+    let out = harness.snapshot_messages_out().expect("outbound snapshot");
+    let installs: Vec<&serde_json::Value> = out
+        .iter()
+        .filter(|r| {
+            r.get("content")
+                .and_then(|c| c.get("install_packages"))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(
+        installs.len(),
+        1,
+        "exactly one install_packages system row: {out:#?}"
+    );
+    let ip = &installs[0]["content"]["install_packages"];
+    assert_eq!(
+        ip["apt"],
+        serde_json::json!(["postgresql", "postgresql-client"]),
+        "the install row must carry both apt packages: {ip}"
+    );
+    assert_eq!(ip["scope"], "image", "apt installs are image-scoped: {ip}");
+    assert!(
+        ip["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "the install row must carry a non-empty reason: {ip}"
+    );
+
+    // (2) The delivery loop APPLIED the row host-side: both packages
+    // merged into central `container_configs.packages_apt`, so the next
+    // container spawn's image bake would include them.
+    let (ag, _sess) = harness.touched_sessions[0];
+    let cfg = copperclaw_db::tables::container_configs::get(&harness.central, ag)
+        .expect("read container_configs")
+        .expect("delivery's install_packages apply must create the config row");
+    for pkg in ["postgresql", "postgresql-client"] {
+        assert!(
+            cfg.packages_apt.contains(&pkg.to_string()),
+            "container_configs.packages_apt must contain {pkg}: {:?}",
+            cfg.packages_apt
+        );
+    }
+
+    // (3) The services registration landed on disk with the run-book's
+    // pg_ctl start line (the file the W2.2 cold-boot hook replays).
+    let services = std::path::Path::new(M23W3_DB_BUILD_ROOT)
+        .join(".copperclaw")
+        .join("services");
+    let contents = std::fs::read_to_string(&services)
+        .unwrap_or_else(|e| panic!("services file missing at {services:?}: {e}"));
+    assert_eq!(
+        contents,
+        "pg_ctl -D /data/pg -l /data/pg/log -o \"-k /data/pg -p 5432 -h 127.0.0.1\" start\n",
+        "the services file must carry the exact pg start command"
+    );
+
+    // (4) The final reply reached the user through the adapter.
+    let cli = mock_for(&harness, "cli");
+    assert!(
+        cli.deliveries().iter().any(|d| d
+            .message
+            .content
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains("Postgres is set up"))),
+        "the closing reply must be delivered: {:?}",
+        cli.deliveries()
+    );
+
+    let _ = std::fs::remove_dir_all(M23W3_DB_BUILD_ROOT);
+}
