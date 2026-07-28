@@ -48,38 +48,42 @@ constraints).
   added, size caps enforced. `coding-task`/`web-backend`/
   `install-packages`/`shell` now cross-link the new skills.
 
-## Wave 2 — make databases first-class (next)
+## Wave 2 — make databases first-class (LANDED)
 
-- **W2.1 Backend profile packages.** Add `libnss-wrapper` (tiny) to the
-  base/prototyping package set so Postgres works the session it is
-  requested; consider a `backend` profile preset that pre-bakes
-  `postgresql`, `mariadb-server`, `redis-server` for coding groups.
-  Touch: `copperclaw-setup` steps + `ImageBuildSpec` baseline in
-  `copperclaw-container-rt` (keep `container/Dockerfile` in sync).
-- **W2.2 Service restart hook.** Daemons die at idle-stop; today the
-  skill teaches manual `/data/start-dbs.sh`. Add a runner cold-boot
-  hook: if `/data/.copperclaw/services` exists (one command per line),
-  run each on container start and log to `/data/.copperclaw/services.log`.
-  Touch: `copperclaw-runner` startup; skill copy update.
-- **W2.3 Egress presets for DB tarballs.** Under `DenyDefault` egress
-  the Mongo tarball path fails. Document `fastdl.mongodb.org:443` +
-  `downloads.mongodb.com:443` in `docs/container-config.md` and add a
-  `mongodb` entry to the egress preset list.
-- **W2.4 Verify-gate DB stage inference.** Repo attach already infers
-  verify stages from manifests; also infer a `db:` health stage when a
-  scaffold's `.env.example` declares `DATABASE_URL`/`REDIS_URL`.
-  Touch: `container_manager/cold_start.rs` inference.
-- **W2.5 Sync the coverage-test tool mirror.** `REGISTRY_TOOLS` in
-  `crates/copperclaw-skills/tests/coverage.rs` has drifted behind
-  `copperclaw_mcp::tools::build_tool_set` (missing `delegate`,
-  `delegate_batch`, `multi_edit`, `apply_patch`, `copy_file`,
-  `find_symbol`, `memory_*`, goal/condition tools, `ui_*`, and more), so
-  skills cannot backtick-reference those tools without failing the
-  mention-resolution test — the M23 review sweep had to fall back to
-  prose for them. Syncing the mirror also re-arms
-  `every_registry_tool_appears_in_some_skill` for the newer tools, which
-  will demand new skill copy for each — schedule the sync and the copy
-  together.
+- **W2.1 Backend profile packages — landed.** `libnss-wrapper` added to
+  `DEFAULT_BASE_APT_PACKAGES` (`copperclaw-setup/src/steps/image.rs`) so
+  every session image resolves uid 1000 and Postgres works the session
+  it is requested. A `backend` image profile landed in
+  `copperclaw-types/src/image.rs`: a strict superset of `prototyping`
+  (test-enforced) that additionally bakes `postgresql`,
+  `postgresql-client`, `mariadb-server`, `mariadb-client`,
+  `redis-server`.
+- **W2.2 Service restart hook — landed.** Runner cold-boot hook
+  (`copperclaw-runner/src/run/services.rs`, called once per container
+  boot in `run_loop` before auto-attach): runs each line of
+  `/data/.copperclaw/services` via bash with a 60s per-command timeout,
+  logs to `/data/.copperclaw/services.log` (256 KiB cap, 8 KiB
+  per-command output cap), never fatal. Skill copy updated.
+- **W2.3 Egress presets — landed.** `cclaw egress list-presets` /
+  `cclaw egress allow mongodb --agent-group-id <id>` (composite ops over
+  the existing audited `groups.config.set-egress-allow` path;
+  idempotent merge). The `mongodb` preset covers `fastdl.mongodb.org:443`
+  + `downloads.mongodb.com:443`; documented in
+  `docs/container-config.md`.
+- **W2.4 Verify-gate DB stage inference — landed** in
+  `copperclaw-runner/src/run/project.rs` (NOT `cold_start.rs` as
+  originally written here — host-side detection is deliberately
+  side-effect-free; the verify writer lives in the runner's attach
+  path). `.env.example`/`.env` `DATABASE_URL`/`REDIS_URL`/`MONGO_URL`/
+  `MONGODB_URI` lines infer `db:`/`db-redis:`/`db-mongo:` stages as
+  plain bash `/dev/tcp` reachability checks (no DB client needed,
+  injection-hardened, never clobbers an agent-authored verify).
+- **W2.5 Coverage-test tool mirror — landed.** Mirror synced (a true
+  derive is a dependency cycle: `copperclaw-mcp` depends on
+  `copperclaw-skills`); 21 tools re-armed, now 58 names, ordering
+  matches `build_tool_set`, `browser_interact` documented as the
+  deliberate opt-in exclusion. Goal/condition tools gained real copy in
+  `schedule-task`; `list_skills` in `save-skill`/`discovering-tools`.
 
 ## Wave 3 — deepen the architect loop
 

@@ -206,7 +206,15 @@ pub enum TopCommand {
     /// opt-in deny-default) and, per agent group, the effective outbound
     /// allow-list (operator-configured entries plus the auto-injected
     /// model endpoint). The same report `cclaw doctor` folds in.
-    Egress,
+    ///
+    /// Subcommands manage the curated egress preset catalog:
+    /// `cclaw egress list-presets` shows the known endpoint sets and
+    /// `cclaw egress allow <preset>` merges one into a group's
+    /// allow-list. With no subcommand, prints the posture report.
+    Egress {
+        #[command(subcommand)]
+        action: Option<EgressCmd>,
+    },
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -403,6 +411,54 @@ pub enum McpCmd {
         #[arg(long = "agent-group-id")]
         agent_group_id: String,
     },
+}
+
+// --- egress ----------------------------------------------------------------
+
+/// `cclaw egress ...` — curated egress allow-list presets.
+///
+/// The catalog lives client-side in [`crate::egress`] (the egress twin of
+/// the MCP preset registry). Both subcommands are composite ops: no new
+/// host wire commands — `allow` merges through the existing, audited
+/// `groups.config.set-egress-allow`.
+#[derive(Debug, Subcommand)]
+pub enum EgressCmd {
+    /// List the curated egress presets (name, description, host:port
+    /// entries). No socket round-trip required.
+    #[command(name = "list-presets")]
+    ListPresets,
+    /// Merge a preset's host:port entries into a group's egress
+    /// allow-list.
+    ///
+    /// Unlike `groups config set-egress-allow` (which replaces the whole
+    /// list), this preserves existing entries and appends the preset's,
+    /// deduplicated — re-running is a no-op. Takes effect at the next
+    /// container spawn for the group.
+    ///
+    /// Example:
+    ///   cclaw egress allow mongodb --agent-group-id <id>
+    Allow {
+        /// Preset name from `cclaw egress list-presets`.
+        preset: String,
+        /// Agent group to configure.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
+    },
+}
+
+impl EgressCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::ListPresets => ParsedCall::new("composite.egress-list-presets", json!({})),
+            Self::Allow {
+                preset,
+                agent_group_id,
+            } => ParsedCall::new(
+                "composite.egress-allow-preset",
+                json!({"preset": preset, "agent_group_id": agent_group_id}),
+            ),
+        }
+    }
 }
 
 // --- quickstart ------------------------------------------------------------
@@ -1235,7 +1291,10 @@ impl TopCommand {
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
             Self::Security { action } => action.to_call(),
-            Self::Egress => ParsedCall::new("egress.status", json!({})),
+            Self::Egress { action } => action.as_ref().map_or_else(
+                || ParsedCall::new("egress.status", json!({})),
+                EgressCmd::to_call,
+            ),
             Self::Usage { since } => ParsedCall::new("usage.rollup", json!({"since": since})),
             Self::Chat {
                 fifo,
@@ -3132,6 +3191,38 @@ mod tests {
         let call = parse(&["cclaw", "mcp", "oauth-list", "--agent-group-id", "ag-1"]);
         assert_eq!(call.command, "mcp.oauth-list");
         assert_eq!(call.args["agent_group_id"], "ag-1");
+    }
+
+    // --- egress ------------------------------------------------------------
+
+    #[test]
+    fn egress_bare_still_maps_to_status() {
+        let call = parse(&["cclaw", "egress"]);
+        assert_eq!(call.command, "egress.status");
+        assert_eq!(call.args, json!({}));
+    }
+
+    #[test]
+    fn egress_list_presets_is_composite() {
+        let call = parse(&["cclaw", "egress", "list-presets"]);
+        assert_eq!(call.command, "composite.egress-list-presets");
+    }
+
+    #[test]
+    fn egress_allow_preset_parses() {
+        let call = parse(&[
+            "cclaw",
+            "egress",
+            "allow",
+            "mongodb",
+            "--agent-group-id",
+            "ag-1",
+        ]);
+        assert_eq!(call.command, "composite.egress-allow-preset");
+        assert_eq!(
+            call.args,
+            json!({"preset": "mongodb", "agent_group_id": "ag-1"})
+        );
     }
 
     #[test]

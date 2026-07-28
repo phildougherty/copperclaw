@@ -30,7 +30,10 @@ only to this agent group. There is no cross-group sharing.
 
 Saving is version-aware: a first save starts at version 1, and
 re-saving an existing skill of the same name bumps its version
-automatically — you never manage `version` yourself.
+automatically — you never manage `version` yourself. Before re-saving,
+`list_skills` (read-only, no arguments) enumerates the skills this
+session can see — name, version, description — so you can check
+whether the name already exists instead of guessing.
 
 The change is **not** retroactive: the skill is NOT available in the
 session you save it from. Save it, tell the user it's pending approval,

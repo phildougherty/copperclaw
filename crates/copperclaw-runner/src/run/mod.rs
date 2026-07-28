@@ -25,6 +25,8 @@ pub mod project;
 pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod reaction;
+// M23 W2.2: cold-boot service restart hook (`/data/.copperclaw/services`).
+pub(super) mod services;
 pub(super) mod tool_dispatch;
 
 // M22 A2: the autonomy-gate types appear in [`RunnerDeps`]'s public
@@ -941,6 +943,17 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     // container respawn. Byte-identical for the common single-provider case
     // (`select_start` always returns 0, no transitions).
     let failover_health = FailoverHealth::from_deps(&deps);
+
+    // M23 W2.2 cold-boot service restart: daemons the agent started
+    // (database servers, dev servers) died with the previous container at
+    // idle-stop while `/data` survived. Run the agent-maintained
+    // `/data/.copperclaw/services` file once per container boot — before
+    // the poll loop and before repo auto-attach, so anything the attach /
+    // verify path touches can already reach its daemons. Best-effort and
+    // time-bounded: never fatal, never blocks boot past the per-command
+    // timeout, and a process-level latch keeps later turns of this boot
+    // from re-running it.
+    services::run_cold_boot_services().await;
 
     // M22 C2 attach seam: at startup, attach any *existing* repository
     // already sitting under the data root — a repo handed to / persisted

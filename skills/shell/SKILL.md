@@ -97,8 +97,12 @@ A process you daemonize (`redis-server --daemonize yes`, `mariadbd ...
 &`, a dev server via `nohup npm run dev &`) outlives the call and is
 reachable from later calls — but dies with the container at idle-stop
 (5 quiet minutes). Data on `/data` survives; the process does not.
-Expect to re-start daemons after a respawn — see [[databases]] for the
-DB-server pattern.
+To have a daemon come back automatically after a respawn, add its
+start command to `/data/.copperclaw/services` (one bash command per
+line, `#` comments allowed) — the runtime runs the file once per
+container boot and logs each command's output and exit status to
+`/data/.copperclaw/services.log`. See [[databases]] for the DB-server
+pattern.
 
 ## Safety model
 

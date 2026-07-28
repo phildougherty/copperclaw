@@ -115,6 +115,28 @@ A `messages_in` row of kind `task`, with `content` containing the
 recurring task; `recurrence` is propagated so you can recognise
 "this is a scheduled run, not an interactive request."
 
+## Siblings: goals and condition wakes
+
+Two families sit beside the scheduler:
+
+- **Goals** — for a multi-step objective that outlives one
+  conversation (not a one-off timed prompt). `create_goal` declares a
+  durable goal the runtime tracks — status, progress log, optional
+  token budget — with an optional cron `checkin_recurrence` that wakes
+  you to check in. On a check-in wake, call `update_goal` (id is in
+  the wake) to record `progress` or transition `status`
+  (active/paused/completed/abandoned). `list_goals` inventories them.
+- **Condition wakes** — event-driven, not clock-driven.
+  `register_condition` stores a predicate and the host wakes you with
+  a check-in when it BECOMES true (rising edge): kinds are `idle`
+  (quiet for N seconds), `pending_inbound` (N+ messages queued), or
+  `flag` — a named latch you raise or lower with `set_condition_flag`.
+  Re-registering the same `id` replaces it; `remove: true`
+  deregisters.
+
+Both are internal tracking state: neither authorizes external action
+by itself — autonomous fires still draft unless a grant applies.
+
 ## Notes
 
 - Task ids are stable across restarts; they live in the central DB.
