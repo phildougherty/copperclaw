@@ -224,6 +224,10 @@ where
                 render_json_pretty(&data)
             } else if call.command == "usage.rollup" {
                 render_usage_rollup(&data, palette)
+            } else if call.command == "budgets.list" {
+                render_budgets_list(&data, palette)
+            } else if call.command == "sessions.list" {
+                render_sessions_list(data, palette)
             } else {
                 render_with(&data, palette)
             };
@@ -291,7 +295,11 @@ const COST_UNKNOWN: &str = "\u{2014}";
 /// up). A genuine priced sub-cent value collapses to `"$0.00"` (3300
 /// micros = $0.0033), which is fine *because it was priced* — rendering
 /// an unknown cost is the caller's job, via [`COST_UNKNOWN`].
-fn format_cost_dollars(micros: u64) -> String {
+///
+/// `pub` because the host's `daily_cost_cap` budget gate reuses it for
+/// the in-channel "cost budget reached" notice, so operator-facing
+/// dollar strings are formatted one way everywhere.
+pub fn format_cost_dollars(micros: u64) -> String {
     let cents = micros.saturating_add(5_000) / 10_000;
     format!("${}.{:02}", cents / 100, cents % 100)
 }
@@ -359,12 +367,138 @@ fn render_usage_rollup(data: &serde_json::Value, palette: Palette) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// `cclaw budgets list` — caps alongside today's spend.
+// ---------------------------------------------------------------------------
+
+/// Render the `budgets.list` payload as the human `cclaw budgets list`
+/// table.
+///
+/// The wire payload (kept verbatim under `--json`) carries the raw cap
+/// columns plus today's spend (`tokens_today`, `cost_today_micros`,
+/// `cost_today_unpriced_turns`) and the host-computed breach flags. The
+/// generic table renderer would print micros nobody can read, so this
+/// projects each row down to: dollar-formatted cost cap and spend (em
+/// dash for an unset cap; a trailing `+` on the spend when some of
+/// today's turns ran on unpriced models, i.e. the number is a floor),
+/// and a final `state` column (`ok`, `over-tokens`, `over-cost`, or
+/// `over-tokens,over-cost`) so a breached cap is visible at a glance.
+fn render_budgets_list(data: &serde_json::Value, palette: Palette) -> String {
+    let Some(rows) = data.as_array() else {
+        return render_with(data, palette);
+    };
+    if rows.is_empty() || !rows.iter().all(serde_json::Value::is_object) {
+        return render_with(data, palette);
+    }
+    let projected: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            // preserve_order is on workspace-wide, so insertion order
+            // here is column order in the rendered table.
+            let mut o = serde_json::Map::new();
+            for key in ["agent_group_id", "daily_token_cap", "tokens_today"] {
+                if let Some(v) = r.get(key) {
+                    o.insert(key.to_string(), v.clone());
+                }
+            }
+            let cost_cap = r
+                .get("daily_cost_cap")
+                .and_then(serde_json::Value::as_f64)
+                .map_or_else(|| COST_UNKNOWN.to_string(), |d| format!("${d:.2}"));
+            o.insert(
+                "daily_cost_cap".to_string(),
+                serde_json::Value::String(cost_cap),
+            );
+            let cost_today = r
+                .get("cost_today_micros")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(
+                    || COST_UNKNOWN.to_string(),
+                    |m| {
+                        let mut s = format_cost_dollars(m);
+                        let unpriced = r
+                            .get("cost_today_unpriced_turns")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
+                        if unpriced > 0 {
+                            // Some of today's turns could not be priced,
+                            // so the dollar figure is a floor.
+                            s.push('+');
+                        }
+                        s
+                    },
+                );
+            o.insert(
+                "cost_today".to_string(),
+                serde_json::Value::String(cost_today),
+            );
+            for key in ["agent_turns_per_minute_cap", "agent_turns_per_hour_cap"] {
+                if let Some(v) = r.get(key) {
+                    o.insert(key.to_string(), v.clone());
+                }
+            }
+            let over_tokens = r
+                .get("over_daily_token_cap")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let over_cost = r
+                .get("over_daily_cost_cap")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let state = match (over_tokens, over_cost) {
+                (true, true) => "over-tokens,over-cost",
+                (true, false) => "over-tokens",
+                (false, true) => "over-cost",
+                (false, false) => "ok",
+            };
+            o.insert(
+                "state".to_string(),
+                serde_json::Value::String(state.to_string()),
+            );
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    render_with(&serde_json::Value::Array(projected), palette)
+}
+
+// ---------------------------------------------------------------------------
 // `cclaw sessions get` / `cclaw sessions tail` — per-session message rows.
 // ---------------------------------------------------------------------------
 
 /// `cclaw sessions get <id>` — one wire call (`sessions.get`), rendered
 /// client-side as the session key/value table followed by the recent
 /// inbound / outbound message-row tables the host attaches.
+/// Render `sessions.list` with a compact parent indicator.
+///
+/// The host row carries the full `source_session_id` UUID (or null for
+/// root sessions). A 36-char, mostly-empty column would dominate the
+/// table, so the table view replaces it with a short `parent` column:
+/// the first 8 chars of the parent session id, or empty for roots.
+/// `--json` output is untouched (it never reaches this function), so
+/// scripts keep the full UUID.
+fn render_sessions_list(mut data: serde_json::Value, palette: Palette) -> String {
+    if let Some(rows) = data.as_array_mut() {
+        for row in rows {
+            let Some(obj) = row.as_object_mut() else {
+                continue;
+            };
+            let parent = obj
+                .remove("source_session_id")
+                .and_then(|v| v.as_str().map(short_session_id));
+            obj.insert(
+                "parent".into(),
+                serde_json::Value::String(parent.unwrap_or_default()),
+            );
+        }
+    }
+    render_with(&data, palette)
+}
+
+/// First 8 chars of a session UUID — enough to disambiguate against
+/// `sessions list` output while keeping the column narrow.
+fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 async fn run_sessions_get<T>(
     args: &serde_json::Value,
     transport: &T,
@@ -2034,7 +2168,72 @@ where
         checks.push(db_integrity_check(&data_root));
     }
 
+    // 17. Budget caps (M24 U2). A breached daily token or dollar cap
+    //     defers every spawn for that group until UTC midnight — from the
+    //     outside it looks like the agent went silent, so surface it
+    //     here. The host computes the breach flags in `budgets.list`
+    //     with the same rollup the spawn gate compares against. An older
+    //     host (no flags in the payload) or a transport error skips the
+    //     row rather than guessing.
+    if let Ok(budgets) = transport
+        .call("budgets.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        checks.push(budgets_check(&budgets));
+    }
+
     finalise_doctor(&checks, as_json, palette)
+}
+
+/// Doctor row for check 17: which groups are over a daily (token or
+/// dollar) cap, per the host-computed `over_daily_token_cap` /
+/// `over_daily_cost_cap` flags in the `budgets.list` payload.
+fn budgets_check(budgets: &serde_json::Value) -> Check {
+    let over: Vec<String> = budgets
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let over_tokens = r
+                        .get("over_daily_token_cap")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let over_cost = r
+                        .get("over_daily_cost_cap")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if !(over_tokens || over_cost) {
+                        return None;
+                    }
+                    let ag = r
+                        .get("agent_group_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let which = match (over_tokens, over_cost) {
+                        (true, true) => "token+cost caps",
+                        (true, false) => "token cap",
+                        _ => "cost cap",
+                    };
+                    Some(format!("{ag} ({which})"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if over.is_empty() {
+        Check::ok("budgets", "no agent group is over its daily token/cost cap")
+    } else {
+        Check::warn(
+            "budgets",
+            format!(
+                "{} group(s) over a daily cap (spawns deferred until UTC midnight): {}",
+                over.len(),
+                over.join(", ")
+            ),
+            Some(
+                "raise or clear the cap: `cclaw budgets set --agent-group-id <id> --daily-tokens N` / `--daily-cost N` (0 removes the cap)",
+            ),
+        )
+    }
 }
 
 /// The thresholds, the pure classifier, and the `statvfs` call now live in
@@ -4396,6 +4595,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn budgets_check_ok_when_no_breach() {
+        let c = budgets_check(&json!([
+            {"agent_group_id": "ag-1", "over_daily_token_cap": false, "over_daily_cost_cap": false},
+        ]));
+        assert!(matches!(c.level, CheckLevel::Ok));
+        assert!(c.detail.contains("no agent group is over"));
+    }
+
+    #[test]
+    fn budgets_check_warns_on_breach_with_fix_hint() {
+        let c = budgets_check(&json!([
+            {"agent_group_id": "ag-cost", "over_daily_token_cap": false, "over_daily_cost_cap": true},
+            {"agent_group_id": "ag-both", "over_daily_token_cap": true, "over_daily_cost_cap": true},
+            {"agent_group_id": "ag-fine", "over_daily_token_cap": false, "over_daily_cost_cap": false},
+        ]));
+        assert!(matches!(c.level, CheckLevel::Warn));
+        assert!(
+            c.detail.contains("2 group(s) over a daily cap"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("ag-cost (cost cap)"), "{}", c.detail);
+        assert!(
+            c.detail.contains("ag-both (token+cost caps)"),
+            "{}",
+            c.detail
+        );
+        assert!(!c.detail.contains("ag-fine"), "{}", c.detail);
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("--daily-cost"), "{fix}");
+    }
+
+    #[test]
+    fn budgets_check_ok_on_legacy_payload_without_flags() {
+        // An older host without the breach flags must read as OK, not
+        // guessed-at breach.
+        let c = budgets_check(&json!([{"agent_group_id": "ag-old", "daily_token_cap": 5}]));
+        assert!(matches!(c.level, CheckLevel::Ok));
+    }
+
     #[tokio::test]
     async fn doctor_reports_egress_allow_all_as_ok() {
         // 6th seeded response is the egress.status call. allow-all → OK row.
@@ -5646,6 +5886,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budgets_list_table_formats_caps_spend_and_state() {
+        let t = StubTransport::ok(json!([
+            {
+                "agent_group_id": "ag-over",
+                "daily_token_cap": 1_000_000,
+                "daily_cost_cap": 0.01,
+                "agent_turns_per_minute_cap": null,
+                "agent_turns_per_hour_cap": null,
+                "updated_at": "2026-07-20T00:00:00+00:00",
+                "tokens_today": 1_500,
+                "cost_today_micros": 10_500,
+                "cost_today_unpriced_turns": 0,
+                "over_daily_token_cap": false,
+                "over_daily_cost_cap": true,
+            },
+            {
+                "agent_group_id": "ag-partial",
+                "daily_token_cap": null,
+                "daily_cost_cap": 5.0,
+                "agent_turns_per_minute_cap": null,
+                "agent_turns_per_hour_cap": null,
+                "updated_at": "2026-07-20T00:00:00+00:00",
+                "tokens_today": 300,
+                "cost_today_micros": 420_000,
+                "cost_today_unpriced_turns": 2,
+                "over_daily_token_cap": false,
+                "over_daily_cost_cap": false,
+            },
+        ]));
+        let out = run_cli(["cclaw", "budgets", "list"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        // Dollar-formatted cap and spend columns.
+        assert!(out.stdout.contains("COST_TODAY"), "stdout={:?}", out.stdout);
+        assert!(out.stdout.contains("$0.01"), "stdout={:?}", out.stdout);
+        assert!(out.stdout.contains("$5.00"), "stdout={:?}", out.stdout);
+        // Priced spend renders as dollars; a partial (unpriced turns
+        // present) spend carries the trailing "+" floor marker.
+        assert!(out.stdout.contains("$0.42+"), "stdout={:?}", out.stdout);
+        // Breach state is visible at a glance.
+        assert!(out.stdout.contains("over-cost"), "stdout={:?}", out.stdout);
+        assert!(out.stdout.contains("ok"), "stdout={:?}", out.stdout);
+        // Raw micros stay off the human table.
+        assert!(!out.stdout.contains("10500"), "stdout={:?}", out.stdout);
+    }
+
+    #[tokio::test]
+    async fn budgets_list_table_dashes_unset_cost_cap() {
+        // Rows from a host without a cost cap (or an older host without
+        // the spend columns) degrade to em dashes, never "$0.00".
+        let t = StubTransport::ok(json!([{
+            "agent_group_id": "ag-plain",
+            "daily_token_cap": 42,
+            "daily_cost_cap": null,
+            "agent_turns_per_minute_cap": null,
+            "agent_turns_per_hour_cap": null,
+            "updated_at": "2026-07-20T00:00:00+00:00",
+        }]));
+        let out = run_cli(["cclaw", "budgets", "list"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        assert!(out.stdout.contains(COST_UNKNOWN), "stdout={:?}", out.stdout);
+        assert!(!out.stdout.contains('$'), "stdout={:?}", out.stdout);
+        // No breach flags -> state renders as ok.
+        assert!(out.stdout.contains("ok"), "stdout={:?}", out.stdout);
+    }
+
+    #[tokio::test]
+    async fn budgets_list_json_passes_handler_payload_through() {
+        let payload = json!([{
+            "agent_group_id": "ag-1",
+            "daily_token_cap": 1000,
+            "daily_cost_cap": 2.5,
+            "agent_turns_per_minute_cap": null,
+            "agent_turns_per_hour_cap": null,
+            "updated_at": "2026-07-20T00:00:00+00:00",
+            "tokens_today": 10,
+            "cost_today_micros": 55,
+            "cost_today_unpriced_turns": 0,
+            "over_daily_token_cap": false,
+            "over_daily_cost_cap": false,
+        }]);
+        let t = StubTransport::ok(payload.clone());
+        let out = run_cli(["cclaw", "--json", "budgets", "list"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let parsed: serde_json::Value =
+            serde_json::from_str(out.stdout.trim()).expect("valid json");
+        assert_eq!(parsed, payload);
+    }
+
+    #[tokio::test]
     async fn sessions_delete_round_trips_through_transport() {
         // Integration coverage for `cclaw sessions delete <id>`:
         // drive the CLI front-end against an in-process stub transport
@@ -6344,6 +6673,53 @@ mod tests {
         assert!(out.stdout.contains("hi human"));
         // The arrays are not dumped into the KV table as raw JSON.
         assert!(!out.stdout.contains("recent_inbound"));
+    }
+
+    #[tokio::test]
+    async fn sessions_list_renders_short_parent_indicator() {
+        // Phase 4 of docs/plans/agent-to-agent-routing.md: the list
+        // table shows a compact PARENT column (8-char prefix of
+        // `source_session_id`, empty for roots) instead of the raw
+        // 36-char UUID column.
+        let rows = json!([
+            {
+                "id": "0197aaaa-0000-7000-8000-000000000001",
+                "status": "active",
+                "source_session_id": serde_json::Value::Null,
+            },
+            {
+                "id": "0197bbbb-0000-7000-8000-000000000002",
+                "status": "active",
+                "source_session_id": "0197aaaa-0000-7000-8000-000000000001",
+            },
+        ]);
+        let t = SequencedTransport::new(vec![Ok(rows)]);
+        let out = run_cli(["cclaw", "sessions", "list"], &t).await;
+        assert!(out.stdout.contains("PARENT"), "stdout: {}", out.stdout);
+        assert!(
+            out.stdout.contains("0197aaaa"),
+            "child row must show the 8-char parent prefix: {}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("SOURCE_SESSION_ID"),
+            "the raw UUID column must be replaced in the table view: {}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_list_json_keeps_full_source_session_id() {
+        let rows = json!([
+            {
+                "id": "0197bbbb-0000-7000-8000-000000000002",
+                "source_session_id": "0197aaaa-0000-7000-8000-000000000001",
+            },
+        ]);
+        let t = SequencedTransport::new(vec![Ok(rows.clone())]);
+        let out = run_cli(["cclaw", "--json", "sessions", "list"], &t).await;
+        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(parsed, rows, "--json must be the untouched wire payload");
     }
 
     #[tokio::test]

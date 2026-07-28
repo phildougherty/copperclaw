@@ -91,9 +91,12 @@ impl Skill {
 ///   selection time; `limit` is the cap on how many skills survive. See
 ///   [`SkillRegistry::select_relevant`] and [`crate::relevance`].
 ///
-/// `All`/`Explicit` mirror `copperclaw_db::tables::container_configs::
-/// SkillsSelector`; `Relevant` is skills-crate-only until the host config
-/// surface grows a matching persisted form.
+/// All three variants mirror `copperclaw_db::tables::container_configs::
+/// SkillsSelector` 1:1 (same JSON shapes). Since M24 U1 the host exposes the
+/// full selector per group: `groups.config.update` accepts a `skills` field
+/// (`cclaw groups skills <id> ...` / `cclaw groups config update --field
+/// 'skills=...'`), persisted in `container_configs.skills` and resolved at
+/// spawn by the container manager's prompt assembly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillsSelector {
     All,

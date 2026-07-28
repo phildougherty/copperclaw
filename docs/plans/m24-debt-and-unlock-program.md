@@ -77,7 +77,21 @@ consume-and-delete). Details per card below.
   existing approvals + grant-snapshot plumbing; do not invent a new
   approval system.
 
-## Wave 3 — unlock
+## Wave 3 — unlock (LANDED)
+
+All four cards landed: U1 `skills` config field + `cclaw groups skills`
+sugar with registry validation and an e2e narrowed-prompt test; U2
+cost-cap enforcement at the spawn gate + broker verdict (unpriced spend
+counted separately, never silently zero; `budgets.set` cost-cap wipe
+bug fixed); U3 save-and-reference image passthrough at the subagent and
+external-MCP seams (5 MB / 20-file caps, degrade-never-error); U4
+`to: "user"` / `to: "agent:parent"` via the spawn-materialized
+session-routing chain (no new tables), skill copy, and the parent chain
+in `sessions.get` + `cclaw sessions list`. One correction to the card
+text below: the per-session `destinations` table the U4 card suggested
+extending has no live host writer — `session_routing` is the real
+materialized seam, and the implementation uses it. Details per card
+below.
 
 - **U1 Skill-relevance config surface.** Expose
   `container_configs.skills` through `groups.config_update` and

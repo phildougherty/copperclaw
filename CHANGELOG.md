@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M24 — unlock wave)
+
+- **Skill-relevance selection is operator-reachable.** The M22 S2
+  machinery finally has a config surface: `groups.config.update` accepts
+  a `skills` field (`"all"`, `"relevant"` with optional query/limit, or
+  an explicit name array validated against the registry), plus
+  `cclaw groups skills <id> all|relevant|only <names...>` sugar. An
+  end-to-end test proves a `relevant` group gets a narrowed prompt at
+  spawn. Documented in `docs/container-config.md`.
+- **`daily_cost_cap` is enforced.** The spawn gate (and the broker
+  budget verdict) now compare the group's priced spend since UTC
+  midnight against the stored dollar cap, refusing like the token cap
+  with a deduped in-channel notice and a `gate="daily_cost"` label on
+  `copperclaw_budget_exhausted_total`. Unpriced-model turns are counted
+  separately and never gate (surfaced as a `+` floor marker), `ollama`
+  stays priced-at-zero, `cclaw budgets list` shows spend/caps/state,
+  `cclaw budgets set --daily-cost N` lands, `cclaw doctor` warns on
+  breached groups — and a latent bug where every `budgets.set` silently
+  wiped the stored cost cap is fixed.
+- **Images cross agent boundaries.** Subagent tool results and
+  external-MCP results no longer flatten to a literal `<image>`: bytes
+  are saved under the session's `.copperclaw/images/` (5 MB per image,
+  20-file retention, `view_image`-compatible formats) and referenced as
+  `[image saved: <path> — view with view_image]`; failures degrade to
+  the old marker plus a reason, never an error.
+- **Agent-to-agent addressing phases 2-4** (docs/plans/
+  agent-to-agent-routing.md): `to: "user"` routes to the ROOT
+  conversation's human from any spawn depth (via the session-routing
+  chain the host already materializes at spawn), `to: "agent:parent"`
+  routes to the parent session (clear validation error when there is no
+  parent); `send-message`/`create-agent` skills teach the forms;
+  `sessions.get` emits `source_session_id` + resolved `root_session_id`
+  and `cclaw sessions list` grew a PARENT column.
+
 ### Security (M24 — security-debt wave)
 
 - **Public-tunnel approvals can no longer be replayed onto a reused

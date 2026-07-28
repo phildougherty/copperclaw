@@ -59,13 +59,89 @@ fn parse_since(s: &str) -> Result<DateTime<Utc>, ErrorPayload> {
 /// small token counts from truncating to zero (e.g. 100 input tokens at
 /// $3/MTok is `100 * 3_000_000 / 1_000_000 = 300` micros, whereas dividing
 /// first would floor to 0). The result comfortably fits `u64`.
-fn cost_micros(price: &ModelPrice, input_tokens: i64, output_tokens: i64) -> u64 {
+///
+/// `pub(crate)` so the container manager's `daily_cost_cap` gate and the
+/// `budgets.list` handler reuse the exact same arithmetic (via
+/// [`priced_spend_since`]) instead of duplicating pricing math.
+pub(crate) fn cost_micros(price: &ModelPrice, input_tokens: i64, output_tokens: i64) -> u64 {
     let input = u128::try_from(input_tokens.max(0)).unwrap_or(0);
     let output = u128::try_from(output_tokens.max(0)).unwrap_or(0);
     let micros = (input * u128::from(price.input_per_mtok_micros)
         + output * u128::from(price.output_per_mtok_micros))
         / 1_000_000;
     u64::try_from(micros).unwrap_or(u64::MAX)
+}
+
+/// Convert the operator-facing dollar cap (`group_budgets.daily_cost_cap`,
+/// stored as an f64 in **USD per day**) to micro-dollars for comparison
+/// against the integer-micros spend arithmetic. Non-finite or non-positive
+/// caps read as "no cap".
+///
+/// `pub(crate)` so the spawn gate (`container_manager/budgets.rs`) and the
+/// `budgets.list` breach flags convert the cap identically.
+pub(crate) fn cost_cap_micros(cap_dollars: f64) -> Option<u64> {
+    if !cap_dollars.is_finite() || cap_dollars <= 0.0 {
+        return None;
+    }
+    // Operator-entered dollar amounts are far inside f64's exact integer
+    // range; round to the nearest micro-dollar.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let micros = (cap_dollars * 1_000_000.0).round() as u64;
+    Some(micros)
+}
+
+/// One agent group's priced spend over a window, as computed by
+/// [`priced_spend_since`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PricedSpend {
+    /// Micro-dollar sum over the `(model, provider)` slices that HAVE a
+    /// known price. Slices with no price are excluded, so this is a
+    /// floor on true spend, never an overstatement.
+    pub micros: u64,
+    /// Turns whose `(model, provider)` could not be priced and therefore
+    /// contribute nothing to `micros`. Callers that display or gate on
+    /// `micros` use this to say so instead of silently treating unknown
+    /// cost as zero.
+    pub unpriced_turns: i64,
+}
+
+/// Roll up one agent group's priced spend since `since`.
+///
+/// Shared cost-arithmetic seam: the `daily_cost_cap` spawn gate
+/// (`container_manager/budgets.rs`), the credential broker's budget
+/// verdict, and the `budgets.list` handler all price spend through this
+/// one function so they can never disagree with `cclaw usage`.
+///
+/// Unpriced models (no entry in `copperclaw_types::pricing`) are NOT
+/// counted as zero silently: their turns are excluded from `micros` and
+/// reported in `unpriced_turns`. A dollar cap therefore gates on what is
+/// computable — the honest alternative to either inventing a price or
+/// letting an unknown model bypass every priced one.
+pub(crate) fn priced_spend_since(
+    central: &CentralDb,
+    agent_group_id: &str,
+    since: DateTime<Utc>,
+) -> Result<PricedSpend, copperclaw_db::DbError> {
+    let by_model = agent_turns::rollup_by_model_since(central, since)?;
+    let mut spend = PricedSpend {
+        micros: 0,
+        unpriced_turns: 0,
+    };
+    for m in by_model
+        .iter()
+        .filter(|m| m.agent_group_id == agent_group_id)
+    {
+        match pricing::price_for(&m.provider, &m.model) {
+            Some(p) => {
+                spend.micros =
+                    spend
+                        .micros
+                        .saturating_add(cost_micros(&p, m.input_tokens, m.output_tokens));
+            }
+            None => spend.unpriced_turns += m.turns,
+        }
+    }
+    Ok(spend)
 }
 
 /// One `(model, provider)` slice of a group's usage, with its priced cost.
@@ -293,6 +369,47 @@ mod tests {
             "pricing_as_of": PRICING_AS_OF,
         }]);
         assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn priced_spend_since_sums_priced_and_reports_unpriced() {
+        let db = CentralDb::open_in_memory().unwrap();
+        // Priced: sonnet 100 in + 200 out = 300 + 3000 = 3300 micros.
+        seed(&db, "ag-spend", "claude-sonnet-4-6", "anthropic", 100, 200);
+        // Unpriced: excluded from the sum, surfaced in unpriced_turns.
+        seed(
+            &db,
+            "ag-spend",
+            "mystery-model-9",
+            "somevendor",
+            1_000_000,
+            1_000_000,
+        );
+        // Another group's turns must not leak into this group's spend.
+        seed(&db, "ag-other", "claude-sonnet-4-6", "anthropic", 999, 999);
+        let spend = priced_spend_since(&db, "ag-spend", Utc::now() - Duration::hours(1)).unwrap();
+        assert_eq!(spend.micros, 3_300);
+        assert_eq!(spend.unpriced_turns, 1);
+    }
+
+    #[test]
+    fn priced_spend_since_empty_group_is_zero_with_no_unpriced() {
+        let db = CentralDb::open_in_memory().unwrap();
+        seed(&db, "ag-other", "claude-sonnet-4-6", "anthropic", 100, 100);
+        let spend = priced_spend_since(&db, "ag-none", Utc::now() - Duration::hours(1)).unwrap();
+        assert_eq!(spend.micros, 0);
+        assert_eq!(spend.unpriced_turns, 0);
+    }
+
+    #[test]
+    fn priced_spend_since_ollama_is_priced_at_zero_not_unpriced() {
+        // Known-free local provider: positive knowledge of $0, so the
+        // turns are priced (at zero), not excluded as unpriced.
+        let db = CentralDb::open_in_memory().unwrap();
+        seed(&db, "ag-local", "qwen3.6:27b", "ollama", 100_000, 100_000);
+        let spend = priced_spend_since(&db, "ag-local", Utc::now() - Duration::hours(1)).unwrap();
+        assert_eq!(spend.micros, 0);
+        assert_eq!(spend.unpriced_turns, 0);
     }
 
     #[test]

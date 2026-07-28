@@ -302,29 +302,32 @@ impl ContainerManager {
             return Ok(false);
         }
 
-        // Budget gate. If the group has a daily_token_cap and today's
-        // turns already meet/exceed it, refuse to spawn. The inbound
-        // sits in the row until the cap resets at UTC midnight or the
-        // operator raises it via `cclaw groups budget set`.
+        // Budget gate. If the group has a daily_token_cap or a
+        // daily_cost_cap and today's usage already meets/exceeds it,
+        // refuse to spawn. The inbound sits in the row until the cap
+        // resets at UTC midnight or the operator raises it via
+        // `cclaw budgets set`.
         //
         // The user gets one in-channel reply per agent group per
         // notice window — without that, a chat goes silent and the
-        // user has no idea why. See `maybe_post_budget_exhausted` for
-        // the dedup window + the message text.
-        if self.is_over_budget(session)? {
+        // user has no idea why. See `daily_budget_message` for the
+        // per-cap message text and `maybe_post_budget_exhausted` for
+        // the dedup window.
+        if let Some((msg, gate_label)) = self.daily_budget_message(session)? {
             warn!(
                 session = %session.id.as_uuid(),
                 agent_group = %session.agent_group_id.as_uuid(),
-                "daily token budget exhausted; spawn deferred"
+                gate = gate_label,
+                "daily budget exhausted; spawn deferred"
             );
             // Fires once per refusal, before the dedup window check —
             // operators can alert on the spike independent of how many
             // reply notices actually went out.
             copperclaw_metrics::inc_budget_exhausted(
                 &session.agent_group_id.as_uuid().to_string(),
-                copperclaw_metrics::BUDGET_GATE_DAILY_TOKENS,
+                gate_label,
             );
-            if let Err(err) = self.maybe_post_budget_exhausted(session, &paths) {
+            if let Err(err) = self.maybe_post_budget_exhausted(session, &paths, &msg) {
                 // Notification failure is non-fatal; the spawn is
                 // still deferred and the warning above is in the log.
                 warn!(?err, "could not post budget-exhausted reply");

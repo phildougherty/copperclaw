@@ -535,7 +535,7 @@ async fn invoke_tool_inner(
             // clear (whose tool is out of C6's scope) lives here.
             apply_see_fix_hooks(deps, &call.name).await;
             (
-                render_tool_result(&result),
+                render_tool_result(&result, &crate::subagent::default_images_dir()),
                 extract_tool_images(&result),
                 false,
             )
@@ -609,7 +609,9 @@ pub(super) type ToolImage = (String, String);
 
 /// Pull any image content blocks out of a `CallToolResult`. Each becomes
 /// a `HistoryMessage::Image` so vision-capable models actually see the
-/// pixels (the text render only notes `<image>`).
+/// pixels (the text render saves the image to the session images dir and
+/// notes the path, so text-only providers can still reach it via
+/// `view_image`).
 pub(super) fn extract_tool_images(result: &rmcp::model::CallToolResult) -> Vec<ToolImage> {
     result
         .content
@@ -622,10 +624,16 @@ pub(super) fn extract_tool_images(result: &rmcp::model::CallToolResult) -> Vec<T
 }
 
 /// Pluck the textual content out of a `CallToolResult`. Multiple
-/// blocks get joined with double newlines; non-text blocks
-/// (resources, images) are rendered as their type tag so the model
-/// at least sees they happened.
-pub(super) fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
+/// blocks get joined with double newlines. Image blocks are saved to
+/// `images_dir` (capped; see `crate::subagent::save_tool_image`) and
+/// rendered as a `view_image`-able path reference — degrading to the
+/// legacy `<image>` marker plus a reason when the save is impossible.
+/// Other non-text blocks (audio, resources) render as their type tag
+/// so the model at least sees they happened.
+pub(super) fn render_tool_result(
+    result: &rmcp::model::CallToolResult,
+    images_dir: &std::path::Path,
+) -> String {
     let mut out = String::new();
     for block in &result.content {
         if !out.is_empty() {
@@ -634,7 +642,13 @@ pub(super) fn render_tool_result(result: &rmcp::model::CallToolResult) -> String
         let raw = &block.raw;
         match raw {
             rmcp::model::RawContent::Text(t) => out.push_str(&t.text),
-            rmcp::model::RawContent::Image(_) => out.push_str("<image>"),
+            rmcp::model::RawContent::Image(img) => {
+                out.push_str(&crate::subagent::render_image_block(
+                    images_dir,
+                    &img.mime_type,
+                    &img.data,
+                ));
+            }
             rmcp::model::RawContent::Audio(_) => out.push_str("<audio>"),
             rmcp::model::RawContent::Resource(_) => out.push_str("<resource>"),
         }
@@ -2208,5 +2222,50 @@ mod tests {
         .await;
         assert!(is_error);
         assert!(content.contains("not wired"), "got: {content}");
+    }
+
+    // ── image passthrough in the text render (M24 U3) ─────────────────────
+
+    #[test]
+    fn render_tool_result_saves_image_and_references_path() {
+        // A 1x1 PNG, standard base64.
+        const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let tmp = tempfile::tempdir().unwrap();
+        let result = rmcp::model::CallToolResult::success(vec![
+            rmcp::model::Content::text("shot"),
+            rmcp::model::Content::image(TINY_PNG_B64.to_string(), "image/png".to_string()),
+        ]);
+        let rendered = render_tool_result(&result, tmp.path());
+        assert!(
+            rendered.starts_with("shot\n\n[image saved: "),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(" — view with view_image]"),
+            "got: {rendered}"
+        );
+        // The referenced file exists and holds real PNG bytes.
+        let files: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let bytes = std::fs::read(files[0].path()).unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        // The vision path still extracts the image block independently.
+        assert_eq!(extract_tool_images(&result).len(), 1);
+    }
+
+    #[test]
+    fn render_tool_result_degrades_image_on_unwritable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("occupied");
+        std::fs::write(&blocked, b"file, not dir").unwrap();
+        let result = rmcp::model::CallToolResult::success(vec![rmcp::model::Content::image(
+            "QUJD".to_string(),
+            "image/png".to_string(),
+        )]);
+        let rendered = render_tool_result(&result, &blocked.join("images"));
+        assert!(
+            rendered.starts_with("<image> (cannot create"),
+            "got: {rendered}"
+        );
     }
 }

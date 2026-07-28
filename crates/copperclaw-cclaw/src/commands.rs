@@ -542,6 +542,14 @@ pub enum GroupsCmd {
     Delete { id: String },
     /// Restart the agent group's container.
     Restart { id: String },
+    /// Set which skills this group's agent sees (the
+    /// `container_configs.skills` selector). Sugar over
+    /// `groups config update --field 'skills=...'`.
+    Skills {
+        id: String,
+        #[command(subcommand)]
+        mode: GroupSkillsCmd,
+    },
     /// Container-config subcommands.
     Config {
         #[command(subcommand)]
@@ -593,6 +601,34 @@ pub enum GroupProviderCmd {
     },
     /// Remove the provider chain + pins + health (revert to single-provider).
     Clear { id: String },
+}
+
+/// `groups skills <id> ...` — pick the skills selector for a group. Each
+/// variant maps onto one accepted JSON form of the `skills` field of
+/// `groups.config.update`; defaults (empty query, host-side limit) are
+/// filled in by the host so the client never duplicates them.
+#[derive(Debug, Subcommand)]
+pub enum GroupSkillsCmd {
+    /// Expose every discovered skill (the default for new groups).
+    All,
+    /// FTS relevance narrowing: only the skills whose description scores
+    /// against the query are inlined at spawn. With no query (or an empty
+    /// one) the narrowing falls back to all skills.
+    Relevant {
+        /// Task text scored against each skill's description.
+        #[arg(long)]
+        query: Option<String>,
+        /// Cap on how many skills survive the narrowing (host default: 8).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Explicit allowlist: only the named skills, in the given order.
+    /// Names are validated host-side against the skills registry.
+    Only {
+        /// Skill names (at least one).
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1186,11 +1222,13 @@ pub enum PairingCmd {
 /// `cclaw budgets ...` — per-agent-group daily and rate-limit caps.
 #[derive(Debug, Subcommand)]
 pub enum BudgetsCmd {
-    /// List all configured budgets (daily token cap + rate caps).
+    /// List all configured budgets (daily token cap + daily dollar cap +
+    /// rate caps), each shown next to today's spend and a breach state.
     List,
     /// Set or update a group's caps.
     ///
     /// `--daily-tokens 0` or `--clear` removes the daily token cap.
+    /// `--daily-cost 0` removes the daily dollar cap.
     /// `--turns-per-minute 0` removes the per-minute rate cap.
     /// `--turns-per-hour 0` removes the per-hour rate cap.
     Set {
@@ -1198,6 +1236,11 @@ pub enum BudgetsCmd {
         agent_group_id: String,
         #[arg(long)]
         daily_tokens: Option<i64>,
+        /// Daily dollar cap (USD, fractional allowed — e.g. 2.50).
+        /// Enforced against *priced* spend only: turns on models with no
+        /// known price do not count toward it. 0 = remove cap.
+        #[arg(long)]
+        daily_cost: Option<f64>,
         /// Max LLM calls per trailing 60-second window. 0 = remove cap.
         #[arg(long)]
         turns_per_minute: Option<i64>,
@@ -1488,6 +1531,31 @@ impl GroupsCmd {
                 "groups.config.set-coding-enabled",
                 json!({"id": id, "enabled": false}),
             ),
+            Self::Skills { id, mode } => {
+                let value = match mode {
+                    GroupSkillsCmd::All => json!("all"),
+                    GroupSkillsCmd::Relevant { query, limit } => {
+                        if query.is_none() && limit.is_none() {
+                            // Bare shorthand: the host fills the defaults.
+                            json!("relevant")
+                        } else {
+                            let mut o = Map::new();
+                            if let Some(q) = query {
+                                o.insert("query".into(), q.clone().into());
+                            }
+                            if let Some(l) = limit {
+                                o.insert("limit".into(), (*l).into());
+                            }
+                            json!({ "relevant": Value::Object(o) })
+                        }
+                    }
+                    GroupSkillsCmd::Only { names } => json!(names),
+                };
+                ParsedCall::new(
+                    "groups.config.update",
+                    json!({"id": id, "field": "skills", "value": value}),
+                )
+            }
             Self::Config { action } => action.to_call(),
             Self::Provider { action } => action.to_call(),
         }
@@ -1938,6 +2006,7 @@ impl BudgetsCmd {
             Self::Set {
                 agent_group_id,
                 daily_tokens,
+                daily_cost,
                 turns_per_minute,
                 turns_per_hour,
                 clear,
@@ -1950,6 +2019,9 @@ impl BudgetsCmd {
                     o.insert("daily_tokens".into(), (*n).into());
                 }
                 // 0 means "remove the cap" (normalised to null by the host).
+                if let Some(d) = daily_cost {
+                    o.insert("daily_cost".into(), (*d).into());
+                }
                 if let Some(n) = turns_per_minute {
                     o.insert("turns_per_minute".into(), (*n).into());
                 }
@@ -2130,6 +2202,82 @@ mod tests {
         assert_eq!(
             parse(&["cclaw", "groups", "restart", "x"]).command,
             "groups.restart"
+        );
+    }
+
+    // --- group skills (M24 U1) ---------------------------------------------
+
+    #[test]
+    fn groups_skills_all() {
+        let p = parse(&["cclaw", "groups", "skills", "id1", "all"]);
+        assert_eq!(p.command, "groups.config.update");
+        assert_eq!(p.args, json!({"id":"id1","field":"skills","value":"all"}));
+    }
+
+    #[test]
+    fn groups_skills_relevant_bare_sends_shorthand() {
+        let p = parse(&["cclaw", "groups", "skills", "id1", "relevant"]);
+        assert_eq!(p.command, "groups.config.update");
+        assert_eq!(
+            p.args,
+            json!({"id":"id1","field":"skills","value":"relevant"})
+        );
+    }
+
+    #[test]
+    fn groups_skills_relevant_with_query_and_limit() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "skills",
+            "id1",
+            "relevant",
+            "--query",
+            "deploy the bot",
+            "--limit",
+            "3",
+        ]);
+        assert_eq!(
+            p.args,
+            json!({
+                "id": "id1",
+                "field": "skills",
+                "value": {"relevant": {"query": "deploy the bot", "limit": 3}},
+            })
+        );
+    }
+
+    #[test]
+    fn groups_skills_relevant_with_only_limit_omits_query() {
+        // The host defaults the missing query to "" — the client must not
+        // invent one.
+        let p = parse(&[
+            "cclaw", "groups", "skills", "id1", "relevant", "--limit", "5",
+        ]);
+        assert_eq!(
+            p.args,
+            json!({
+                "id": "id1",
+                "field": "skills",
+                "value": {"relevant": {"limit": 5}},
+            })
+        );
+    }
+
+    #[test]
+    fn groups_skills_only_sends_name_array() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "skills",
+            "id1",
+            "only",
+            "git-commit",
+            "testing",
+        ]);
+        assert_eq!(
+            p.args,
+            json!({"id":"id1","field":"skills","value":["git-commit","testing"]})
         );
     }
 
@@ -3400,6 +3548,39 @@ mod tests {
     }
 
     // --- budgets rate-limit flags ------------------------------------------
+
+    #[test]
+    fn budgets_set_accepts_daily_cost() {
+        let p = parse(&[
+            "cclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--daily-cost",
+            "2.5",
+        ]);
+        assert_eq!(p.command, "budgets.set");
+        assert_eq!(p.args["agent_group_id"], "ag-1");
+        assert_eq!(p.args["daily_cost"], 2.5);
+        assert!(p.args.get("daily_tokens").is_none());
+    }
+
+    #[test]
+    fn budgets_set_zero_daily_cost_emits_zero() {
+        // 0 reaches the host as-is; the handler normalises it to null
+        // ("remove the cap") so list output stays consistent.
+        let p = parse(&[
+            "cclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--daily-cost",
+            "0",
+        ]);
+        assert_eq!(p.args["daily_cost"], 0.0);
+    }
 
     #[test]
     fn budgets_set_accepts_turns_per_minute() {

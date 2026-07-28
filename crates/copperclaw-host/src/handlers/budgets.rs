@@ -1,21 +1,60 @@
 //! Handlers for `budgets.*` commands.
 
+use super::usage::{cost_cap_micros, priced_spend_since};
 use super::{db_err, parse_agent_group_id, req_str};
 use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::tables::group_budgets;
+use copperclaw_db::tables::{agent_turns, group_budgets};
 use serde_json::{Value, json};
 
-/// `budgets.list` — every configured budget.
+/// `budgets.list` — every configured budget, with today's spend beside
+/// each cap so a breached budget is visible where the caps live.
+///
+/// Additive columns per row: `tokens_today` (input + output since UTC
+/// midnight), `cost_today_micros` (priced spend since UTC midnight — the
+/// SAME rollup the `daily_cost_cap` spawn gate compares, so list and gate
+/// can never disagree), `cost_today_unpriced_turns` (turns excluded from
+/// that sum because their model has no known price; when > 0 the dollar
+/// figure is a floor, not a total), and the host-computed breach flags
+/// `over_daily_token_cap` / `over_daily_cost_cap`.
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let rows = group_budgets::list(central).map_err(db_err)?;
-    Ok(json!(rows.iter().map(budget_to_json).collect::<Vec<_>>()))
+    let midnight = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc();
+    let mut out = Vec::with_capacity(rows.len());
+    for b in &rows {
+        let ag_id = b.agent_group_id.as_uuid().to_string();
+        let tokens_today = agent_turns::tokens_since(central, &ag_id, midnight).map_err(db_err)?;
+        let spend = priced_spend_since(central, &ag_id, midnight).map_err(db_err)?;
+        let over_token_cap = b.daily_token_cap.is_some_and(|cap| tokens_today >= cap);
+        let over_cost_cap = b
+            .daily_cost_cap
+            .and_then(cost_cap_micros)
+            .is_some_and(|cap_micros| spend.micros >= cap_micros);
+        let mut v = budget_to_json(b);
+        let obj = v.as_object_mut().expect("budget_to_json returns an object");
+        obj.insert("tokens_today".into(), json!(tokens_today));
+        obj.insert("cost_today_micros".into(), json!(spend.micros));
+        obj.insert(
+            "cost_today_unpriced_turns".into(),
+            json!(spend.unpriced_turns),
+        );
+        obj.insert("over_daily_token_cap".into(), json!(over_token_cap));
+        obj.insert("over_daily_cost_cap".into(), json!(over_cost_cap));
+        out.push(v);
+    }
+    Ok(json!(out))
 }
 
 /// `budgets.set` — upsert. Pass `daily_tokens: null` (via the
 /// `--clear` flag in cclaw) to remove the daily cap.
 /// `turns_per_minute` and `turns_per_hour` follow the same convention:
 /// absent = keep existing value, 0 or null = remove cap.
+/// `daily_cost` (USD per day, fractional allowed) follows it too:
+/// absent = keep existing value, 0/negative or null = remove cap.
 pub fn set(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let agent_group_id = parse_agent_group_id(args, "agent_group_id")?;
 
@@ -79,13 +118,43 @@ pub fn set(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         None => prev.and_then(|r| r.agent_turns_per_hour_cap),
     };
 
+    // `daily_cost` — the dollar cap (USD per day), enforced by the same
+    // spawn gate as `daily_token_cap`. Absent = preserve the stored cap
+    // (before this field existed, every `budgets.set` silently wiped it);
+    // null or <= 0 = remove; positive finite number = set.
+    let daily_cost_cap = match args.get("daily_cost") {
+        None => prev.and_then(|r| r.daily_cost_cap),
+        Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let v = n.as_f64().ok_or_else(|| {
+                ErrorPayload::new(
+                    "bad_request",
+                    format!("daily_cost must be a number, got {n}"),
+                )
+            })?;
+            if !v.is_finite() {
+                return Err(ErrorPayload::new(
+                    "bad_request",
+                    "daily_cost must be a finite number",
+                ));
+            }
+            if v <= 0.0 { None } else { Some(v) }
+        }
+        Some(other) => {
+            return Err(ErrorPayload::new(
+                "bad_request",
+                format!("daily_cost must be a non-negative number or null, got {other}"),
+            ));
+        }
+    };
+
     let _ = req_str; // silence dead-code lint in trimmed builds
     let row = group_budgets::upsert(
         central,
         group_budgets::UpsertGroupBudget {
             agent_group_id,
             daily_token_cap,
-            daily_cost_cap: None,
+            daily_cost_cap,
             agent_turns_per_minute_cap,
             agent_turns_per_hour_cap,
         },
@@ -236,6 +305,157 @@ mod tests {
         )
         .unwrap();
         assert!(v["agent_turns_per_minute_cap"].is_null());
+    }
+
+    /// Insert one `agent_turns` row for `ag` timestamped now (inside the
+    /// UTC-midnight window `budgets.list` rolls up).
+    fn seed_turn(db: &CentralDb, ag: &str, model: &str, provider: &str, input: i64, output: i64) {
+        copperclaw_db::tables::agent_turns::insert(
+            db,
+            &copperclaw_db::tables::agent_turns::NewAgentTurn {
+                session_id: "s-1".into(),
+                agent_group_id: ag.into(),
+                seq: 1,
+                model: model.into(),
+                provider: provider.into(),
+                input_tokens: input,
+                output_tokens: output,
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+                status: "ok".into(),
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_daily_cost_round_trips_and_zero_clears() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let ag = AgentGroupId::new();
+        let v = set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 1000,
+                "daily_cost": 2.5,
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["daily_cost_cap"], 2.5);
+        // 0 removes the cost cap (same convention as the other caps).
+        let v = set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 1000,
+                "daily_cost": 0,
+            }),
+            &db,
+        )
+        .unwrap();
+        assert!(v["daily_cost_cap"].is_null());
+    }
+
+    #[test]
+    fn set_omitting_daily_cost_preserves_existing() {
+        // Regression: before the `daily_cost` field existed, every
+        // `budgets.set` silently wiped a stored cost cap.
+        let db = CentralDb::open_in_memory().unwrap();
+        let ag = AgentGroupId::new();
+        set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 1000,
+                "daily_cost": 1.25,
+            }),
+            &db,
+        )
+        .unwrap();
+        let v = set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 2000,
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["daily_cost_cap"], 1.25);
+    }
+
+    #[test]
+    fn set_rejects_non_numeric_daily_cost() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let ag = AgentGroupId::new();
+        let err = set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 1000,
+                "daily_cost": "lots",
+            }),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn list_includes_today_spend_and_breach_flags() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let ag = AgentGroupId::new();
+        // Cap $0.01 (10_000 micros) + token cap well above usage.
+        set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": 1_000_000,
+                "daily_cost": 0.01,
+            }),
+            &db,
+        )
+        .unwrap();
+        let ag_str = ag.as_uuid().to_string();
+        // Priced spend: sonnet 1000 in + 500 out = 10_500 micros (over).
+        seed_turn(&db, &ag_str, "claude-sonnet-4-6", "anthropic", 1_000, 500);
+        // Unpriced spend: excluded from the sum, counted separately.
+        seed_turn(&db, &ag_str, "mystery-model-9", "somevendor", 10, 10);
+
+        let rows = list(&json!({}), &db).unwrap();
+        let row = &rows.as_array().unwrap()[0];
+        assert_eq!(row["daily_cost_cap"], 0.01);
+        assert_eq!(row["tokens_today"], 1_520);
+        assert_eq!(row["cost_today_micros"], 10_500);
+        assert_eq!(row["cost_today_unpriced_turns"], 1);
+        assert_eq!(row["over_daily_cost_cap"], true);
+        assert_eq!(row["over_daily_token_cap"], false);
+    }
+
+    #[test]
+    fn list_flags_false_when_caps_unset() {
+        // Cap unset means no cost gate: heavy spend, no breach flag.
+        let db = CentralDb::open_in_memory().unwrap();
+        let ag = AgentGroupId::new();
+        set(
+            &json!({
+                "agent_group_id": ag.as_uuid().to_string(),
+                "daily_tokens": Value::Null,
+            }),
+            &db,
+        )
+        .unwrap();
+        let ag_str = ag.as_uuid().to_string();
+        seed_turn(
+            &db,
+            &ag_str,
+            "claude-sonnet-4-6",
+            "anthropic",
+            1_000_000,
+            1_000_000,
+        );
+        let rows = list(&json!({}), &db).unwrap();
+        let row = &rows.as_array().unwrap()[0];
+        assert_eq!(row["over_daily_token_cap"], false);
+        assert_eq!(row["over_daily_cost_cap"], false);
+        // Spend is still visible even with no caps configured.
+        assert_eq!(row["cost_today_micros"], 18_000_000);
     }
 
     #[test]

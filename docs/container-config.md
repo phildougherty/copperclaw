@@ -31,8 +31,8 @@ Before every spawn it compares the live fingerprint to the stored
 When does the fingerprint change?
 
 - **Operator-driven**: `cclaw groups config add-package --apt jq`,
-  `... remove-package --npm typescript`, `... set-skills ...`,
-  `... set-mcp-servers ...`.
+  `... remove-package --npm typescript`, `cclaw groups skills <id> ...`,
+  `... add-mcp-server ...`.
 - **Agent-driven**: the agent calls the `install_packages` /
   `add_mcp_server` tools, which write `container_configs` directly.
   The next spawn rebuilds — the agent does NOT need to wait for an
@@ -55,6 +55,70 @@ blip during `apt-get update`, etc.):
 - If the group has **no** prior `image_tag` (first-ever build for a
   newly-configured group), the spawn errors and the session stays
   Stopped. The manager retries on the next tick.
+
+## Skills selector
+
+Stored as `container_configs.skills` — a JSON value in one of three
+shapes:
+
+| Stored form | Meaning |
+|---|---|
+| `"all"` | Every discovered skill inlines (the default). |
+| `["name", ...]` | Explicit allowlist: only the named skills, in listed order. |
+| `{"relevant": {"query": "...", "limit": N}}` | FTS relevance narrowing (M22 S2): only the up-to-`N` skills whose `description` scores against `query` inline. |
+
+### Setting it
+
+The dedicated subcommand:
+
+```
+cclaw groups skills <group-id> all
+cclaw groups skills <group-id> relevant --query "code review and testing" --limit 8
+cclaw groups skills <group-id> only git-commit testing
+```
+
+Or the generic field update (value JSON-encoded, note the quoting):
+
+```
+cclaw groups config update --field 'skills="all"' <group-id>
+cclaw groups config update --field 'skills="relevant"' <group-id>
+cclaw groups config update --field 'skills=["git-commit","testing"]' <group-id>
+cclaw groups config update --field 'skills={"relevant":{"query":"code review","limit":8}}' <group-id>
+cclaw groups config update --field 'skills=null' <group-id>   # reset to "all"
+```
+
+Both routes go through `groups.config.update`, which also accepts:
+
+- the bare string `"relevant"` — shorthand for
+  `{"relevant": {"query": "", "limit": 8}}`;
+- a `{"relevant": {...}}` object with either key omitted (`query`
+  defaults to `""`, `limit` to `8`; `limit` must be >= 1);
+- `null` — reset to `"all"`.
+
+### Validation
+
+Explicit skill names are validated at write time against the skills
+registry (the global `COPPERCLAW_SKILLS_DIR` plus this group's
+`<groups_dir>/<group-id>/skills/` override — the same roots prompt
+assembly scans at spawn). An unknown name is rejected with a
+`bad_request` listing the offenders and every available skill. When no
+skills directory is configured (or the registry scan fails on a
+malformed skill), the list is accepted unvalidated — at spawn time
+unknown names are warn-skipped, never fatal.
+
+### Behaviour notes
+
+- **`relevant` with an empty query behaves like `all`** (the scorer is
+  fail-open), so the bare `"relevant"` shorthand only narrows once a
+  query is set. Use the object form with a task-shaped `query` for
+  actual narrowing.
+- An empty explicit list (`[]`) is valid and inlines zero skills.
+- The `coding_enabled` flag caps only the `"all"` selector; explicit
+  lists (and relevance picks) are honoured as-is.
+- `skills` is a **fingerprint field** (see "Image rebuild on diff"
+  above): changing it forces an image rebuild before the next spawn.
+  Like every container-config change it takes effect at the next
+  container spawn — `cclaw groups restart <group-id>` to force one.
 
 ## Egress allow-list
 

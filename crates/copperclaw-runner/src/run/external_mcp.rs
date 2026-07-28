@@ -125,9 +125,12 @@ fn copperclaw_host_mcp_tools_filename() -> &'static str {
 /// [`EXTERNAL_MCP_DEADLINE_SECS`]), taint the turn, and render the result into
 /// the `(content, images, is_error)` triple `invoke_tool` returns.
 ///
-/// Images are not surfaced for external MCP tools in this version — the
-/// response is the host-rendered text; an image-bearing remote result is noted
-/// as `<image>` host-side. The empty image vec keeps the signature uniform.
+/// Images are not surfaced as vision blocks for external MCP tools — the
+/// response is the host-rendered text. An image-bearing remote result is saved
+/// host-side into the session's `/data/.copperclaw/images/` dir (capped) and
+/// referenced in the rendered text as a path the agent can open with
+/// `view_image`; an unsavable image degrades to a `<image> (reason)` marker.
+/// The empty image vec keeps the signature uniform.
 pub(super) async fn dispatch_external(
     deps: &RunnerDeps,
     route: &ExternalToolRoute,

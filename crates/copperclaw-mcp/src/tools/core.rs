@@ -10,13 +10,17 @@ use crate::context::Recipient;
 use crate::error::ToolError;
 
 /// Shared `to` field. Accepted forms:
+/// - `"user"` — the human in the ROOT conversation of the spawn chain.
+/// - `"agent:parent"` — the agent that spawned this session.
 /// - `"telegram:chat-123"` — bare channel id string (convenience).
 /// - `{ "kind": "channel", "id": "..." }` / `{ "kind": "agent", ... }` /
-///   `{ "kind": "user", ... }` — explicit `Recipient`.
+///   `{ "kind": "user", ... }` / `{ "kind": "parent" }` /
+///   `{ "kind": "root_user" }` — explicit `Recipient`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RecipientInput {
-    /// Bare string form: treated as a fully-qualified channel id.
+    /// Bare string form: the special `"user"` / `"agent:parent"`
+    /// shorthands, else a fully-qualified channel id.
     Channel(String),
     /// Explicit tagged form.
     Tagged(Recipient),
@@ -25,7 +29,7 @@ pub(crate) enum RecipientInput {
 impl RecipientInput {
     pub(crate) fn into_recipient(self) -> Recipient {
         match self {
-            Self::Channel(id) => Recipient::Channel { id },
+            Self::Channel(id) => Recipient::from_to_string(&id),
             Self::Tagged(r) => r,
         }
     }
@@ -40,6 +44,8 @@ pub(crate) fn validate_to(input: Option<RecipientInput>) -> Result<Option<Recipi
     let id_empty = match &r {
         Recipient::Channel { id } | Recipient::User { id } => id.trim().is_empty(),
         Recipient::Agent { session_id } => session_id.trim().is_empty(),
+        // Virtual recipients carry no id; the runner resolves them.
+        Recipient::Parent | Recipient::RootUser => false,
     };
     if id_empty {
         return Err(ToolError::Validation("`to` id is empty".into()));
@@ -70,7 +76,10 @@ pub mod send_message {
     pub fn schema() -> Tool {
         make_tool(
             "send_message",
-            "Send a plain-text message. Omit `to` to reply on the originating channel.",
+            "Send a plain-text message. Omit `to` to reply on the default destination \
+             (your parent agent if you were spawned by one, the originating channel \
+             otherwise). Special forms: `to: \"user\"` reaches the human in the root \
+             conversation; `to: \"agent:parent\"` reaches the agent that spawned you.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -504,6 +513,45 @@ mod tests {
             }) => assert_eq!(session_id, "sess_2"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_message_with_user_shorthand_parses_root_user() {
+        // Phase 2 of docs/plans/agent-to-agent-routing.md: the bare
+        // string `"user"` means "the human in the ROOT conversation",
+        // not a channel named `user`.
+        let ctx = MockToolContext::new();
+        send_message::handle(
+            args_from(serde_json::json!({"to": "user", "text": "hi"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &ctx.calls()[0],
+            OutboundToolEffect::SendMessage(SendMessageSpec {
+                to: Some(Recipient::RootUser),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_message_with_agent_parent_shorthand_parses_parent() {
+        let ctx = MockToolContext::new();
+        send_message::handle(
+            args_from(serde_json::json!({"to": "agent:parent", "text": "done"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &ctx.calls()[0],
+            OutboundToolEffect::SendMessage(SendMessageSpec {
+                to: Some(Recipient::Parent),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
