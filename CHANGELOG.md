@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (M24 — truth wave)
+
+- **`install-packages` skill no longer denies session-scope installs.**
+  M18 E1 shipped `scope: "session"` (pip into `/data/.venv`, npm into
+  `/data/.npm-global`, usable the same turn), but the skill still taught
+  the pre-E1 model — "you will wait forever", manual `/data` workarounds
+  — and `databases`/`coding-task` propagated the claim. All three now
+  teach the real scope semantics (apt is always image-scoped; pip is
+  session-only; npm is both), the activation lines, and the classified
+  failure modes. The inverse stale claim was in the code: `self_mod.rs`'s
+  module docs and image-scope ack said effects were "awaiting approval",
+  while the delivery loop applies them directly
+  (`apply_install_packages`) — comments and ack text corrected; the
+  runner's provenance-policy gate (Full profile, no tainted/autonomous
+  turns) is now stated as the actual gate.
+- **`docs/replay-fixtures.md` no longer documents a phantom capture
+  pipeline.** The `COPPERCLAW_FIXTURE_CAPTURE` / `fixture/redact.rs`
+  instructions (never implemented) are replaced with the real authoring
+  flow: hand-authored fixture dirs plus the per-card
+  `COPPERCLAW_*_GENERATE` guards that dump `expected/*.jsonl` via
+  `ReplayHarness::dump_expected_jsonl`. Implementing real capture is
+  parked as an M25 candidate in `docs/plans/m24-debt-and-unlock-program.md`.
+- **Stale anchors corrected**: two comments still referencing the
+  M18-R0-deleted `DISALLOWED_TOOLS` floor
+  (`container_manager/runner_config.rs`, `db/tables/container_configs.rs`);
+  the M18 plan doc's "V5 HELD" card row and closing line (PR #55 merged
+  2026-07-16); and `run/lsp.rs` docs now state plainly that
+  `Backend::LanguageServerAssisted` records a detected server binary over
+  a ctags index — no server is launched or queried.
+- **M24 program plan** at `docs/plans/m24-debt-and-unlock-program.md`:
+  the audited gap list from the m17-m23 plan-doc review, organized as
+  truth (this wave), security-debt, and unlock waves, with the verified
+  non-gaps parked for M25.
+
 ### Added (M23 — software-architect capability, wave 3)
 
 - **Design-review critic in the architecture skill.** For designs that

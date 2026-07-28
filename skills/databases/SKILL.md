@@ -18,11 +18,13 @@ The environment you are working in:
   processes.
 - **Probe before you bake**: groups on the `backend` image profile
   already ship Postgres, MariaDB, and Redis — check `command -v
-  initdb mariadbd redis-server` first. Otherwise server packages must
-  be **baked into the image** via `install_packages` and appear in a
-  *future* session, not this one (see [[install-packages]]). Request
-  them the moment you know you'll need them, then continue with SQLite
-  or a tarball fallback this session if you can't wait.
+  initdb mariadbd redis-server` first. Server packages are apt, and
+  apt only installs at image-build time: `install_packages` with
+  `scope: "image"` bakes them into a *future* session, never this one
+  (see [[install-packages]]). Request them the moment you know you'll
+  need them, then continue with SQLite or a tarball fallback this
+  session. Client libraries are different — a pip driver or npm
+  client lands live, this turn, via `scope: "session"`.
 - Keep every data dir, socket, and pid file under `/data` — it is the
   only writable, session-persistent path. `/var/lib/*` and `/run/*`
   are root-owned; pointing a server at them is the #1 failure.

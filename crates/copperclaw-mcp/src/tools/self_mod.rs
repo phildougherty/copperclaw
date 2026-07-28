@@ -1,7 +1,11 @@
 //! Self-modification tools: `install_packages`, `add_mcp_server`.
 //!
-//! These tools never actually mutate the container themselves — they request
-//! an approval. The runner translates the effect into an approval row.
+//! These tools never rebuild the container image themselves. An image-scoped
+//! effect is applied directly to the group's `container_configs` by the host
+//! delivery loop (no operator-approval gate — see
+//! `copperclaw-host-delivery::service::apply_install_packages`); the image
+//! rebuilds at the next spawn. The runner's provenance policy still gates the
+//! tool itself (Full profile only; blocked on tainted/autonomous turns).
 
 pub mod install_packages {
     //! `install_packages`: install apt / npm / pip packages.
@@ -9,7 +13,7 @@ pub mod install_packages {
     //! Two scopes (M18 E1):
     //!
     //! - `scope: "image"` (default, unchanged): records the packages into the
-    //!   group's pending `container_configs` and requests approval; they are
+    //!   group's `container_configs` (applied directly at delivery); they are
     //!   baked into the image on the *next* container spawn. Nothing changes in
     //!   the current session.
     //! - `scope: "session"`: runs the ecosystem-appropriate LOCAL install into
@@ -64,7 +68,7 @@ pub mod install_packages {
         make_tool(
             "install_packages",
             "Install apt / npm / pip packages. `scope:\"image\"` (default) bakes \
-             them into the next container image (subject to approval). \
+             them into the next container image (applied at delivery). \
              `scope:\"session\"` ALSO installs pip/npm into the session's /data \
              right now so they work this turn — the default you want mid-build.",
             serde_json::json!({
@@ -99,8 +103,8 @@ pub mod install_packages {
     }
 
     /// The two ack states the card calls out. `ImagePending` is emitted at
-    /// tool-emit time for `scope: "image"` (nothing ran yet — awaiting approval
-    /// then the next rebuild). `SessionDone` is emitted after the in-container
+    /// tool-emit time for `scope: "image"` (nothing ran yet — the host applies
+    /// the config change at delivery, then the next rebuild picks it up). `SessionDone` is emitted after the in-container
     /// install actually ran for `scope: "session"`.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum InstallAck {
@@ -146,7 +150,7 @@ pub mod install_packages {
                         parts.push(format!("npm: {}", npm.join(", ")));
                     }
                     format!(
-                        "Recorded for the NEXT image build (awaiting approval): {}. \
+                        "Recorded for the NEXT image build: {}. \
                          These do NOT apply to the current session — they install \
                          when the container next rebuilds. If you need a package \
                          right now, call install_packages again with scope:\"session\".",

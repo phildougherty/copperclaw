@@ -194,7 +194,7 @@ main..<branch> --oneline` yourself first.
 | C5 | **Merged (part 1; renderer split to C5b).** Adapter rich-surface floors for signal / whatsapp-cloud / mattermost (each a new `render.rs`): mattermost + signal gained `edit_message` → added to `EDIT_CAPABLE_CHANNELS`; whatsapp-cloud correctly stays non-edit-capable (Cloud API can't edit sent messages). Plus the two PR-#30 stale-doc-comment fixes (`emit_breadcrumb`→`emit_task_hud`). Shared markdown renderer + `fence.rs` migration deferred to **C5b** (Wave C). Gate 7148/0, fmt clean. | #52 |
 | C5b | **Merged.** Shared `channels/core::markdown` renderer (Html/Discord/Mattermost/Slack/WhatsApp/Plain flavors: headings, code, bold/italic/strike, links, nested lists, blockquotes) + C2's `fence.rs` migrated into it; `host-delivery` now delegates (`fence.rs` left a cfg(test) shim). C2's 17 splitter tests still pass through the relocated logic. Gate 7191/0, fmt clean. | #53 |
 | R7 | **Merged.** New `delegate` MCP tool → write-capable middle-tier build worker: permission-gated + depth-capped (reuses `create_agent` gates), each delegate in its own isolated `sib/<id>` worktree, contained (NULL messaging group → reports only to parent, can't post to user chat). No `spawn.rs` change (reused worktree mechanics via a `SpawnProfile` param). Single-call parallel fan-out orchestration deferred (parents fan out by calling `delegate` N times). Gate 7166/0, fmt clean. | #54 |
-| V5 | **PR open — HELD for human security sign-off (NOT merged).** Public tunnel module (`copperclaw-modules/src/tunnel.rs`): `TunnelProvider` trait + `CloudflaredProvider` (operator-provided binary, anonymous quick tunnel — no Cloudflare credential read/stored), off-by-default/per-group opt-in, every exposure a `CredentialedExternalAction` `pending_approvals` row (single-use grant), audit-rowed, auto-teardown with the preview, absent-binary → clean `BinaryNotFound`. Real `credentialed_external_action` apply arm replaces G1's placeholder. `security-review` skill run: no HIGH findings; 2 sub-threshold gaps (reusable grant → single-use; payload/upstream confused-deputy → uses approved grant's stored upstream) found AND fixed pre-sign-off. Threat model in PR "## Security review". Gate 7180/0, fmt clean. | #55 |
+| V5 | **Merged 2026-07-16 (after human security sign-off).** Public tunnel module (`copperclaw-modules/src/tunnel.rs`): `TunnelProvider` trait + `CloudflaredProvider` (operator-provided binary, anonymous quick tunnel — no Cloudflare credential read/stored), off-by-default/per-group opt-in, every exposure a `CredentialedExternalAction` `pending_approvals` row (single-use grant), audit-rowed, auto-teardown with the preview, absent-binary → clean `BinaryNotFound`. Real `credentialed_external_action` apply arm replaces G1's placeholder. `security-review` skill run: no HIGH findings; 2 sub-threshold gaps (reusable grant → single-use; payload/upstream confused-deputy → uses approved grant's stored upstream) found AND fixed pre-sign-off. Threat model in PR "## Security review". Gate 7180/0, fmt clean. | #55 |
 | M1 | **Merged.** Metrics rider: ~55 `copperclaw_*` metrics swept from merged PRs #24-#54, each registered + emitted at a verified call site (52 files: metrics crate + emit sites across channels/mcp/browser/modules/runner/host/router/delivery). Adapted: R1 gauge→counter (cross-process consumer). Dropped (no distinct code path, would misattribute): P3/X2 ritual-card metrics. Deferred to **M1b**: V2 tombstone-duration + R7 concurrent-delegates histograms (need runtime state not yet on `main`); V5 tunnel metrics (unmerged). Gate 7206/0, fmt clean. | #56 |
 
 ### R3 history (merged as #32 — skip unless you're touching the gate)
@@ -1419,10 +1419,10 @@ called for. Screenshots archived in the eighth-session chat.
    Also: only 1 git commit vs the commit-per-increment discipline (prompt
    adherence, not a system bug).
 
-**Remaining to call the program fully done:** merge **V5 #55** after security
-sign-off. (The live smoke is now PASSED; the todo-store race + the two minor
-guards + the preview-taint UX question are post-M18 hardening follow-ups, none
-blocking.)
+**Program fully done:** **V5 #55** merged 2026-07-16 after security sign-off —
+the last held card. (The live smoke is PASSED; the todo-store race + the two
+minor guards + the preview-taint UX question are post-M18 hardening follow-ups,
+none blocking.)
 
 ## Deferred / rejected (don't re-litigate)
 

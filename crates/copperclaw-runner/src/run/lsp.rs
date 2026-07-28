@@ -14,11 +14,13 @@
 //! (decision **(f)**). It picks the richest backend the image actually
 //! carries and degrades cleanly when a heavier one is absent:
 //!
-//! 1. **Language server** (rust-analyzer for a `Cargo.toml` repo,
+//! 1. **Language-server *hint*** (rust-analyzer for a `Cargo.toml` repo,
 //!    typescript-language-server / `tsserver` for a `package.json` /
-//!    `tsconfig.json` repo) — probed for and *recorded* when present, so a
-//!    future card can add a live JSON-RPC go-to-def path without disturbing
-//!    this bridge or the tool contract. A full LSP client is intentionally
+//!    `tsconfig.json` repo) — probed for on `PATH` and *recorded* when
+//!    present, nothing more: no server process is launched, no JSON-RPC
+//!    is spoken, no query is ever answered by the server. The hint exists
+//!    so a future card can add a live go-to-def path without disturbing
+//!    this bridge or the tool contract. A real LSP client is intentionally
 //!    deferred (its fragility is exactly what decision **(f)**'s pragmatism
 //!    note steers away from); the queryable artifact today is the ctags
 //!    index below, which every language the agent builds in can produce.
@@ -43,11 +45,13 @@ use copperclaw_mcp::tools::find_symbol::{TAGS_REL_PATH, parse_tags};
 /// Which backend actually produced (or would have produced) the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// A fitting language server is present *and* the ctags index was built.
-    /// The index is ctags-backed; the server is recorded for a future live
+    /// The ctags index was built, and a fitting language-server binary was
+    /// *detected* on `PATH` alongside it. Despite the name, no server is
+    /// launched or queried — symbol lookup is served entirely from the
+    /// ctags index; the server name is a recorded hint for a future live
     /// go-to-def path (see the module docs).
     LanguageServerAssisted {
-        /// The server binary that was found on `PATH`.
+        /// The server binary that was found on `PATH` (never run).
         server: &'static str,
     },
     /// The ctags index was built (no language server present, or none fits).

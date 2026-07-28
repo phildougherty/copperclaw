@@ -11,10 +11,10 @@ ships `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`, `jq`,
 `typescript`, `eslint`, `prettier`, `tailwindcss`, `ruff`, `sqlite3`,
 `create-vite`/`vite` — probe first (`command -v eslint`).
 
-Need a toolchain in neither (Go, Rust, a JVM)? Don't call
-`install_packages` and wait — it only rebuilds the image for a *future*
-session. Untar the official build into `/data` and extend `PATH` — no
-root, no apt. See [[install-packages]].
+Need a pip/npm package right now? `install_packages` with
+`scope: "session"` installs it into `/data` this turn. A toolchain on
+neither (Go, Rust, a JVM): untar the official build into `/data` and
+extend `PATH` — no root, no apt. See [[install-packages]].
 
 ## Every project is a git repo (do this first)
 
