@@ -79,15 +79,17 @@ in-thread.
 ## `content` shape per kind
 
 - `chat`: `{ "text": "...", "sender": {...} }` + optional `files`.
-- `task`: the prompt you registered with `schedule_task` + `recurrence`
-  (so you recognise the scheduled fire) + `series_id` (correlates
-  fires).
-- `webhook`: the verbatim JSON the external service POSTed, under
-  `body`.
-- `system`: `{ "kind": "<sub-kind>", ... }`. Sub-kinds:
-  `cli_request`, `cli_response`, ack payloads.
-- `agent`: same shape as `chat` but with `source_session_id` set and
-  no `sender.channel_type`.
+- `task`: `{ "prompt": "..." }` — the prompt you registered with
+  `schedule_task`; the row also carries `recurrence` (so you recognise
+  the scheduled fire) and `series_id` (correlates fires).
+- `webhook`: the content IS the verbatim JSON the external service
+  POSTed (no wrapper key).
+- `system`: host-internal synthetic payloads with no fixed schema —
+  e.g. a question-expiry result for `ask_user_question`, approval and
+  control notices. Rendered under a `[system]` header; read the JSON,
+  don't assume `text`.
+- `agent`: same shape as `chat` but with `source_session_id` set on
+  the row and no human sender.
 
 ## Attachments
 
@@ -120,4 +122,5 @@ A Slack mention in a thread:
 
 Reply with `send_message({"text": "On it."})` and no `to` — the
 runner fills in `(slack, C01XYZ, 1714578122.000200)` from
-`session_routing`.
+`session_routing`. For routing anywhere other than the origin, see
+[[destinations]]; for choosing the reply's shape, see [[native-ui]].

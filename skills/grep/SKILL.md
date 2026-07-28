@@ -75,9 +75,13 @@ patterns containing spaces.
 ## When to prefer other tools
 
 - **Listing files by pattern without searching contents**: use
-  `glob`. It's the right tool when you only need the path list.
-- **Reading a single known file**: use `read_file`. Don't grep
-  for "everything in this file".
+  `glob` (see [[glob]]). It's the right tool when you only need
+  the path list.
+- **Reading a single known file**: use `read_file` (see
+  [[read-file]]). Don't grep for "everything in this file".
+- **Multi-file research where you want synthesis, not raw
+  matches**: hand the question to an `explore` subagent (see
+  [[explore]]) and get a summary back instead of match rows.
 - **Counting occurrences**: `grep` then count `matches.len()` on
   the caller side. Don't spawn `shell wc -l`.
 - **Running an actual `grep` binary with flags this tool doesn't

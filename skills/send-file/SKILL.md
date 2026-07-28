@@ -1,6 +1,6 @@
 ---
 name: send-file
-description: Attach a file with the send_file MCP tool, including base64 encoding rules, when to inline text instead, and filename safety.
+description: Attach a file with the send_file MCP tool — path vs base64 data, when to inline text instead, and filename safety.
 ---
 
 # send-file
@@ -12,26 +12,39 @@ row.
 
 ## Schema
 
+Preferred — the file is already on disk (you wrote it with `write_file`
+or a build step produced it):
+
 ```json
 {
   "to": "telegram:chat-123",
-  "filename": "report.pdf",
-  "data": "<base64 bytes>",
+  "path": "/data/report.pdf",
   "text": "optional caption"
 }
 ```
 
-- `filename` (required, non-blank). The host re-validates with
+Only for bytes generated in-memory that you cannot save first:
+
+```json
+{ "filename": "report.pdf", "data": "<base64 bytes>" }
+```
+
+- `path` XOR `data` — exactly one, never both. **Never base64-encode a
+  file that is on disk** and pass it as `data`: that overflows the
+  model's `max_tokens` mid-tool-call. Use `path`; the tool reads the
+  bytes itself. The `path` branch caps at 32 MB.
+- `filename` — required with `data`; optional with `path` (defaults to
+  the path's basename). The host re-validates with
   `safe_attachment_name()`: no `..`, no `/`, no leading dot, length
   bounded at 255. A failing name is bounced before delivery.
-- `data` (required, non-empty). Base64-encoded bytes. The tool decodes
-  on the way in; an invalid base64 payload returns
+- `data` — base64-encoded bytes, non-empty. Invalid base64 returns
   `ToolError::Validation`.
 - `text` (optional). A caption shown beside the file on channels that
   support it (Telegram caption, Slack `initial_comment`). Channels
   without inline captions ignore it.
 - `to` accepts the same forms as `send_message` (string, tagged channel,
-  tagged agent, tagged user).
+  tagged agent, tagged user) — see [[destinations]]. Omit to reply on
+  the originating channel.
 
 ## When to use `send_file` vs inline text
 
@@ -49,7 +62,7 @@ Prefer `send_message` with a triple-backtick code block when:
 
 ## Attachment limits
 
-The tool itself does not impose an upper bound; channel adapters do.
+The `path` branch caps at 32 MB; channel adapters cap lower.
 Practical ceilings observed in current adapters:
 
 - Telegram: 50 MB for non-bot files, 20 MB for bots.
@@ -85,12 +98,12 @@ separate outbound rows but share routing context.
 
 ```json
 {
-  "filename": "metrics.csv",
-  "data": "Zm9vLGJhcgoxLDIK",
+  "path": "/data/metrics.csv",
   "text": "Latest counts (Mon-Fri)."
 }
 ```
 
 This will appear in the recipient's chat as `metrics.csv` with the
 caption "Latest counts (Mon-Fri).". The tool returns an ack with the
-outbound `seq`.
+outbound `seq` — save it if you plan to `edit_message` / `add_reaction`
+later (see [[edit-message]], [[add-reaction]]).

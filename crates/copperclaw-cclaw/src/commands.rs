@@ -444,7 +444,8 @@ pub enum GroupsCmd {
     /// Fetch a single agent group by id.
     Get { id: String },
     /// Enable the bundled coding skills (`coding-task`, `git-commit`,
-    /// `code-review`, `testing`) for this group.
+    /// `code-review`, `testing`, `architecture`, `databases`) for this
+    /// group.
     #[command(name = "enable-coding")]
     EnableCoding { id: String },
     /// Disable the bundled coding skills for this group (the default

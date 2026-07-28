@@ -59,7 +59,14 @@ pub const CONTAINER_RUNNER_PATH: &str = "/usr/local/bin/copperclaw-runner";
 /// is false. Acts as a cap on `SkillsSelector::All`; explicit
 /// selector lists are honoured as-is (the operator picked the names
 /// deliberately).
-pub const CODING_SKILL_NAMES: &[&str] = &["coding-task", "git-commit", "code-review", "testing"];
+pub const CODING_SKILL_NAMES: &[&str] = &[
+    "coding-task",
+    "git-commit",
+    "code-review",
+    "testing",
+    "architecture",
+    "databases",
+];
 
 /// Default idle window before the manager stops a running container.
 /// 300s (5 min) matches the OpenBSD-of-claw-agents "conservative

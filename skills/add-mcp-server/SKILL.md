@@ -80,13 +80,14 @@ Opens an EventSource and speaks JSON-RPC over it. The
 
 The change is **not** retroactive — current container does not gain
 the new server mid-conversation. After idle-stop / restart, the model
-can call the new tools directly.
+can call the new tools directly (see [[discovering-tools]] for how the
+`mcp__<name>__<tool>` namespacing surfaces them).
 
 ## Common patterns
 
 - **Refresh credentials.** Same `name` + new env; merge replaces.
 - **Remove a server.** Not exposed as a tool. Operator runs
-  `cclaw groups config remove-mcp-server --agent-group-id <id>
+  `cclaw groups config remove-mcp-server <agent-group-id>
   --name <name>`; fingerprint change forces a rebuild that drops it.
 - **Preset shortcut.** `cclaw mcp add <preset>` writes the same
   shape. `cclaw mcp list-presets` for the catalog.
@@ -115,7 +116,8 @@ operator can confirm the merge.
 
 ## Failure modes
 
-- **Blank name.** Apply step drops the call as a no-op (no rebuild).
+- **Blank `name` / blank `reason` / non-object `transport`.** Rejected
+  synchronously as a validation error — fix the arguments and retry.
 - **Image rebuild fails.** Same as `install_packages`: manager falls
   back to last-known-good, increments
   `copperclaw_image_rebuild_failed_total`, retries on next spawn until

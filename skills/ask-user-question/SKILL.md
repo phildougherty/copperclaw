@@ -36,17 +36,14 @@ The normal call — no `to`, which asks the user you're already talking to:
 
 ## How the reply round-trips
 
-1. The tool ack writes a `pending_questions` row in the central DB
-   carrying the question id, your session id, and the option list.
-2. The host renders the question on the destination channel.
-3. When the user clicks (or types) an option, the channel adapter
-   emits an inbound event the host correlates back to your session
-   via the pending-question id.
-4. Your container's next poll loop receives the answer as a
-   `MessageKind::Chat` (or `System`, depending on the adapter)
-   inbound row whose content carries
-   `{"question_id": "...", "answer": "yes"}`.
-5. The `pending_questions` row is deleted.
+1. The host records a `pending_questions` row (question id, your
+   session id, title, options) and renders the question on the
+   destination channel — native buttons where the platform has them.
+2. When the user taps an option (or just types), the reply lands as an
+   **ordinary inbound chat message** on a later turn. A button tap
+   arrives as a chat row whose text is the option's value; free text
+   arrives as-is. There is no special `answer` payload — read it like
+   any other message.
 
 Your code does **not** block on the reply. The tool returns
 immediately; the user might answer in seconds, hours, or never.
@@ -54,17 +51,20 @@ Design your behaviour to be resumable.
 
 ## Timeout behaviour
 
-There is no host-enforced timeout for the user. Pending questions sit
-in the central DB indefinitely. If you need a deadline, schedule a
-follow-up with `schedule_task` and check `pending_questions` for the
-correlation id when it fires:
+Unanswered questions expire after a default TTL of 24 hours. The
+host's sweep then stamps the original card with an expiry note (no
+live buttons left behind) and writes a system inbound row carrying a
+question-result payload with `status = "expired"`, which
+you will see as a `[system]` line on your next turn — treat it as
+"no answer" and proceed with a safe default. If you need a shorter
+deadline, schedule a follow-up with `schedule_task`:
 
 ```text
 ask_user_question({"title": "...", "options": [...]})
 schedule_task({
   "name": "deploy-question-followup",
   "when": "<now + 15m>",
-  "prompt": "If question abc-123 is still pending, fall back to safe default."
+  "prompt": "If the deploy question is still unanswered, fall back to safe default."
 })
 ```
 
@@ -96,3 +96,7 @@ Which environment first?
   3) prod-full
 (Reply with the option text or its number.)
 ```
+
+Use `ask_user_question` for a constrained pick; for richer structured
+output (fields, mixed buttons, links) use `send_card` — see
+[[send-card]] and [[native-ui]].

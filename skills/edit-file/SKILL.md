@@ -53,9 +53,9 @@ explaining *why*, not *what*.
 
 ## How to use it
 
-1. **`read_file` first.** Pull the file (or the relevant region via
-   `shell` with `grep -n` / `sed -n`) so you can see the exact byte
-   sequence you want to swap.
+1. **`read_file` first** (see [[read-file]]). Pull the file (or the
+   relevant region via `grep` / `read_file` in `lines` mode) so you
+   can see the exact byte sequence you want to swap.
 2. **Include enough surrounding context to disambiguate.** If the
    line you want to change appears elsewhere in the file, expand
    `old_string` to include the function header, a unique comment,
@@ -91,9 +91,16 @@ does not necessarily (chown needs caps the container doesn't have).
 
 ## When to prefer other tools
 
-- **Creating a new file:** `write_file`.
+- **Creating a new file:** `write_file` — see [[write-file]].
 - **Appending without changing existing content:** `write_file`
   with `append: true`.
+- **Several edits to the same file:** `multi_edit` applies a list
+  of find-replaces atomically in one call — cheaper than N
+  sequential `edit_file` calls, and failed edits roll the whole
+  call back.
+- **Multi-region edits you can express as a diff:** `apply_patch`
+  takes a unified diff (exact-context, atomic) — more compact than
+  repeating overlapping `old_string` context.
 - **Multi-line in-place edit driven by a regex:** `shell` with
   `sed -i -E '...'`. `edit_file` is literal-string-only by design.
 - **Bulk find-and-replace across many files:** loop `edit_file`

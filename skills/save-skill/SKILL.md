@@ -28,6 +28,10 @@ only to this agent group. There is no cross-group sharing.
    directory. Your **next** session discovers and exposes it. No image
    rebuild is needed — skills are read fresh at spawn.
 
+Saving is version-aware: a first save starts at version 1, and
+re-saving an existing skill of the same name bumps its version
+automatically — you never manage `version` yourself.
+
 The change is **not** retroactive: the skill is NOT available in the
 session you save it from. Save it, tell the user it's pending approval,
 then move on — don't wait for it to appear this turn.
@@ -75,9 +79,9 @@ scoring, so make it a real sentence, not one word.
 - You discovered a multi-step procedure you'll want to repeat.
 - The user asks you to "remember how to do X" as a repeatable recipe.
 
-Use `agent-memory` / `memory_save` for durable **facts**; use
+Use [[agent-memory]] / `memory_save` for durable **facts**; use
 `save_skill` for durable **procedures** (a reusable playbook exposed as
-a skill).
+a skill). See [[approvals]] for how the operator resolves the request.
 
 ## Failure modes
 

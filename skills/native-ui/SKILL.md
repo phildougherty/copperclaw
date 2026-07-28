@@ -41,13 +41,13 @@ that isn't prose.
 
 4. **User must pick from a small set.** → `ask_user_question`. Native
    buttons; reply round-trips via inbound queue. See
-   `../ask-user-question/SKILL.md`.
+   [[ask-user-question]].
 
 5. **Operator approval before a destructive action.** → For built-in
    families (`install_packages`, `add_mcp_server`, sender, channel)
    the runner writes `pending_approvals` automatically and an
    operator clears via `cclaw approvals approve-id <id>` /
-   `deny <id>` (`../approvals/SKILL.md`). For agent-defined gates use
+   `deny <id>` (see [[approvals]]). For agent-defined gates use
    `send_card` with two `value` buttons: Approve (`primary`), Deny
    (`danger`). The tap routes back as inbound chat carrying the
    `value`.
@@ -55,7 +55,7 @@ that isn't prose.
 6. **Structured info** — status, comparison, build summary.
    → `send_card` with `title`+`body`+`fields[]`. Native on
    telegram/slack/discord/gchat; text fallback elsewhere. See
-   `../send-card/SKILL.md`.
+   [[send-card]].
 
 7. **Tool failure to report.** → `send_card` titled `"Error"` with a
    body explaining what failed and what you tried. Don't use
@@ -69,13 +69,14 @@ that isn't prose.
    Don't paste a diff in chat.
 
 9. **Sending a file or binary.** → `send_file`. Don't base64 into a
-   chat message. See `../send-file/SKILL.md`.
+   chat message. See [[send-file]].
 
 10. **Updating a message you already sent.** → `edit_message` with the
-    saved outbound `seq`. Don't post fresh. See `../edit-message/SKILL.md`.
+    saved outbound `seq`. Don't post fresh. See [[edit-message]].
 
-11. **Quick ack of someone else's message.** → `add_reaction` on the
-    inbound seq, or a one-emoji `send_message`.
+11. **Quick ack.** → `add_reaction` on a message you sent earlier (by
+    its outbound seq — reactions only target your own messages), or a
+    one-emoji `send_message`.
 
 12. **Prose to the user.** → `send_message`.
 
@@ -119,7 +120,7 @@ Don't ask yes/no as prose — use `ask_user_question` with `options`.
 
 ```text
 WRONG:  send_message("Should I proceed? Reply YES or NO.")
-RIGHT:  ask_user_question({"question":"Proceed?","options":["Yes","No"]})
+RIGHT:  ask_user_question({"title":"Proceed?","options":["Yes","No"]})
 ```
 
 Don't pack fielded info into one chat line; a build summary belongs in
@@ -128,9 +129,9 @@ Don't pack fielded info into one chat line; a build summary belongs in
 ```text
 WRONG:  send_message("Tests: 1247 pass, 3 fail. Duration: 42s. Coverage: 87%.")
 RIGHT:  send_card({"title":"Build",
-                   "fields":[{"name":"Tests","value":"1247 pass / 3 fail"},
-                             {"name":"Duration","value":"42s"},
-                             {"name":"Coverage","value":"87%"}]})
+                   "fields":[{"label":"Tests","value":"1247 pass / 3 fail"},
+                             {"label":"Duration","value":"42s"},
+                             {"label":"Coverage","value":"87%"}]})
 ```
 
 Don't post a fresh message to update status — `edit_message` the
@@ -145,7 +146,7 @@ Don't hand-craft platform JSON (Block Kit, Discord embed) as a card
 body. The schema is canonical; adapters translate.
 
 Don't call typing yourself — the host's `TypingModule` emits it on
-every tool call. See `../typing-indicator/SKILL.md`.
+every tool call. See [[typing-indicator]].
 
 ## In doubt
 
@@ -154,8 +155,6 @@ adapters add native renderers, old card calls light up automatically.
 
 ## See also
 
-`../send-message/SKILL.md`, `../send-card/SKILL.md`,
-`../send-file/SKILL.md`, `../ask-user-question/SKILL.md`,
-`../edit-message/SKILL.md`, `../add-reaction/SKILL.md`,
-`../typing-indicator/SKILL.md`, `../approvals/SKILL.md`,
-`../error-handling/SKILL.md`, `../messaging-context/SKILL.md`.
+[[send-message]], [[send-card]], [[send-file]], [[ask-user-question]],
+[[edit-message]], [[add-reaction]], [[typing-indicator]], [[approvals]],
+[[error-handling]], [[messaging-context]].

@@ -65,6 +65,10 @@ Need the tool *this* session? Install it into `/data` yourself:
 Use `install_packages` for tools you'll want in *every* future session;
 install into `/data` for "I need it right now."
 
+Database servers (Postgres, MariaDB, Redis) are the canonical
+`install_packages` case — bake the server package, then follow
+[[databases]] for the non-root, `/data`-backed run-book.
+
 ## Constraints
 
 - Non-blank names. Whitespace-only entries are silently dropped.

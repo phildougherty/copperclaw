@@ -12,9 +12,10 @@ friendly errors, no pager.
 All four take an optional `path` (default cwd). The tool walks upward
 to the `.git`; any path *inside* a repo works.
 
-These tools never commit, push, branch, or modify. For mutations: hand
-the exact `git ...` command to the operator and stop. Do not `shell`
-around it.
+These tools never commit, push, branch, or modify. For mutations on a
+coding-enabled session, follow the [[git-commit]] discipline; otherwise
+hand the exact `git ...` command to the operator and stop. Do not
+`shell` around it.
 
 ## When to use each
 

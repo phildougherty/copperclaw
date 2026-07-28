@@ -5,17 +5,19 @@ description: Use the CLI (stdin/stdout) channel for local development and testin
 
 # cli-channel
 
-The CLI channel is the simplest adapter in the registry. It reads
-lines from stdin and writes lines to stdout. It exists for two
-reasons:
+The CLI channel is the simplest adapter in the registry. It has two
+modes:
 
-1. To give developers an interactive REPL against a running host
-   without configuring a real chat platform.
-2. To make end-to-end tests trivial — feed stdin from a fixture
-   file, capture stdout, assert.
+1. **stdio mode** — reads lines from stdin, writes labelled lines to
+   stdout. The developer REPL for a foreground host, and the mode
+   that makes end-to-end tests trivial (feed stdin from a fixture,
+   capture stdout, assert).
+2. **FIFO/log mode** — reads lines from a named pipe and appends one
+   structured `CliFrame` JSON line per delivery to a log file. This
+   is the bridge behind `cclaw chat`, and it survives writers
+   opening and closing the FIFO.
 
-Every input line becomes an `InboundEvent`; every outbound message
-becomes a labelled line.
+Every input line becomes an `InboundEvent` in both modes.
 
 ## Wiring
 
@@ -68,7 +70,7 @@ different harness.
 
 ## Outbound format
 
-Every outbound message is rendered as:
+In stdio mode every outbound message is rendered as:
 
 ```text
 <label><body>\n
@@ -84,9 +86,14 @@ Body rendering rules:
 - If the message carries attachments, a `[files: a.txt, b.png]`
   suffix is appended.
 
-There is no edit support: `edit_message` simply emits a new line.
-Reactions emit a `reacted: <emoji>` line. No typing indicators are
-visible.
+In FIFO/log mode each delivery is instead one compact JSON `CliFrame`
+line (e.g. `{"kind":"chat","text":"hello"}`), which is how structured
+payloads (cards, todo lists, diffs) survive to the `cclaw chat`
+renderer.
+
+There is no native edit or reaction API: `edit_message` falls back to
+a fresh `(edit) <text>` line, `add_reaction` to a
+`(reaction: <emoji>)` line. No typing indicators are visible.
 
 ## Limitations
 
@@ -95,8 +102,10 @@ visible.
 - No platform message ids returned (`deliver` returns `Ok(None)`).
 - No back-pressure on stdout. If your terminal is slow, the host's
   delivery loop blocks on `write_all`.
-- The reader task ends on EOF. Once stdin closes, the channel falls
-  silent — restart the host to recover.
+- In stdio mode the reader task ends on EOF: once stdin closes, the
+  channel falls silent — restart the host to recover. FIFO/log mode
+  holds its own writer handle open, so `cclaw chat` sessions can come
+  and go freely.
 
 ## Programmatic use
 

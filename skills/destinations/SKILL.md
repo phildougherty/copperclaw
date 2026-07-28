@@ -10,7 +10,7 @@ goes. This skill explains the shapes the field accepts, the
 named-destination registry, and how the host resolves a `to` value to
 a concrete delivery target.
 
-## The three forms of `to`
+## The four forms of `to`
 
 In the JSON sent to a tool, `to` is one of:
 
@@ -36,17 +36,18 @@ on). Use that unless you mean to send somewhere else.
   The platform delivers to the user; you may get a platform message id
   back, which the host stores in `delivered.platform_message_id`.
 - Agent: the message is written to the destination session's
-  `messages_in.db` with `kind = "agent"`. The destination agent reads
-  it on its next turn. There is no platform; the host is the relay.
+  `inbound.db` (`messages_in` table) with `kind = "agent"`. The
+  destination agent reads it on its next turn. There is no platform;
+  the host is the relay.
 
 You can mix freely — call `send_message(to=Channel{...})` and
 `send_message(to=Agent{...})` in the same turn.
 
 ## Named destinations
 
-Each agent group has a `destinations` table (per-session DB,
-populated from the central wiring). Rows let you address a
-destination by a short name in tools that surface it. The row shape:
+Each session has a `destinations` table (in its `inbound.db`, rebuilt
+by the host on every container wake from the central wiring). Rows let
+you address a destination by a short name. The row shape:
 
 ```text
 name            display_name    kind     channel_type  platform_id  agent_group_id
@@ -54,27 +55,29 @@ name            display_name    kind     channel_type  platform_id  agent_group_
 "bossbot"       "Senior Bot"    agent                              <UUID>
 ```
 
-In future tool calls (planned but not in the v0 surface) the `to`
-field will accept a bare name like `"ops"` and the runner will
-resolve it via this table. For now, use the channel id or agent
-session directly.
+A channel-form `to` (bare string or `{"kind":"channel","id":...}`)
+accepts a bare name like `"ops"`: the runner looks the id up in this
+table first, and only falls back to `channel_type:platform_id`
+parsing when no row matches. Prefer a named destination when one
+exists — it survives platform-id changes.
 
 ## How resolution works
 
-For a tagged channel id like `"slack:C01ABCD"`:
+For a channel id like `"slack:C01ABCD"` (or a name like `"ops"`):
 
-1. The runner splits at the first colon: `("slack", "C01ABCD")`.
-2. The host looks up the channel adapter for `"slack"` in the
-   `ChannelRegistry`.
-3. The adapter's `deliver` method takes `platform_id = "C01ABCD"` and
-   `thread_id = None` (unless the originating row had one).
+1. The runner looks the string up in the `destinations` table by name;
+   a match wins.
+2. Otherwise it splits at the first colon: `("slack", "C01ABCD")`.
+3. The host looks up the channel adapter for `"slack"` and calls its
+   `deliver` with `platform_id = "C01ABCD"` and `thread_id = None`
+   (unless the originating row had one).
 
 For a tagged agent destination:
 
 1. The destination session id is parsed.
 2. The host opens the destination session's `inbound.db`.
-3. A row is written with `kind = "agent"` and `source_session_id`
-   set to your session.
+3. A `messages_in` row is written with `kind = "agent"` and
+   `source_session_id` set to your session.
 
 ## Common patterns
 
@@ -91,3 +94,7 @@ For a tagged agent destination:
   surfaced via the delivery loop's retry/back-off path.
 - Unknown user id at delivery time → host writes a
   `dropped_messages` row and moves on.
+
+The `to` field itself is documented per tool in [[send-message]],
+[[send-file]], and [[send-card]]; inbound-side routing context is in
+[[messaging-context]].

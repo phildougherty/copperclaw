@@ -14,7 +14,7 @@ Six tools cover the lifecycle:
 
 | Tool | Schema | Purpose |
 |---|---|---|
-| `schedule_task`  | `{ name, when?, prompt, recurrence? }` | enqueue |
+| `schedule_task`  | `{ name, when?, prompt, recurrence?, grant? }` | enqueue |
 | `list_tasks`     | `{}` | inventory current tasks |
 | `cancel_task`    | `{ id }` | permanently remove |
 | `pause_task`     | `{ id }` | stop firing, keep state |
@@ -29,8 +29,9 @@ Six tools cover the lifecycle:
   `"2026-05-21T06:00:00Z"`. The agent's wall-clock interpretation is
   set at the host; if the agent's locale matters, format the value
   yourself.
-- `recurrence` is a 5-field cron expression (croner dialect — same as
-  standard cron, no seconds field). Examples:
+- `recurrence` is a cron expression (croner dialect — standard 5-field
+  form; a 6-field form with a leading seconds field is also accepted).
+  Examples:
   - `"0 9 * * *"` — every day at 09:00 UTC.
   - `"*/15 * * * *"` — every 15 minutes.
   - `"0 9 * * 1-5"` — weekdays at 09:00 UTC.
@@ -58,6 +59,19 @@ fire time and `recurrence` controls everything after that.
   "recurrence": "0 * * * *" }
 ```
 
+## Optional `grant`: pre-authorising autonomous action
+
+By default a task's autonomous fires can only draft. Attach a `grant`
+object when the task should ACT on its own (e.g. actually send the
+standup message): `{ capability_scope, expires_at, reason,
+token_budget?, max_fires? }`. `capability_scope` is space-separated
+`class` or `class:resource` tokens (e.g. `"send_message:telegram"`);
+`expires_at` is required and at most 365 days out; at least one of
+`token_budget` / `max_fires` must be set (grants are bounded, never
+unlimited). A grant is approval-gated — the task is created either
+way, but the grant only takes effect after an operator approves it
+(see [[approvals]]).
+
 ## Listing, pausing, resuming
 
 `list_tasks` returns a JSON array of `TaskSummary` values:
@@ -72,8 +86,9 @@ fire time and `recurrence` controls everything after that.
 Task ids are `task_<uuidv7>` (always the full UUID — don't shorten them
 when passing back to `cancel_task` / `pause_task` / etc.).
 
-`status` is one of `active` / `paused`. Use the `id` in
-`pause_task` / `resume_task` / `cancel_task` / `update_task`.
+`status` is one of `active` / `paused` / `cancelled` / `completed`.
+Use the `id` in `pause_task` / `resume_task` / `cancel_task` /
+`update_task`.
 
 ## Updating in place
 
@@ -105,5 +120,5 @@ recurring task; `recurrence` is propagated so you can recognise
 - Task ids are stable across restarts; they live in the central DB.
 - A paused task does not fire; its recurrence "skips" while paused.
 - Cancelling is irreversible. To re-create, call `schedule_task` again.
-- The host caps recurrence frequency to once per minute; `*/30 * * * * *`
-  (six fields) is invalid.
+- An unparseable recurrence never fires — if a recurring task goes
+  silent, `list_tasks` and check the expression.

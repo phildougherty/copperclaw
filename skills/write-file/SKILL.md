@@ -61,9 +61,11 @@ get a one-line `before / after` size summary instead.
 
 ## When to prefer other tools
 
-- **Editing a few bytes in the middle of a large file**: use `shell`
-  with `sed -i` or a similar in-place tool. `write_file` writes the
-  whole content; you would have to read-modify-rewrite manually.
+- **Changing part of an existing file**: use `edit_file` (see
+  [[edit-file]]) — read the file first, then swap the specific
+  region. Overwriting a file you have not read this session with
+  `write_file` risks silently dropping code that was already there.
+  For regex-driven in-place edits, `shell` with `sed -i` works too.
 - **Writing binary data**: base64-decode via `shell` and write with
   `dd` / `tee`, or use `shell` directly with a here-doc.
 - **Writing files outside `/data`**: legal but lost on next spawn.

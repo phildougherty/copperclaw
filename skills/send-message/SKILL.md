@@ -25,6 +25,9 @@ appropriate channel adapter.
   - Tagged user: `{ "kind": "user", "id": "u_42" }` (host resolves the
     route via `user_dms`).
 
+  Full routing semantics (named destinations, resolution order) are in
+  [[destinations]].
+
 ## When to omit `to`
 
 Omit `to` whenever you are replying to the inbound message you are
@@ -78,4 +81,9 @@ Reply with a fenced code block:
 
 The tool returns an ack carrying the new outbound `seq` (an odd integer).
 Save that seq if you intend to call `edit_message` or `add_reaction` on
-the same message later.
+the same message later ([[edit-message]], [[add-reaction]]).
+
+`send_message` is the right shape for prose. Before reaching for it
+with choices, status tables, files, or errors, check the decision tree
+in [[native-ui]] — those belong in `send_card`, `ask_user_question`,
+or `send_file`.

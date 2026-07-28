@@ -91,6 +91,15 @@ sent SIGKILL — `exit_code` is then implementation-defined.
 operations, run an installed binary (compilers, formatters, linters),
 or inspect the runtime environment.
 
+## Background daemons
+
+A process you daemonize (`redis-server --daemonize yes`, `mariadbd ...
+&`, a dev server via `nohup npm run dev &`) outlives the call and is
+reachable from later calls — but dies with the container at idle-stop
+(5 quiet minutes). Data on `/data` survives; the process does not.
+Expect to re-start daemons after a respawn — see [[databases]] for the
+DB-server pattern.
+
 ## Safety model
 
 The container is the sandbox. The tool itself trusts you with the

@@ -751,6 +751,10 @@ This is a hard workflow rule, not a suggestion: when a task enters a \
 skill's area, your FIRST action is to `load_skill` it — before you touch \
 any other tool. Concretely:\n\
 - about to write, edit, or run code → `load_skill(\"coding-task\")`\n\
+- designing a multi-component system (frontend + API + DB, services, \
+pipelines) → `load_skill(\"architecture\")` before scaffolding\n\
+- a build needs a real database server (Postgres/MySQL/Redis/Mongo) → \
+`load_skill(\"databases\")`\n\
 - about to commit or merge → `load_skill(\"git-commit\")`\n\
 - spawning sub-agents / parallel work → `load_skill(\"create-agent\")`\n\
 - sending a card or file, scheduling, etc. → load that skill first.\n\n\
