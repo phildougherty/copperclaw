@@ -566,6 +566,11 @@ pub fn assemble(
     if let Some(groups_dir) = &cfg.groups_dir {
         delivery.set_groups_dir(groups_dir.clone());
     }
+    // M24 S4: give the delivery service the per-session data root so a
+    // runner-emitted `taint_approval_request` can be raised as a
+    // `taint_clearance` approval whose apply arm writes the single-turn
+    // clearance file into `<sessions_root>/<ag>/<sess>/`.
+    delivery.set_sessions_dir(cfg.sessions_root());
 
     let sweep_root: Arc<dyn copperclaw_host_sweep::SessionRoot> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
@@ -633,6 +638,20 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) -> 
                         .ok()
                         .flatten()
                         .is_some()
+                })
+            })
+            // M24 S2: the gate honors the messaging group's stored
+            // `unknown_sender_policy` (`open` admits an unknown sender
+            // without approval; everything else holds pending). Reading
+            // live from `messaging_groups` means a `cclaw
+            // messaging-groups update` lands on the next inbound, no
+            // restart needed.
+            .with_unknown_sender_policy_lookup({
+                let central = host_ctx.central().clone();
+                std::sync::Arc::new(move |mg_id| {
+                    copperclaw_db::tables::messaging_groups::get(&central, mg_id)
+                        .ok()
+                        .map(|mg| mg.unknown_sender_policy)
                 })
             })
             .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone()))

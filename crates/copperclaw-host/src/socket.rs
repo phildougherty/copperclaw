@@ -404,6 +404,14 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("approvals.decisions", handlers::approvals::decisions, false);
     ins!("pairing.list", handlers::pairing::list, false);
     ins!("pairing.approve", handlers::pairing::approve, true);
+    // M24 S3: task capability grants — operator list + revoke. Revoke needs
+    // the data_dir to eagerly withdraw the session's grant.json snapshot.
+    ins!("grants.list", handlers::grants::list, false);
+    ins_ctx!(
+        "grants.revoke",
+        |a, ctx| handlers::grants::revoke(a, &ctx.central, &ctx.data_dir),
+        true
+    );
     ins!("audit.list", handlers::audit::list, false);
     ins!("budgets.list", handlers::budgets::list, false);
     ins!("budgets.set", handlers::budgets::set, true);
@@ -1154,6 +1162,102 @@ mod tests {
         )
         .unwrap();
         assert!(audit_rows.iter().any(|r| r.command == "sessions.delete"));
+    }
+
+    #[test]
+    fn dispatch_grants_revoke_is_host_only_and_audits() {
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use copperclaw_db::tables::task_grants::{self, NewTaskGrant};
+        use copperclaw_db::tables::tasks::{self, NewTask};
+        let db = central();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "g".into(),
+                folder: "g".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        tasks::insert(
+            &db,
+            NewTask {
+                id: "t-1".into(),
+                agent_group_id: ag.id,
+                session_id: SessionId::new(),
+                name: Some("standup".into()),
+                prompt: "post standup".into(),
+                when_spec: "daily at 09:00".into(),
+                recurrence: None,
+                next_fire: None,
+            },
+        )
+        .unwrap();
+        task_grants::insert_approved(
+            &db,
+            NewTaskGrant {
+                id: "g-1".into(),
+                task_id: "t-1".into(),
+                capability_scope: "send_message:telegram".into(),
+                token_budget: None,
+                max_fires: None,
+                expires_at: None,
+                granted_by: None,
+            },
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = HandlerCtx::with_data_dir(db.clone(), tmp.path().to_path_buf());
+        let table = build_dispatch_table();
+
+        // Agent caller is blocked (grants.revoke is host-only).
+        let req = Request::Call {
+            id: "1".into(),
+            command: "grants.revoke".into(),
+            args: json!({"id": "g-1"}),
+            caller: Caller::Agent {
+                session_id: SessionId::nil(),
+                agent_group_id: AgentGroupId::nil(),
+                messaging_group_id: None,
+            },
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Err { error, .. } => assert_eq!(error.code, "permission_denied"),
+            Response::Ok { .. } => panic!("agent caller must not revoke grants"),
+        }
+
+        // Host caller succeeds; the grant reads revoked afterwards.
+        let req = Request::Call {
+            id: "2".into(),
+            command: "grants.revoke".into(),
+            args: json!({"id": "g-1"}),
+            caller: Caller::Host,
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Ok { data, .. } => assert_eq!(data["status"], "revoked"),
+            Response::Err { error, .. } => panic!("unexpected error: {error:?}"),
+        }
+        assert!(
+            task_grants::effective_grant(&db, "t-1", chrono::Utc::now())
+                .unwrap()
+                .is_none()
+        );
+        // Both attempts audited — grants.revoke is a mutation.
+        let audit_rows = copperclaw_db::tables::audit_log::list_recent(
+            &db,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            audit_rows
+                .iter()
+                .filter(|r| r.command == "grants.revoke")
+                .count(),
+            2
+        );
     }
 
     #[test]

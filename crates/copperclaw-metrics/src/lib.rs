@@ -2244,11 +2244,14 @@ pub const TASK_GRANTS_TOTAL: &str = "copperclaw_task_grants_total";
 
 /// Increment `copperclaw_task_grants_total{outcome}` — a task capability grant
 /// lifecycle event. `outcome` is `approved` (an operator approved a pending
-/// grant card and the bounded `task_grants` row persisted). Reserved for future
-/// sites: `issued` (grant proposal raised), `revoked` (a revoke path — no
-/// production caller yet), and `expired` (an expiry sweep — none exists; grants
-/// lapse lazily via `effective_grant`). Emitted from
-/// `copperclaw-host/src/handlers/approvals.rs` (`apply_task_grant`).
+/// grant card and the bounded `task_grants` row persisted; emitted from
+/// `copperclaw-host/src/handlers/approvals.rs`, `apply_task_grant`) or
+/// `revoked` (an operator revoked a grant via `grants.revoke` /
+/// `cclaw grants revoke`; emitted from
+/// `copperclaw-host/src/handlers/grants.rs`, `revoke` — counted once per
+/// Approved -> Revoked transition, M24 S3). Reserved for future sites:
+/// `issued` (grant proposal raised) and `expired` (an expiry sweep — none
+/// exists; grants lapse lazily via `effective_grant`).
 pub fn inc_task_grant(outcome: &str) {
     counter!(TASK_GRANTS_TOTAL, "outcome" => outcome.to_owned()).increment(1);
 }

@@ -3,8 +3,12 @@
 //! Three hooks are wired:
 //!
 //! 1. `set_sender_scope_gate` — when an inbound event comes from an unknown
-//!    sender, the gate returns [`SenderScopeDecision::Pending`] so the host
-//!    will record an `unregistered_senders` row and drop the event.
+//!    sender, the gate consults the messaging group's stored
+//!    `unknown_sender_policy` (via [`UnknownSenderPolicyLookup`]). Under the
+//!    default hold-pending policy it returns
+//!    [`SenderScopeDecision::Pending`] so the host will record an
+//!    `unregistered_senders` row and drop the event; under `open` it returns
+//!    [`SenderScopeDecision::Allow`] and the event proceeds without approval.
 //!
 //! 2. `register_delivery_action("approval_card")` — when an agent emits an
 //!    outbound system message requesting an approval card, this handler
@@ -103,6 +107,57 @@ struct PendingStore {
 /// circular dep on `copperclaw-db`.
 pub type SenderLookup = Arc<dyn Fn(&SenderIdentity) -> bool + Send + Sync>;
 
+/// Per-messaging-group `unknown_sender_policy` lookup the gate consults for
+/// a sender that is neither in the in-memory set nor in the persistent
+/// store. Returns the raw stored policy string for the messaging group, or
+/// `None` when the group is unknown (the gate then falls back to the
+/// hold-pending default). Sourced from the central `messaging_groups` table
+/// by the host; kept as a closure so the modules crate doesn't take a
+/// circular dep on `copperclaw-db`.
+pub type UnknownSenderPolicyLookup = Arc<dyn Fn(MessagingGroupId) -> Option<String> + Send + Sync>;
+
+/// Parsed form of a messaging group's stored `unknown_sender_policy`.
+///
+/// The column (`messaging_groups.unknown_sender_policy`, TEXT NOT NULL
+/// DEFAULT `'strict'`) is free text; these are the values the codebase
+/// actually writes:
+///
+///   - `"strict"` — the schema default (`001_initial.sql`).
+///   - `"request_approval"` — the canonical secure default
+///     (`copperclaw_db::tables::messaging_groups::DEFAULT_UNKNOWN_SENDER_POLICY`),
+///     also what `cclaw security audit --fix` tightens `open` to.
+///   - `"approval-required"` — the setup wizard's spelling of the same
+///     intent (`copperclaw-setup/src/steps/quickstart_group.rs`).
+///   - `"open"` — default-allow: an unknown sender is admitted without
+///     operator approval (`cclaw security audit` flags this as High).
+///
+/// `strict`, `request_approval`, and `approval-required` all mean "hold the
+/// unknown sender pending operator approval" — today's (and the default)
+/// behavior. Any unrecognized value also parses to
+/// [`Self::RequestApproval`] so a typo fails toward the secure posture,
+/// never toward open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownSenderPolicy {
+    /// Hold the unknown sender pending operator approval (pairing code +
+    /// approval card flow). The default.
+    #[default]
+    RequestApproval,
+    /// Admit the unknown sender without approval.
+    Open,
+}
+
+impl UnknownSenderPolicy {
+    /// Parse a stored policy string. Unrecognized values fall back to the
+    /// secure [`Self::RequestApproval`] default.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "open" => Self::Open,
+            _ => Self::RequestApproval,
+        }
+    }
+}
+
 /// Context passed to [`NewPendingNotifier`] when a new sender lands in the
 /// pending queue for the first time.
 #[derive(Debug, Clone)]
@@ -146,6 +201,10 @@ pub struct ApprovalsModule {
     /// Persistent-store lookup invoked when the in-memory set
     /// misses. `None` = in-memory only.
     persistent_lookup: Option<SenderLookup>,
+    /// Per-messaging-group `unknown_sender_policy` lookup consulted for a
+    /// sender both lookups miss. `None` = every unresolved sender is held
+    /// pending (the pre-policy behavior).
+    policy_lookup: Option<UnknownSenderPolicyLookup>,
     /// Optional callback fired the first time a new sender hits pending.
     /// Wired by the host at boot to post an in-channel "approve?" prompt.
     new_pending_notifier: Option<NewPendingNotifier>,
@@ -170,6 +229,7 @@ impl ApprovalsModule {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(Vec::new())),
             persistent_lookup: None,
+            policy_lookup: None,
             new_pending_notifier: None,
             pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
@@ -187,6 +247,7 @@ impl ApprovalsModule {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(senders)),
             persistent_lookup: None,
+            policy_lookup: None,
             new_pending_notifier: None,
             pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
@@ -200,6 +261,19 @@ impl ApprovalsModule {
     #[must_use]
     pub fn with_persistent_lookup(mut self, lookup: SenderLookup) -> Self {
         self.persistent_lookup = Some(lookup);
+        self
+    }
+
+    /// Builder: attach the per-messaging-group `unknown_sender_policy`
+    /// lookup. The gate consults it only after both sender lookups miss:
+    /// `open` admits the sender without approval, everything else (and a
+    /// missing lookup or group) holds the sender pending. The host wires
+    /// this to a closure that queries the central `messaging_groups` table,
+    /// so a `cclaw messaging-groups update` lands on the very next inbound
+    /// with no host restart.
+    #[must_use]
+    pub fn with_unknown_sender_policy_lookup(mut self, lookup: UnknownSenderPolicyLookup) -> Self {
+        self.policy_lookup = Some(lookup);
         self
     }
 
@@ -460,6 +534,7 @@ impl Module for ApprovalsModule {
     async fn install(&self, ctx: Arc<dyn ModuleContext>) -> Result<(), ModuleError> {
         let known = Arc::clone(&self.known_senders);
         let persistent = self.persistent_lookup.clone();
+        let policy_lookup = self.policy_lookup.clone();
         let notifier = self.new_pending_notifier.clone();
         let pairing = self.pairing_notifier.clone();
         let dispatcher_slot = Arc::clone(&self.dispatcher);
@@ -487,8 +562,25 @@ impl Module for ApprovalsModule {
                     return SenderScopeDecision::Defer;
                 }
             }
-            // Sender is unknown. Fire the new-pending notifier and the
-            // pairing notifier if registered and a dispatcher is available.
+            // Sender is unknown to both stores. Honor the messaging group's
+            // stored `unknown_sender_policy`: `open` admits the sender
+            // without approval (no pending row, no notifications); every
+            // other value — `strict` (the schema default),
+            // `request_approval`, `approval-required`, an unrecognized
+            // string, a missing lookup, or an event with no messaging
+            // group — falls through to the hold-pending flow below.
+            let policy = policy_lookup
+                .as_ref()
+                .zip(s.messaging_group_id)
+                .and_then(|(lookup, mg_id)| lookup(mg_id))
+                .map(|raw| UnknownSenderPolicy::parse(&raw))
+                .unwrap_or_default();
+            if policy == UnknownSenderPolicy::Open {
+                return SenderScopeDecision::Allow;
+            }
+            // Sender is unknown and held pending. Fire the new-pending
+            // notifier and the pairing notifier if registered and a
+            // dispatcher is available.
             // Both are responsible for their own de-duplication / rate
             // limiting so this hot path stays cheap. The dispatcher lock is
             // taken once and the same handle handed to both callbacks.
@@ -772,6 +864,160 @@ mod tests {
             resolved_user: None,
         });
         assert!(decision.is_defer());
+    }
+
+    // -----------------------------------------------------------------------
+    // unknown_sender_policy gate tests (M24 S2)
+    // -----------------------------------------------------------------------
+
+    /// Helper: install a module whose policy lookup returns `policy` for
+    /// every messaging group, then run the gate once for an unknown sender
+    /// on a messaging group.
+    async fn gate_decision_with_policy(policy: Option<&str>) -> SenderScopeDecision {
+        let stored: Option<String> = policy.map(str::to_owned);
+        let m = ApprovalsModule::new()
+            .with_unknown_sender_policy_lookup(Arc::new(move |_mg_id| stored.clone()));
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        (gate)(SenderScopeCtx {
+            event_sender: Some(SenderIdentity {
+                channel_type: ChannelType::new("telegram"),
+                identity: "u-unknown".into(),
+                display_name: None,
+            }),
+            messaging_group_id: Some(copperclaw_types::MessagingGroupId::new()),
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn scope_gate_open_policy_admits_unknown_sender() {
+        let decision = gate_decision_with_policy(Some("open")).await;
+        assert!(
+            decision.is_allow(),
+            "unknown_sender_policy=open must admit the sender without approval; got {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_gate_request_approval_policy_holds_pending() {
+        let decision = gate_decision_with_policy(Some("request_approval")).await;
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_approval_required_spelling_holds_pending() {
+        // The setup wizard writes this spelling of the same intent.
+        let decision = gate_decision_with_policy(Some("approval-required")).await;
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_strict_default_policy_holds_pending() {
+        // `strict` is the schema default (`001_initial.sql`): a group left
+        // at the default must keep today's hold-pending behavior.
+        let decision = gate_decision_with_policy(Some("strict")).await;
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_unrecognized_policy_holds_pending() {
+        // A typo'd policy fails toward the secure posture, never open.
+        let decision = gate_decision_with_policy(Some("yolo")).await;
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_missing_group_row_holds_pending() {
+        // Lookup wired but the messaging group has no row: hold pending.
+        let decision = gate_decision_with_policy(None).await;
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_open_policy_without_messaging_group_holds_pending() {
+        // An event with no messaging group can't resolve a policy, so even a
+        // lookup that would say `open` never runs and the sender is held.
+        let m = ApprovalsModule::new()
+            .with_unknown_sender_policy_lookup(Arc::new(|_mg_id| Some("open".to_owned())));
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("slack", "U-77")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
+    }
+
+    #[tokio::test]
+    async fn scope_gate_open_policy_skips_notifiers() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_n = Arc::clone(&calls);
+        let calls_p = Arc::clone(&calls);
+        let m = ApprovalsModule::new()
+            .with_unknown_sender_policy_lookup(Arc::new(|_mg_id| Some("open".to_owned())))
+            .with_new_pending_notifier(Arc::new(move |_ctx, _d| {
+                calls_n.fetch_add(1, Ordering::SeqCst);
+            }))
+            .with_pairing_notifier(Arc::new(move |_ctx, _d| {
+                calls_p.fetch_add(1, Ordering::SeqCst);
+            }));
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let d: Arc<dyn DeliveryDispatcher> = MockDispatcher::new();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("telegram", "u-42")),
+            messaging_group_id: Some(copperclaw_types::MessagingGroupId::new()),
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_allow());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an admitted-without-approval sender must not trigger pending/pairing notifications"
+        );
+    }
+
+    #[test]
+    fn unknown_sender_policy_parse_values() {
+        assert_eq!(
+            UnknownSenderPolicy::parse("open"),
+            UnknownSenderPolicy::Open
+        );
+        // Whitespace is tolerated; matching is otherwise exact.
+        assert_eq!(
+            UnknownSenderPolicy::parse(" open "),
+            UnknownSenderPolicy::Open
+        );
+        for held in [
+            "strict",
+            "request_approval",
+            "approval-required",
+            "",
+            "OPEN",
+        ] {
+            assert_eq!(
+                UnknownSenderPolicy::parse(held),
+                UnknownSenderPolicy::RequestApproval,
+                "{held:?} must hold pending"
+            );
+        }
+        assert_eq!(
+            UnknownSenderPolicy::default(),
+            UnknownSenderPolicy::RequestApproval
+        );
     }
 
     #[test]

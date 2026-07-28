@@ -128,6 +128,29 @@ fn exposure_note() -> String {
         .to_string()
 }
 
+/// The approval-card title for a public-tunnel exposure. Names the app (when
+/// the preview carries one), the host port, and the session (M24 S1 / M19 A3
+/// follow-up 2) so an operator with several concurrent previews can tell
+/// exactly which exposure they are approving.
+fn tunnel_card_title(req: &TunnelExposeRequest) -> String {
+    let session = req.session_id.as_uuid();
+    match req
+        .preview_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        Some(name) => format!(
+            "Expose preview \"{name}\" (host port {}, session {session}) to the public internet?",
+            req.host_port
+        ),
+        None => format!(
+            "Expose the preview on host port {} (session {session}) to the public internet?",
+            req.host_port
+        ),
+    }
+}
+
 /// The note returned while an exposure is waiting on an approver's tap.
 fn pending_note() -> String {
     "Public exposure needs operator approval. An approval card has been sent; \
@@ -510,6 +533,20 @@ pub struct TunnelExposeRequest {
     pub host_port: u16,
     /// The local upstream the tunnel fronts, e.g. `http://127.0.0.1:8100`.
     pub upstream: String,
+    /// Stable, non-secret identifier of the SPECIFIC preview instance being
+    /// fronted (M24 S1 / M19 A3 follow-up 1). Host ports are pool-reused within
+    /// a session, so `(session, host_port)` alone is not a safe approval
+    /// identity: a stale approved row could re-stand-up a public tunnel for a
+    /// DIFFERENT app that later reacquired the same port. The nonce is minted
+    /// per preview instance host-side, so retries of the same live preview map
+    /// to the same approval row (the pending-dedup UX is preserved) while a new
+    /// preview — even on a reused port — always raises a FRESH approval.
+    /// Required: an empty nonce is a [`TunnelError::BadRequest`] (fail-closed).
+    pub preview_nonce: String,
+    /// The app/project name the preview was exposed under (if the agent gave
+    /// one). Rendered into the approval card title so an operator with several
+    /// concurrent previews can tell which app they are approving.
+    pub preview_name: Option<String>,
     /// Per-group opt-in. `false` ⇒ [`TunnelError::NotEnabled`] (secure default).
     pub enabled: bool,
     /// Channel coordinates the approval card is posted to, if the host has a
@@ -563,9 +600,17 @@ impl TunnelBroker {
         })
     }
 
-    /// Stable natural key for a `(session, host_port)` exposure's approval row.
-    fn request_id(session_id: SessionId, host_port: u16) -> String {
-        format!("tunnel:{}:{host_port}", session_id.as_uuid())
+    /// Stable natural key for one exposure request's approval row. Includes the
+    /// per-preview nonce (M24 S1): host ports are pool-reused within a session,
+    /// so keying on `(session, host_port)` alone would let a stale approved row
+    /// satisfy a NEW request for a different app on a reacquired port. With the
+    /// nonce in the identity, an old grant can never match a new preview
+    /// instance; retries of the SAME live preview still dedup onto one row.
+    fn request_id(session_id: SessionId, host_port: u16, preview_nonce: &str) -> String {
+        format!(
+            "tunnel:{}:{host_port}:{preview_nonce}",
+            session_id.as_uuid()
+        )
     }
 
     /// Request (and, once approved, stand up) a public tunnel fronting a preview.
@@ -585,6 +630,13 @@ impl TunnelBroker {
         }
         if req.host_port == 0 {
             return Err(TunnelError::BadRequest("host_port must be non-zero".into()));
+        }
+        if req.preview_nonce.trim().is_empty() {
+            // Fail-closed: without a per-preview nonce the approval identity
+            // would degrade back to the pool-reusable (session, host_port) key.
+            return Err(TunnelError::BadRequest(
+                "preview_nonce is required (per-preview approval identity)".into(),
+            ));
         }
 
         // 1. Opt-in gate (secure default). A blocked attempt is still audited.
@@ -622,7 +674,7 @@ impl TunnelBroker {
         self.provider.preflight().await?;
 
         // 4. Consult the approval grant for this exposure.
-        let request_id = Self::request_id(req.session_id, req.host_port);
+        let request_id = Self::request_id(req.session_id, req.host_port, &req.preview_nonce);
         let existing = self.find_approval(&request_id)?;
         let now = Utc::now();
         match existing {
@@ -646,17 +698,25 @@ impl TunnelBroker {
     /// Spawn the tunnel for an approved request, track it, audit the exposure,
     /// and **consume the grant** so it is single-use.
     ///
-    /// Two security bindings live here:
+    /// Three security bindings live here:
     /// * **Bind the spawned upstream to the APPROVED payload, not the retry
     ///   request.** The upstream the tunnel fronts is read from `grant.payload`
     ///   (what the operator saw and approved on the card), never from the
     ///   agent-supplied retry `req`. This closes a confused-deputy where a retry
     ///   could re-drive `stand_up` against a different internal target than the
     ///   one approved.
-    /// * **One-shot grant.** On success the approved row is revoked, so a later
-    ///   re-expose of the same `(session, host_port)` — after the first tunnel is
-    ///   torn down — must raise a FRESH approval and earn a FRESH human tap.
-    ///   There is no path to a second public URL on a single approval.
+    /// * **Consume-first, fail-closed (M24 S1).** The grant is revoked BEFORE
+    ///   the tunnel binary is spawned, serialized under the `active` lock so a
+    ///   concurrent expose cannot double-spend it. If consumption fails for any
+    ///   reason (row gone, no longer approved, DB error) the stand-up is
+    ///   aborted — no tunnel process is ever started on a grant that could not
+    ///   be spent. The deliberate trade: if the tunnel binary then fails to
+    ///   open, the grant is already spent and the retry raises a FRESH approval
+    ///   (the operator may be re-asked; a public tunnel can never outlive its
+    ///   consumed grant's accounting).
+    /// * **One-shot grant.** The revoked row can never authorize a second
+    ///   public URL — a later re-expose of the same preview after teardown must
+    ///   earn a fresh human tap.
     async fn stand_up(
         &self,
         req: &TunnelExposeRequest,
@@ -670,12 +730,56 @@ impl TunnelBroker {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(req.upstream.as_str())
             .to_string();
-        let opened = self.provider.open(&upstream).await?;
+        {
+            // Idempotency + consumption under one lock: a racing expose either
+            // finds the winner's live tunnel here, or fails its own consume
+            // below (the row is no longer approved) — never a second spawn on
+            // one grant.
+            let active = self.active.lock().await;
+            if let Some(t) = active
+                .iter()
+                .find(|t| t.session_id == req.session_id && t.host_port == req.host_port)
+            {
+                return Ok(TunnelOutcome::Exposed(TunnelExposed {
+                    public_url: t.public_url.clone(),
+                    note: exposure_note(),
+                }));
+            }
+            if let Err(err) = self.consume_grant(grant.approval_id) {
+                self.audit(
+                    req.session_id,
+                    req.agent_group_id,
+                    "expose",
+                    req.host_port,
+                    &upstream,
+                    "aborted-grant-consume-failed",
+                );
+                copperclaw_metrics::inc_public_tunnel("aborted", "grant_consume_failed");
+                return Err(err);
+            }
+        }
+        let opened = match self.provider.open(&upstream).await {
+            Ok(opened) => opened,
+            Err(err) => {
+                // The grant is already spent (consume-first): audit the aborted
+                // stand-up so an operator can see why they will be re-asked.
+                self.audit(
+                    req.session_id,
+                    req.agent_group_id,
+                    "expose",
+                    req.host_port,
+                    &upstream,
+                    "open-failed-grant-consumed",
+                );
+                copperclaw_metrics::inc_public_tunnel("aborted", "open_failed");
+                return Err(err);
+            }
+        };
         let public_url = opened.public_url().to_string();
         {
             let mut active = self.active.lock().await;
-            // Double-check idempotency in case of a concurrent expose. The
-            // racing winner already consumed the grant, so don't touch it here.
+            // Defensive re-check: consumption is one-shot, so a concurrent
+            // duplicate should be impossible here — but never leak a child.
             if let Some(t) = active
                 .iter()
                 .find(|t| t.session_id == req.session_id && t.host_port == req.host_port)
@@ -697,7 +801,6 @@ impl TunnelBroker {
                 tunnel: opened,
             });
         }
-        self.consume_grant(grant.approval_id);
         self.audit(
             req.session_id,
             req.agent_group_id,
@@ -721,16 +824,37 @@ impl TunnelBroker {
         }))
     }
 
-    /// Revoke a just-used approval grant so it cannot authorize a second public
-    /// exposure. Best-effort: a DB error is logged and swallowed (the tunnel is
-    /// already live and tracked; the worst case is the operator being re-asked).
-    fn consume_grant(&self, approval_id: ApprovalId) {
-        if let Err(err) =
-            pending_approvals::update_status(&self.central, approval_id, ApprovalStatus::Revoked)
-        {
-            warn!(?err, "tunnel: could not consume approval grant");
-            return;
+    /// Spend an approval grant so it cannot authorize a second public exposure.
+    /// Fail-closed (M24 S1): re-reads the row and refuses unless it is still
+    /// `Approved`, then flips it to `Revoked`; ANY failure (row gone, already
+    /// spent, DB error) is an error the caller must treat as "do not stand up".
+    /// Called BEFORE the tunnel binary is spawned — a grant that cannot be
+    /// spent never fronts a public URL.
+    fn consume_grant(&self, approval_id: ApprovalId) -> Result<(), TunnelError> {
+        let row = pending_approvals::get(&self.central, approval_id).map_err(|e| {
+            TunnelError::Internal(format!(
+                "could not read approval grant {} to consume it: {e}",
+                approval_id.as_uuid()
+            ))
+        })?;
+        if row.status != ApprovalStatus::Approved {
+            return Err(TunnelError::Internal(format!(
+                "approval grant {} is no longer approved (status: {}); a fresh operator \
+                 approval is required before this preview can be made public",
+                approval_id.as_uuid(),
+                row.status.as_str()
+            )));
         }
+        pending_approvals::update_status(&self.central, approval_id, ApprovalStatus::Revoked)
+            .map_err(|e| {
+                warn!(?e, "tunnel: could not consume approval grant");
+                TunnelError::Internal(format!(
+                    "could not consume approval grant {}: {e}",
+                    approval_id.as_uuid()
+                ))
+            })?;
+        // The decision row is bookkeeping on an already-revoked grant —
+        // best-effort is still safe here.
         let _ = pending_approvals::record_decision(
             &self.central,
             approval_id,
@@ -739,6 +863,7 @@ impl TunnelBroker {
             "system:tunnel-consumed",
             Some("grant consumed by one-shot public tunnel exposure"),
         );
+        Ok(())
     }
 
     /// Persist a `CredentialedExternalAction` pending approval for this exposure
@@ -759,6 +884,8 @@ impl TunnelBroker {
             "session_id": req.session_id.as_uuid().to_string(),
             "host_port": req.host_port,
             "upstream": req.upstream,
+            "preview_nonce": req.preview_nonce,
+            "preview_name": req.preview_name,
         });
         let approval = pending_approvals::upsert(
             &self.central,
@@ -770,7 +897,7 @@ impl TunnelBroker {
                 agent_group_id: Some(req.agent_group_id),
                 channel_type,
                 platform_id,
-                title: "Expose this preview to the public internet?".to_string(),
+                title: tunnel_card_title(req),
                 options: vec![],
                 ..Default::default()
             },
@@ -1160,6 +1287,8 @@ mod tests {
                 agent_group_id: AgentGroupId::new(),
                 host_port: 8100,
                 upstream: "http://127.0.0.1:8100".into(),
+                preview_nonce: "nonce-a".into(),
+                preview_name: None,
                 enabled: false,
                 notify: None,
             })
@@ -1187,6 +1316,8 @@ mod tests {
                 agent_group_id: AgentGroupId::new(),
                 host_port: 8100,
                 upstream: "http://127.0.0.1:8100".into(),
+                preview_nonce: "nonce-b".into(),
+                preview_name: None,
                 enabled: true,
                 notify: None,
             })
@@ -1216,6 +1347,8 @@ mod tests {
             agent_group_id,
             host_port: 8100,
             upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "nonce-flow".into(),
+            preview_name: Some("cofounder-demo".into()),
             enabled: true,
             notify: Some((ChannelType::new("telegram"), "chat-1".into())),
         };
@@ -1231,6 +1364,20 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].payload["kind"], "tunnel");
         assert_eq!(pending[0].payload["host_port"], 8100);
+        // S1 (a): the approval identity carries the per-preview nonce, not just
+        // the pool-reusable (session, host_port).
+        assert!(
+            pending[0].request_id.ends_with(":nonce-flow"),
+            "request id includes the preview nonce: {}",
+            pending[0].request_id
+        );
+        // S1 (b): the card names the app, the host port, and the session.
+        assert!(pending[0].title.contains("cofounder-demo"), "names the app");
+        assert!(pending[0].title.contains("8100"), "names the host port");
+        assert!(
+            pending[0].title.contains(&session_id.as_uuid().to_string()),
+            "names the session"
+        );
 
         // 2. A repeat expose while pending stays pending (no duplicate rows).
         assert!(matches!(
@@ -1322,6 +1469,8 @@ mod tests {
             agent_group_id,
             host_port: 8100,
             upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "nonce-denied".into(),
+            preview_name: None,
             enabled: true,
             notify: None,
         };
@@ -1353,6 +1502,8 @@ mod tests {
                 agent_group_id,
                 host_port: port,
                 upstream: format!("http://127.0.0.1:{port}"),
+                preview_nonce: format!("nonce-{port}"),
+                preview_name: None,
                 enabled: true,
                 notify: None,
             };
@@ -1371,6 +1522,199 @@ mod tests {
         assert_eq!(broker.active_count().await, 2);
         assert_eq!(broker.close_all_for_session(session_id).await, 2);
         assert_eq!(broker.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_preview_nonce_is_refused_fail_closed() {
+        // Without a nonce the approval identity would degrade back to the
+        // pool-reusable (session, host_port) key — refuse before any gate.
+        let central = db();
+        let provider = Arc::new(CloudflaredProvider::with_binary("/nonexistent/cf"));
+        let broker = TunnelBroker::new(central, provider);
+        let err = broker
+            .expose(TunnelExposeRequest {
+                session_id: SessionId::new(),
+                agent_group_id: AgentGroupId::new(),
+                host_port: 8100,
+                upstream: "http://127.0.0.1:8100".into(),
+                preview_nonce: "   ".into(),
+                preview_name: None,
+                enabled: true,
+                notify: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TunnelError::BadRequest(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn stale_approved_grant_on_reused_port_needs_fresh_approval() {
+        // M24 S1 (a): host ports are pool-reused. An old, still-Approved row for
+        // (session, host_port) minted under a PREVIOUS preview instance must not
+        // satisfy a NEW preview's exposure request — the nonce in the request
+        // identity forces a fresh approval (and a fresh human tap).
+        let central = db();
+        let (_guard, path) = mock_binary("INF https://stale.trycloudflare.com", 30);
+        let provider = Arc::new(
+            CloudflaredProvider::with_binary(path).with_open_timeout(Duration::from_secs(30)),
+        );
+        let broker = TunnelBroker::new(central.clone(), provider);
+        let (agent_group_id, session_id) = seed_group_and_session(&central);
+
+        // Old preview instance requests exposure; the operator approves; the
+        // grant is never consumed (simulating the stale-approved-row hazard).
+        let old_req = TunnelExposeRequest {
+            session_id,
+            agent_group_id,
+            host_port: 8100,
+            upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "old-preview".into(),
+            preview_name: Some("old-app".into()),
+            enabled: true,
+            notify: None,
+        };
+        let approval_id = match broker.expose(old_req).await.unwrap() {
+            TunnelOutcome::Pending { approval_id, .. } => approval_id,
+            TunnelOutcome::Exposed(e) => panic!("expected Pending, got Exposed {e:?}"),
+        };
+        let approval_uuid =
+            copperclaw_types::ApprovalId(uuid::Uuid::parse_str(&approval_id).unwrap());
+        update_status(&central, approval_uuid, ApprovalStatus::Approved).unwrap();
+
+        // A DIFFERENT app later reacquires host port 8100 in the same session
+        // (fresh preview instance ⇒ fresh nonce). The stale grant must NOT
+        // stand up a tunnel: the request goes Pending on a NEW approval row.
+        let new_req = TunnelExposeRequest {
+            session_id,
+            agent_group_id,
+            host_port: 8100,
+            upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "new-preview".into(),
+            preview_name: Some("new-app".into()),
+            enabled: true,
+            notify: None,
+        };
+        match broker.expose(new_req).await.unwrap() {
+            TunnelOutcome::Pending {
+                approval_id: id, ..
+            } => {
+                assert_ne!(id, approval_id, "a fresh approval row was raised");
+            }
+            TunnelOutcome::Exposed(e) => {
+                panic!("stale grant re-stood-up a public tunnel: {e:?}")
+            }
+        }
+        assert_eq!(broker.active_count().await, 0, "no tunnel without a tap");
+        // The stale grant is untouched and the new row is pending.
+        let rows = pending_approvals::list(&central, Some(TUNNEL_APPROVAL_ACTION), None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r.request_id.ends_with(":new-preview")
+                    && r.status == ApprovalStatus::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_failure_aborts_before_stand_up() {
+        // M24 S1 (a): grant consumption is fail-closed and happens BEFORE the
+        // tunnel binary is spawned. A grant that cannot be spent (here: revoked
+        // in the DB under a stale in-memory Approved snapshot) must abort the
+        // stand-up with a grant error — NOT reach the provider (the absent
+        // binary would surface as BinaryNotFound/Spawn if it were attempted).
+        let central = db();
+        let provider = Arc::new(CloudflaredProvider::with_binary("/nonexistent/cf"));
+        let broker = TunnelBroker::new(central.clone(), provider);
+        let (agent_group_id, session_id) = seed_group_and_session(&central);
+        let req = TunnelExposeRequest {
+            session_id,
+            agent_group_id,
+            host_port: 8100,
+            upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "nonce-consume".into(),
+            preview_name: None,
+            enabled: true,
+            notify: None,
+        };
+        // Seed the approval row directly (the absent binary blocks `expose`'s
+        // preflight path, which is exactly why stand_up must not reach it).
+        let grant = pending_approvals::upsert(
+            &central,
+            UpsertPendingApproval {
+                session_id: Some(session_id),
+                request_id: TunnelBroker::request_id(session_id, 8100, "nonce-consume"),
+                action: TUNNEL_APPROVAL_ACTION.to_string(),
+                payload: serde_json::json!({"upstream": "http://127.0.0.1:8100"}),
+                agent_group_id: Some(agent_group_id),
+                title: "t".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        update_status(&central, grant.approval_id, ApprovalStatus::Approved).unwrap();
+        // Stale snapshot says Approved; the DB row is then revoked (as a racing
+        // consumer would have done).
+        let mut stale = pending_approvals::get(&central, grant.approval_id).unwrap();
+        assert_eq!(stale.status, ApprovalStatus::Approved);
+        update_status(&central, grant.approval_id, ApprovalStatus::Revoked).unwrap();
+        stale.status = ApprovalStatus::Approved; // keep the snapshot stale
+
+        let err = broker.stand_up(&req, &stale).await.unwrap_err();
+        match &err {
+            TunnelError::Internal(msg) => {
+                assert!(msg.contains("no longer approved"), "got {msg}");
+            }
+            other => panic!(
+                "expected the grant-consume Internal error (binary must never \
+                 be attempted), got {other:?}"
+            ),
+        }
+        assert_eq!(broker.active_count().await, 0, "stand-up aborted");
+    }
+
+    #[tokio::test]
+    async fn open_failure_after_consume_spends_grant_fail_closed() {
+        // M24 S1 (a): consume-first ordering on the live path. When the tunnel
+        // binary fails to advertise a URL, the grant was ALREADY spent — the
+        // retry must raise a fresh approval rather than reuse the grant.
+        let central = db();
+        // Mock binary passes preflight but exits without printing a URL.
+        let (_guard, path) = mock_binary("starting up, no url here", 0);
+        let provider = Arc::new(
+            CloudflaredProvider::with_binary(path).with_open_timeout(Duration::from_secs(30)),
+        );
+        let broker = TunnelBroker::new(central.clone(), provider);
+        let (agent_group_id, session_id) = seed_group_and_session(&central);
+        let req = TunnelExposeRequest {
+            session_id,
+            agent_group_id,
+            host_port: 8100,
+            upstream: "http://127.0.0.1:8100".into(),
+            preview_nonce: "nonce-openfail".into(),
+            preview_name: None,
+            enabled: true,
+            notify: None,
+        };
+        let approval_id = match broker.expose(req.clone()).await.unwrap() {
+            TunnelOutcome::Pending { approval_id, .. } => approval_id,
+            TunnelOutcome::Exposed(e) => panic!("expected Pending, got Exposed {e:?}"),
+        };
+        let approval_uuid =
+            copperclaw_types::ApprovalId(uuid::Uuid::parse_str(&approval_id).unwrap());
+        update_status(&central, approval_uuid, ApprovalStatus::Approved).unwrap();
+
+        let err = broker.expose(req.clone()).await.unwrap_err();
+        assert!(matches!(err, TunnelError::NoUrl { .. }), "got {err:?}");
+        assert_eq!(broker.active_count().await, 0);
+        // The grant was consumed BEFORE the failed stand-up.
+        let after = pending_approvals::get(&central, approval_uuid).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Revoked);
+        // The retry cannot reuse it: a fresh approval is raised.
+        assert!(matches!(
+            broker.expose(req).await.unwrap(),
+            TunnelOutcome::Pending { .. }
+        ));
     }
 
     #[tokio::test]

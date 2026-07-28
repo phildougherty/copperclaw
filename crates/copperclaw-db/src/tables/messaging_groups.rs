@@ -17,6 +17,13 @@ use rusqlite::{OptionalExtension, Row, params};
 /// handler and any DM auto-creation path reference this constant instead of
 /// hard-coding a string, so the default can never silently drift between
 /// call sites.
+///
+/// The sender-scope gate (`copperclaw_modules::approvals`, wired in host
+/// boot) enforces the stored value per messaging group: `"open"` admits an
+/// unknown sender without approval; `"request_approval"`,
+/// `"approval-required"` (the setup wizard's spelling), `"strict"` (the
+/// `001_initial.sql` schema default), and any unrecognized value all hold
+/// the sender pending operator approval.
 pub const DEFAULT_UNKNOWN_SENDER_POLICY: &str = "request_approval";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

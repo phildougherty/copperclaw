@@ -29,6 +29,7 @@ pub mod db;
 pub mod destinations;
 pub mod dropped_messages;
 pub mod egress;
+pub mod grants;
 pub mod groups;
 pub mod host_status;
 pub mod mcp;
@@ -85,6 +86,7 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "approvals.deny",
     "approvals.revoke",
     "pairing.approve",
+    "grants.revoke",
     "budgets.set",
     "db.backup",
     "db.restore",

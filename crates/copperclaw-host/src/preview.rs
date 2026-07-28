@@ -113,6 +113,9 @@ pub enum TeardownReason {
     SessionStop,
     /// The host is shutting down.
     Shutdown,
+    /// The operator flipped the group's `preview_enabled` off (M24 S1 kill
+    /// switch): every live preview and public tunnel of the group is torn down.
+    Disabled,
 }
 
 impl TeardownReason {
@@ -122,6 +125,7 @@ impl TeardownReason {
             Self::Idle => "idle",
             Self::SessionStop => "session-stop",
             Self::Shutdown => "shutdown",
+            Self::Disabled => "previews-disabled",
         }
     }
 }
@@ -136,6 +140,13 @@ struct PreviewEntry {
     host_port: u16,
     token: String,
     name: Option<String>,
+    /// Non-secret, per-preview-instance identifier (M24 S1). Host ports are
+    /// pool-reused, so the public-tunnel approval keys its request identity on
+    /// this nonce rather than the reusable `(session, host_port)` — a stale
+    /// approved grant from an earlier preview can never satisfy a new one.
+    /// Stable across tombstone/revive of the SAME instance; a fresh expose
+    /// after full teardown mints a fresh nonce.
+    nonce: String,
     container_ip: String,
     /// Last time a valid proxied request was seen (tokio clock, so a
     /// paused-clock test can advance it deterministically).
@@ -320,6 +331,13 @@ pub struct LivePreviewProxy {
     /// proxy, so the shareable public URL must carry `.../__preview/<token>` —
     /// public exposure stays token-gated (defence in depth).
     pub token: String,
+    /// The per-preview-instance nonce the public-tunnel approval keys its
+    /// request identity on (M24 S1) — see [`PreviewEntry::nonce`].
+    pub nonce: String,
+    /// The app/project name the preview was exposed under (if any), rendered
+    /// into the public-tunnel approval card so the operator knows which app
+    /// they are approving.
+    pub name: Option<String>,
 }
 
 /// The host-side preview manager. Constructed once at boot with the container
@@ -346,18 +364,80 @@ pub struct PreviewManager {
     tunnel_broker: OnceLock<Arc<copperclaw_modules::TunnelBroker>>,
 }
 
+/// Registry of live [`PreviewManager`]s (M24 S1 kill switch). The sync
+/// `groups.config.update` handler has no path to the manager the host booted
+/// with, so every manager self-registers here (weakly — a dropped manager is
+/// pruned, never kept alive). [`teardown_group_previews`] walks the registry to
+/// tear down a disabled group's previews + tunnels. Production holds exactly
+/// one manager; unit tests may hold several, which is harmless because group
+/// ids are unique and a manager with no entries for the group is a no-op.
+static LIVE_MANAGERS: StdMutex<Vec<std::sync::Weak<PreviewManager>>> = StdMutex::new(Vec::new());
+
+/// Best-effort teardown of every live preview (and the public tunnels fronting
+/// them) belonging to `agent_group_id`, across every registered manager. The
+/// M24 S1 kill switch: called by the `groups.config.update` handler when an
+/// operator flips `preview_enabled` off, so disabling previews stops serving
+/// immediately rather than only blocking NEW exposures. Spawned onto the
+/// current tokio runtime (the socket handlers run inside one); without a
+/// runtime it logs and skips — best-effort by contract, and the flipped config
+/// still blocks every new exposure fail-closed.
+pub fn teardown_group_previews(agent_group_id: AgentGroupId) {
+    let managers: Vec<Arc<PreviewManager>> = {
+        let mut registry = LIVE_MANAGERS.lock().unwrap();
+        registry.retain(|w| w.strong_count() > 0);
+        registry
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    };
+    if managers.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                for manager in managers {
+                    let n = manager
+                        .close_all_for_group(agent_group_id, TeardownReason::Disabled)
+                        .await;
+                    if n > 0 {
+                        info!(
+                            agent_group_id = %agent_group_id.as_uuid(),
+                            torn_down = n,
+                            "previews disabled: tore down the group's live previews"
+                        );
+                    }
+                }
+            });
+        }
+        Err(_) => {
+            warn!(
+                agent_group_id = %agent_group_id.as_uuid(),
+                "previews disabled outside an async runtime; live previews not torn down \
+                 (new exposures are still blocked by the disabled config)"
+            );
+        }
+    }
+}
+
 impl PreviewManager {
     /// Construct a manager. The reaper is started separately via
-    /// [`PreviewManager::spawn_reaper`].
+    /// [`PreviewManager::spawn_reaper`]. Self-registers (weakly) in
+    /// [`LIVE_MANAGERS`] so the M24 S1 kill switch can reach it.
     #[must_use]
     pub fn new(central: CentralDb, runtime: Arc<dyn ContainerRuntime>) -> Arc<Self> {
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             central,
             runtime,
             entries: AsyncMutex::new(Vec::new()),
             approval_dispatcher: OnceLock::new(),
             tunnel_broker: OnceLock::new(),
-        })
+        });
+        let mut registry = LIVE_MANAGERS.lock().unwrap();
+        registry.retain(|w| w.strong_count() > 0);
+        registry.push(Arc::downgrade(&manager));
+        drop(registry);
+        manager
     }
 
     /// Wire the delivery dispatcher used to post the one-tap enable-preview
@@ -411,6 +491,8 @@ impl PreviewManager {
         Some(LivePreviewProxy {
             host_port: entry.host_port,
             token: entry.token.clone(),
+            nonce: entry.nonce.clone(),
+            name: entry.name.clone(),
         })
     }
 
@@ -507,6 +589,33 @@ impl PreviewManager {
         for port in ports {
             self.teardown(session_id, port, reason).await;
         }
+    }
+
+    /// Tear down every preview belonging to `agent_group_id` (M24 S1 kill
+    /// switch — the operator disabled previews for the group). Reuses the same
+    /// [`Self::teardown`] path as close/session-stop/shutdown, so the public
+    /// tunnels fronting the previews are torn down with them and every
+    /// teardown is audited. Returns how many previews were torn down.
+    pub async fn close_all_for_group(
+        &self,
+        agent_group_id: AgentGroupId,
+        reason: TeardownReason,
+    ) -> usize {
+        let targets: Vec<(SessionId, u16)> = {
+            let entries = self.entries.lock().await;
+            entries
+                .iter()
+                .filter(|e| e.agent_group_id == agent_group_id)
+                .map(|e| (e.session_id, e.container_port))
+                .collect()
+        };
+        let mut n = 0;
+        for (session_id, port) in targets {
+            if self.teardown(session_id, port, reason).await {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Remove the entry for `(session, container_port)` if present, cancel its
@@ -983,6 +1092,7 @@ impl PreviewBroker for PreviewManager {
             host_port,
             token,
             name: name.clone(),
+            nonce: mint_token(),
             container_ip,
             last_activity,
             cancel,
@@ -1132,6 +1242,12 @@ impl copperclaw_modules::PublicTunnelBroker for PublicPreviewTunnel {
             agent_group_id: session.agent_group_id,
             host_port: proxy.host_port,
             upstream,
+            // M24 S1: the approval identity is keyed on this per-preview nonce,
+            // so a stale approved grant from an earlier preview on a pool-reused
+            // host port can never satisfy this request. The app name feeds the
+            // approval card so the operator knows what they are approving.
+            preview_nonce: proxy.nonce.clone(),
+            preview_name: proxy.name.clone(),
             enabled,
             notify,
         };
@@ -1262,7 +1378,7 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     // Token-mint path: set the cookie and redirect to the app root.
     if let Some(token) = path.strip_prefix(PREVIEW_TOKEN_PATH) {
         if constant_time_eq(token, &state.token) {
-            return cookie_mint_redirect(&state.token);
+            return cookie_mint_redirect(&state.token, forwarded_https(req.headers()));
         }
         return forbidden();
     }
@@ -1291,10 +1407,31 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     proxy_upstream(&state, req).await
 }
 
+/// Did this request reach the proxy through an HTTPS front (M24 S1)? The proxy
+/// itself only ever speaks plain HTTP — the sole TLS terminator in front of it
+/// is the public tunnel (cloudflared), which stamps `X-Forwarded-Proto: https`
+/// on every forwarded request. A direct LAN/loopback hit carries no such
+/// header, so this is the honest scheme signal: `true` exactly when the cookie
+/// will live in an HTTPS browsing context. (A client spoofing the header only
+/// changes its own cookie's flags — no cross-client effect.)
+fn forwarded_https(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(HeaderName::from_static("x-forwarded-proto"))
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|proto| proto.trim().eq_ignore_ascii_case("https"))
+}
+
 /// Build the 302 that mints the gating cookie and redirects to the app root.
 /// Shared by the live token-mint path and a successful tombstone recovery.
-fn cookie_mint_redirect(token: &str) -> Response {
-    let cookie = format!("{PREVIEW_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax");
+/// `secure` (M24 S1) marks the cookie `Secure` when the request arrived over
+/// the HTTPS public tunnel (see [`forwarded_https`]) so the token is never
+/// replayed over plain HTTP from that context; plain-HTTP LAN previews keep a
+/// non-`Secure` cookie, or the browser would refuse to send it at all.
+fn cookie_mint_redirect(token: &str, secure: bool) -> Response {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!("{PREVIEW_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax{secure_attr}");
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::SET_COOKIE, cookie)
@@ -1316,7 +1453,7 @@ async fn tombstone_handler(state: &Arc<ProxyState>, req: Request) -> Response {
         }
         if state.try_recover().await {
             // Re-exposed: mint the cookie + redirect to the (now live) app.
-            return cookie_mint_redirect(&state.token);
+            return cookie_mint_redirect(&state.token, forwarded_https(req.headers()));
         }
         // One recovery already used, or the container is no longer up.
         return tombstone_page(true);
@@ -2605,6 +2742,177 @@ mod manager_tests {
         // 4. Closing the preview tears the tunnel down with it (A3 auto-teardown).
         mgr.close(session_id, upstream_port).await.unwrap();
         assert_eq!(mgr.tunnel_broker.get().unwrap().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn make_public_card_names_app_port_and_session() {
+        // M24 S1 (b): the approval card raised for a public exposure names the
+        // app the preview carries, the host port, and the session.
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(session_id, ag);
+        mgr.expose(&sess, upstream_port, Some("shop-demo".into()))
+            .await
+            .unwrap();
+        let proxy = mgr.live_proxy_for(session_id, upstream_port).await.unwrap();
+
+        let (_guard, bin) = mock_cloudflared("https://x.trycloudflare.com");
+        let pt = public_tunnel(&mgr, &db, &bin, true);
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Pending { .. } => {}
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        let rows = pending_approvals::list(&db, Some(TUNNEL_APPROVAL_ACTION), None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let title = &rows[0].title;
+        assert!(title.contains("shop-demo"), "names the app: {title}");
+        assert!(
+            title.contains(&proxy.host_port.to_string()),
+            "names the host port: {title}"
+        );
+        assert!(
+            title.contains(&session_id.as_uuid().to_string()),
+            "names the session: {title}"
+        );
+        // M24 S1 (a): the request identity carries the per-preview nonce.
+        assert!(
+            rows[0].request_id.ends_with(&format!(":{}", proxy.nonce)),
+            "request id keys on the preview nonce: {}",
+            rows[0].request_id
+        );
+        mgr.close(session_id, upstream_port).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabling_previews_tears_down_group_previews_and_tunnels() {
+        // M24 S1 (c): flipping `preview_enabled` off via groups.config.update
+        // is a kill switch — the group's live preview AND the public tunnel
+        // fronting it are torn down, not just future exposures blocked.
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(session_id, ag);
+        mgr.expose(&sess, upstream_port, Some("kill-me".into()))
+            .await
+            .unwrap();
+
+        // Stand a public tunnel up in front of it.
+        let (_guard, bin) = mock_cloudflared("https://kill-me.trycloudflare.com");
+        let pt = public_tunnel(&mgr, &db, &bin, true);
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Pending { .. } => {}
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        approve_tunnel(&db);
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Exposed { .. } => {}
+            other => panic!("expected Exposed, got {other:?}"),
+        }
+        assert_eq!(mgr.active_count().await, 1);
+        assert_eq!(mgr.tunnel_broker.get().unwrap().active_count().await, 1);
+
+        // Operator kill switch: preview_enabled=false through the real handler.
+        let v = crate::handlers::groups::config_update(
+            &serde_json::json!({
+                "id": ag.as_uuid().to_string(),
+                "field": "preview_enabled",
+                "value": false,
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["preview_enabled"], false);
+
+        // Teardown is spawned best-effort; poll for it.
+        for _ in 0..100 {
+            if mgr.active_count().await == 0
+                && mgr.tunnel_broker.get().unwrap().active_count().await == 0
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.active_count().await, 0, "live preview torn down");
+        assert_eq!(
+            mgr.tunnel_broker.get().unwrap().active_count().await,
+            0,
+            "public tunnel torn down with the preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_cookie_secure_only_when_fronted_by_https() {
+        // M24 S1 (d): the gating cookie is marked Secure exactly when the
+        // request came through the HTTPS public tunnel (cloudflared stamps
+        // X-Forwarded-Proto: https); a plain-HTTP LAN hit keeps a non-Secure
+        // cookie so the browser still sends it back over http://.
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let mgr = manager(db, Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+        let exposed = mgr.expose(&sess, upstream_port, None).await.unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // Plain LAN hit: no Secure attribute.
+        let r = client.get(&exposed.url).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 302);
+        let plain = r
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(plain.contains("HttpOnly"));
+        assert!(
+            !plain.contains("Secure"),
+            "plain-HTTP mint must not set Secure: {plain}"
+        );
+
+        // Fronted by the HTTPS tunnel: cloudflared adds X-Forwarded-Proto.
+        let r = client
+            .get(&exposed.url)
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 302);
+        let tunneled = r
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            tunneled.contains("; Secure"),
+            "HTTPS-fronted mint sets Secure: {tunneled}"
+        );
+
+        mgr.close(sess.session_id, upstream_port).await.unwrap();
+    }
+
+    #[test]
+    fn forwarded_https_detects_only_an_https_front() {
+        let mut h = HeaderMap::new();
+        assert!(!forwarded_https(&h), "no header => plain HTTP");
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!forwarded_https(&h));
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(forwarded_https(&h));
+        h.insert("x-forwarded-proto", "HTTPS".parse().unwrap());
+        assert!(forwarded_https(&h), "case-insensitive");
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(forwarded_https(&h), "list form");
     }
 
     #[tokio::test]

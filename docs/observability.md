@@ -293,7 +293,7 @@ skills S1–S4); the metric definitions and helper docs live in
 
 | Name | Labels | Meaning |
 |---|---|---|
-| `copperclaw_task_grants_total` | `outcome` | A task capability-grant lifecycle event; `outcome` = `approved` (persisted after operator approval). `issued\|revoked\|expired` are reserved for when those sites land (A1). |
+| `copperclaw_task_grants_total` | `outcome` | A task capability-grant lifecycle event; `outcome` = `approved` (persisted after operator approval) or `revoked` (operator revoked via `cclaw grants revoke` / the `grants.revoke` wire command — M24 S3). `issued\|expired` remain reserved for when those sites land (there is no expiry sweep; grants lapse lazily via `effective_grant`) (A1). |
 | `copperclaw_autonomous_actions_total` | `outcome` | An autonomous turn's credentialed external action met the grant gate; `outcome` = `taken` (granted, in-scope, fire charged) or `blocked_proposed` (ungranted/out-of-scope → read-then-propose) (A2). |
 | `copperclaw_grants_snapshotted_total` | `outcome` | The host wrote/removed the per-session `grant.json` the runner's gate reads; `outcome` = `written\|removed_no_grant\|removed_no_firing_task\|removed_read_error` (A2 host half). |
 | `copperclaw_grant_fires_consumed_total` | — | Grant fires the host debited after an autonomous action (A2 host half). |

@@ -464,6 +464,16 @@ pub struct DeliveryService {
     /// per-group skills root, so a `save_skill` request is refused with a
     /// clear self-mod failure rather than silently dropped.
     groups_dir: std::sync::OnceLock<PathBuf>,
+    /// Root of the per-session data dirs (`<data_dir>/sessions`). When set, a
+    /// runner-emitted `taint_approval_request` (M24 S4) is raised as a
+    /// `taint_clearance` pending approval whose payload carries the
+    /// host-computed `session_dir` (`<sessions_dir>/<ag>/<sess>`) — the exact
+    /// dir the approvals handler's apply arm writes the single-turn
+    /// `taint_clearance.json` into. Set once at boot via
+    /// [`DeliveryService::set_sessions_dir`]; `None` (tests / minimal hosts)
+    /// drops the request with a warning rather than raising an unusable
+    /// approval.
+    sessions_dir: std::sync::OnceLock<PathBuf>,
 }
 
 impl DeliveryService {
@@ -505,6 +515,7 @@ impl DeliveryService {
             preview_broker: std::sync::OnceLock::new(),
             tunnel_broker: std::sync::OnceLock::new(),
             groups_dir: std::sync::OnceLock::new(),
+            sessions_dir: std::sync::OnceLock::new(),
         })
     }
 
@@ -552,6 +563,7 @@ impl DeliveryService {
             preview_broker: std::sync::OnceLock::new(),
             tunnel_broker: std::sync::OnceLock::new(),
             groups_dir: std::sync::OnceLock::new(),
+            sessions_dir: std::sync::OnceLock::new(),
         })
     }
 
@@ -583,6 +595,15 @@ impl DeliveryService {
     /// set.
     pub fn set_groups_dir(&self, dir: PathBuf) -> bool {
         self.groups_dir.set(dir).is_ok()
+    }
+
+    /// Wire the per-session data root (`<data_dir>/sessions`) used by a raised
+    /// `taint_clearance` approval (M24 S4) to compute the session dir the
+    /// apply arm writes the single-turn clearance file into. Called once at
+    /// boot; a second call is a no-op (the `OnceLock` keeps the first).
+    /// Returns whether it was set.
+    pub fn set_sessions_dir(&self, dir: PathBuf) -> bool {
+        self.sessions_dir.set(dir).is_ok()
     }
 
     /// Register or replace a delivery action handler.
@@ -1428,6 +1449,20 @@ impl DeliveryService {
             self.raise_task_grant_approval(sess, row, target, inbound_pool, &action.payload)?;
             return Ok(());
         }
+        // `taint_approval_request` (M24 S4): the runner emits this when the
+        // taint gate blocks a credentialed external action on a tainted turn —
+        // the "fresh approval" route the deny text promises. Like `save_skill`
+        // it is APPROVAL-GATED: we raise a `taint_clearance` pending approval
+        // + card here; only when an operator approves does the host's apply
+        // arm write the single-turn `taint_clearance.json` into the session
+        // dir, which the runner consumes (and deletes) at its next turn start.
+        // Nothing is cleared without approval. The card is best-effort — the
+        // approval stays actionable via `cclaw approvals approve-id` even with
+        // no routable channel.
+        if action.name == "taint_approval_request" {
+            self.raise_taint_clearance_approval(sess, row, target, inbound_pool, &action.payload)?;
+            return Ok(());
+        }
         // `goal` (M22 A3): the runner emits this when the agent calls
         // `create_goal` / `update_goal`. A goal is internal tracking state — it
         // authorizes nothing on its own — so unlike `save_skill` / `task_grant`
@@ -1988,6 +2023,121 @@ impl DeliveryService {
                 Ok(())
             }
         }
+    }
+
+    /// Raise a `taint_clearance` pending approval for a taint-blocked
+    /// credentialed external action (M24 S4) and dispatch an approve/deny card
+    /// to the originating channel when one is routable.
+    ///
+    /// Nothing is cleared here — the single-turn `taint_clearance.json` lands
+    /// in the session dir only when an operator approves (the host's
+    /// `taint_clearance` apply arm). The pending row carries the runner-named
+    /// blocked tool + taint source plus the host-computed `session_dir` /
+    /// `allowed_root`, so the apply arm needs no extra config. Idempotent per
+    /// session via a stable `request_id`, so repeated blocks don't stack
+    /// approvals. When the sessions root is unwired (tests / minimal hosts)
+    /// the request is dropped with a warning — an approval that could never be
+    /// applied is worse than none.
+    fn raise_taint_clearance_approval(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        target: Option<&DispatchTarget>,
+        inbound_pool: &SessionPool,
+        payload: &serde_json::Value,
+    ) -> Result<(), DeliveryError> {
+        let tool = payload
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let taint_source = payload
+            .get("taint_source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let Some(sessions_dir) = self.sessions_dir.get() else {
+            warn!(
+                session = %sess.id.as_uuid(),
+                %tool,
+                "taint_approval_request dropped: sessions dir not wired on this host"
+            );
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        };
+        let clearance_dir = sessions_dir
+            .join(sess.agent_group_id.as_uuid().to_string())
+            .join(sess.id.as_uuid().to_string());
+        let payload_out = serde_json::json!({
+            "tool": tool,
+            "taint_source": taint_source,
+            // Host-computed (trusted) destination + containment root; the
+            // apply arm writes `<session_dir>/taint_clearance.json` and
+            // refuses anything that canonically escapes `allowed_root`.
+            "session_id": sess.id.as_uuid().to_string(),
+            "session_dir": clearance_dir.to_string_lossy(),
+            "allowed_root": sessions_dir.to_string_lossy(),
+        });
+
+        let approval = match pending_approvals::upsert(
+            &self.central,
+            pending_approvals::UpsertPendingApproval {
+                request_id: format!("taint-clearance:{}", sess.id.as_uuid()),
+                action: "taint_clearance".to_string(),
+                payload: payload_out,
+                agent_group_id: Some(sess.agent_group_id),
+                session_id: Some(sess.id),
+                channel_type: target.and_then(|t| t.channel_type.clone()),
+                platform_id: target.and_then(|t| t.platform_id.clone()),
+                title: format!("Taint clearance: {tool}"),
+                ..Default::default()
+            },
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                warn!(?err, session = %sess.id.as_uuid(), "taint_clearance approval upsert failed");
+                let in_conn = inbound_pool.connect()?;
+                delivered::insert(&in_conn, row.id, None, "ok")?;
+                return Ok(());
+            }
+        };
+
+        // Best-effort card to the originating channel. The `approve:<id>` /
+        // `deny:<id>` buttons route through the same G1 interceptor + DB path
+        // the CLI `cclaw approvals approve-id <id>` uses, so the request is
+        // actionable even on channels without buttons (operator CLI).
+        if let Some(target) = target {
+            if target.channel_type.is_some() && target.platform_id.is_some() {
+                let approval_id = approval.approval_id.as_uuid().to_string();
+                let body = format!(
+                    "The agent was blocked from running `{tool}` because this turn's \
+                     context contains untrusted content (taint source: `{taint_source}`). \
+                     Approving clears credentialed external actions for exactly ONE turn \
+                     of this session; the clearance expires unused after about an hour."
+                );
+                let card = OutboundMessage {
+                    kind: MessageKind::Card,
+                    content: serde_json::json!({
+                        "card": {
+                            "title": format!("Taint clearance: {tool}"),
+                            "body": body,
+                            "buttons": [
+                                { "label": "Approve one turn", "value": format!("approve:{approval_id}"), "style": "primary" },
+                                { "label": "Keep blocked", "value": format!("deny:{approval_id}"), "style": "danger" },
+                            ],
+                        },
+                    }),
+                    files: vec![],
+                };
+                self.dispatcher.dispatch(target, &card);
+            }
+        }
+
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "ok")?;
+        Ok(())
     }
 
     /// Raise an approval for an agent-authored `save_skill` request (M19 A4)
@@ -7672,6 +7822,97 @@ mod tests {
         // _on_next_spawn`.) The approval card dispatch is best-effort and
         // fire-and-forget on a spawned task, so it isn't asserted here.
         assert!(!expected_dest.join("greet").exists());
+    }
+
+    // ── M24 S4: taint_approval_request raises a `taint_clearance` approval ──
+
+    #[tokio::test]
+    async fn taint_approval_request_raises_clearance_approval_with_session_dir() {
+        let (service, tmp, sess, _mock) = make_service().await;
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        service.set_sessions_dir(sessions_dir.clone());
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // A routed system row so the card has a target channel.
+        let mut row = make_row(
+            MessageKind::System,
+            json!({ "taint_approval_request": {"tool": "install_packages", "taint_source": "web_fetch"} }),
+        );
+        row.channel_type = Some(ChannelType::new("mock"));
+        row.platform_id = Some("plat-1".into());
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        // A pending `taint_clearance` approval was raised (nothing written to
+        // the session dir yet — the clearance lands only on operator approval,
+        // via the host's `taint_clearance` apply arm).
+        let rows =
+            pending_approvals::list(service.central(), Some("taint_clearance"), None).unwrap();
+        assert_eq!(rows.len(), 1, "expected one taint_clearance approval");
+        let approval = &rows[0];
+        assert_eq!(approval.agent_group_id, Some(sess.agent_group_id));
+        assert_eq!(approval.session_id, Some(sess.id));
+        assert_eq!(approval.payload["tool"], "install_packages");
+        assert_eq!(approval.payload["taint_source"], "web_fetch");
+        assert_eq!(
+            approval.payload["session_id"],
+            sess.id.as_uuid().to_string()
+        );
+        let expected_dir = sessions_dir
+            .join(sess.agent_group_id.as_uuid().to_string())
+            .join(sess.id.as_uuid().to_string());
+        assert_eq!(
+            approval.payload["session_dir"],
+            expected_dir.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            approval.payload["allowed_root"],
+            sessions_dir.to_string_lossy().as_ref()
+        );
+        assert!(
+            !expected_dir.join("taint_clearance.json").exists(),
+            "raising the approval must not write the clearance"
+        );
+        // Re-emitting (a later turn blocked again) upserts the SAME pending
+        // row via the stable per-session request_id — no stacked approvals.
+        let mut second_request = make_row(
+            MessageKind::System,
+            json!({ "taint_approval_request": {"tool": "web_fetch", "taint_source": "memory_search"} }),
+        );
+        second_request.channel_type = Some(ChannelType::new("mock"));
+        second_request.platform_id = Some("plat-1".into());
+        write_row(&out_pool, &second_request);
+        let _ = service.process_session_once(&sess).await.unwrap();
+        let rows =
+            pending_approvals::list(service.central(), Some("taint_clearance"), None).unwrap();
+        assert_eq!(rows.len(), 1, "stable request_id must not stack approvals");
+    }
+
+    #[tokio::test]
+    async fn taint_approval_request_without_sessions_dir_is_dropped() {
+        let (service, _tmp, sess, _mock) = make_service().await;
+        // Deliberately do NOT set sessions_dir: an approval that could never
+        // be applied must not be raised; the row is consumed with a warning.
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "taint_approval_request": {"tool": "web_fetch", "taint_source": "web_fetch"} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        let rows =
+            pending_approvals::list(service.central(), Some("taint_clearance"), None).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]

@@ -166,6 +166,9 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
         // M17 session-preview proxy master switch. Boolean only — the
         // copy-pasteable operator command is
         // `cclaw groups config update --field preview_enabled=true <group>`.
+        // Flipping it OFF is a kill switch (M24 S1): after the config write
+        // lands, the group's live previews AND the public tunnels fronting
+        // them are torn down (best-effort, logged) — see below the upsert.
         "preview_enabled" => {
             existing.preview_enabled = match value {
                 Value::Bool(b) => b,
@@ -291,6 +294,13 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
         },
     )
     .map_err(db_err)?;
+    // M24 S1 kill switch: only after the disable is durably stored, tear down
+    // the group's live previews and the public tunnels fronting them.
+    // Best-effort (spawned; failures are logged) — the stored `false` already
+    // blocks every NEW exposure fail-closed regardless.
+    if field == "preview_enabled" && !row.preview_enabled {
+        crate::preview::teardown_group_previews(id);
+    }
     Ok(container_config_to_json(&row))
 }
 

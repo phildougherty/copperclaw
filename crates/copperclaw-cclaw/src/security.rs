@@ -289,8 +289,9 @@ pub fn analyze(posture: &Posture) -> Vec<Finding> {
                 id: "approvals-open",
                 severity: Severity::High,
                 detail: format!(
-                    "messaging group `{}` ({} / {}) has unknown_sender_policy=open: any \
-                     unrecognised sender is auto-approved",
+                    "messaging group `{}` ({} / {}) has unknown_sender_policy=open: the \
+                     sender gate admits any unrecognised sender straight to the agent, \
+                     no operator approval",
                     mg.name, mg.channel_type, mg.messaging_group_id
                 ),
                 remediation: Remediation::Fixable {

@@ -103,6 +103,14 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Intercepted inline (see `inline_handler_set`) — internal accounting,
         // not approval-gated.
         "grant_consume",
+        // M24 S4: taint-blocked credentialed action requesting a fresh operator
+        // approval (`emit_taint_approval_request` in `run/tool_dispatch.rs`,
+        // NOT an `apply_*` in tools.rs — see the extra scanned function in
+        // `runner_emit_set_matches_source`). Intercepted inline (see
+        // `inline_handler_set`): the delivery service raises a `taint_clearance`
+        // pending approval + card; the host's approvals apply arm writes the
+        // single-turn clearance file only on operator approval.
+        "taint_approval_request",
     ]
     .into_iter()
     .collect()
@@ -151,6 +159,11 @@ fn inline_handler_set() -> HashSet<&'static str> {
         // `consume_fire` / `consume_tokens` — internal accounting, not
         // approval-gated.
         "grant_consume",
+        // M24 S4: `taint_approval_request` is intercepted inline so the delivery
+        // service can raise a `taint_clearance` pending approval (with
+        // `self.central`) and dispatch the approval card — the single-turn
+        // clearance file is written only on operator approval.
+        "taint_approval_request",
     ]
     .into_iter()
     .collect()
@@ -314,8 +327,15 @@ fn runner_emit_set_matches_source() {
         }
     }
     // M22 A2H: scan only `charge_grant_fire_once` in tool_dispatch.rs for the
-    // `grant_consume` emit.
-    for fn_body in extract_fn_bodies(&tool_dispatch_src, &["fn charge_grant_fire_once"]) {
+    // `grant_consume` emit. M24 S4: plus `emit_taint_approval_request` for the
+    // `taint_approval_request` emit.
+    for fn_body in extract_fn_bodies(
+        &tool_dispatch_src,
+        &[
+            "fn charge_grant_fire_once",
+            "fn emit_taint_approval_request",
+        ],
+    ) {
         for cap in re.captures_iter(&fn_body) {
             derived.insert(cap[1].to_string());
         }
