@@ -104,6 +104,20 @@ pub fn resolve_recipient(
             thread_id: None,
             agent_group_id: None,
         })),
+        // `to: "user"` — the root conversation's human. `session_routing`
+        // IS the materialised walk to the root: the host copies it down
+        // the spawn chain at every `create_agent`
+        // (`agent_to_agent::copy_parent_session_routing`), so reading it
+        // here resolves the root human channel even for a grandchild.
+        Some(Recipient::RootUser) => {
+            Ok(session_routing::read(inbound)?.and_then(ResolvedRoute::from_session_routing))
+        }
+        // `to: "agent:parent"` — resolvable only against the runner's
+        // session config (`RunnerConfig::source_session_id`), which this
+        // table-level resolver doesn't carry. The live tool path resolves
+        // it in `tools::resolve_outbound_routing` before any row is
+        // written; here we honestly report "no route".
+        Some(Recipient::Parent) => Ok(None),
     }
 }
 
@@ -279,6 +293,36 @@ mod tests {
         assert_eq!(r.kind, DestinationKind::Channel);
         assert!(r.channel_type.is_none());
         assert_eq!(r.platform_id.as_deref(), Some("u_42"));
+    }
+
+    #[test]
+    fn root_user_recipient_resolves_via_session_routing() {
+        let (_tmp, conn) = fresh_inbound();
+        session_routing::write(
+            &conn,
+            &SessionRouting {
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("root-chat".into()),
+                thread_id: None,
+            },
+        )
+        .unwrap();
+        let r = resolve_recipient(&conn, Some(&Recipient::RootUser))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.kind, DestinationKind::Channel);
+        assert_eq!(r.channel_type.unwrap().as_str(), "telegram");
+        assert_eq!(r.platform_id.as_deref(), Some("root-chat"));
+    }
+
+    #[test]
+    fn parent_recipient_is_unresolvable_at_table_level() {
+        let (_tmp, conn) = fresh_inbound();
+        assert!(
+            resolve_recipient(&conn, Some(&Recipient::Parent))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -129,6 +129,14 @@ the host's `agent_dispatch` handler walks each child's
 inbound. You don't have to tell children "send to agent:<your-name>"
 — the runtime does it.
 
+Children have three routing forms (see [[send-message]]): omitting
+`to` — or the explicit `to: "agent:parent"` — reports up to YOU;
+`to: "user"` escalates to the human in the ROOT conversation. The
+escalation works at any depth: a grandchild's `to: "user"` reaches
+the human, never a middle agent. Tell children to reserve
+`to: "user"` for questions only the human can answer; results always
+report up so you aggregate before anything hits the user's chat.
+
 **Hard rules for the user-visible reply:**
 
 1. **Wait for ALL N children to report.** Each child's reply lands as

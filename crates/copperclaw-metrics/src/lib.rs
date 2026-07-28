@@ -126,6 +126,10 @@ pub const DEGRADED_REASON_HEALTH_CHECK_FAILED: &str = "health_check_failed";
 // `copperclaw_budget_exhausted_total`. Use these constants instead of
 // stringly-typed literals at call sites so a typo is a compile error.
 pub const BUDGET_GATE_DAILY_TOKENS: &str = "daily_tokens";
+/// The daily dollar cap (`group_budgets.daily_cost_cap`, USD) — the gate
+/// compares priced (computable) spend only; turns on unpriced models do
+/// not count toward this gate.
+pub const BUDGET_GATE_DAILY_COST: &str = "daily_cost";
 pub const BUDGET_GATE_TURNS_PER_MINUTE: &str = "turns_per_minute";
 pub const BUDGET_GATE_TURNS_PER_HOUR: &str = "turns_per_hour";
 
@@ -276,7 +280,8 @@ pub fn inc_provider_retry(provider: &str) {
 /// the container manager every time a budget gate refuses to spawn — once
 /// per refusal regardless of whether the in-channel reply is then deduped.
 /// `gate` should be one of [`BUDGET_GATE_DAILY_TOKENS`],
-/// [`BUDGET_GATE_TURNS_PER_MINUTE`], or [`BUDGET_GATE_TURNS_PER_HOUR`].
+/// [`BUDGET_GATE_DAILY_COST`], [`BUDGET_GATE_TURNS_PER_MINUTE`], or
+/// [`BUDGET_GATE_TURNS_PER_HOUR`].
 pub fn inc_budget_exhausted(agent_group_id: &str, gate: &str) {
     counter!(
         BUDGET_EXHAUSTED_TOTAL,
@@ -2760,6 +2765,7 @@ mod tests {
         inc_provider_deadline("anthropic");
         inc_provider_retry("anthropic");
         inc_budget_exhausted("ag-test", BUDGET_GATE_DAILY_TOKENS);
+        inc_budget_exhausted("ag-test", BUDGET_GATE_DAILY_COST);
         inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_MINUTE);
         inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_HOUR);
         inc_budget_exhausted_reply("ag-test");
@@ -2775,6 +2781,7 @@ mod tests {
     fn budget_gate_label_constants_are_snake_case() {
         for label in [
             BUDGET_GATE_DAILY_TOKENS,
+            BUDGET_GATE_DAILY_COST,
             BUDGET_GATE_TURNS_PER_MINUTE,
             BUDGET_GATE_TURNS_PER_HOUR,
         ] {
@@ -2800,6 +2807,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             inc_budget_exhausted("ag-abc-123", BUDGET_GATE_DAILY_TOKENS);
             inc_budget_exhausted("ag-abc-123", BUDGET_GATE_DAILY_TOKENS);
+            inc_budget_exhausted("ag-abc-123", BUDGET_GATE_DAILY_COST);
             inc_budget_exhausted("ag-abc-123", BUDGET_GATE_TURNS_PER_MINUTE);
             inc_budget_exhausted_reply("ag-abc-123");
             inc_budget_exhausted_suppressed("ag-abc-123");
@@ -2815,6 +2823,10 @@ mod tests {
         assert!(
             body.contains("gate=\"daily_tokens\""),
             "missing gate label:\n{body}"
+        );
+        assert!(
+            body.contains("gate=\"daily_cost\""),
+            "missing daily-cost gate label:\n{body}"
         );
         assert!(
             body.contains("gate=\"turns_per_minute\""),

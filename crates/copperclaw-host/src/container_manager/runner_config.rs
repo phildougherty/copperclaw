@@ -1439,6 +1439,106 @@ mod tests {
         );
     }
 
+    /// M24 U1 end-to-end: storing a `Relevant` skills selector through the
+    /// operator surface (`groups.config.update` with `field = "skills"`)
+    /// narrows the system prompt assembled at the next spawn. On-topic
+    /// skills survive; off-topic ones are filtered out.
+    #[test]
+    fn runner_config_relevant_selector_from_config_update_narrows_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        // Descriptions with disjoint vocabularies so the FTS scorer can
+        // separate them.
+        let write = |name: &str, desc: &str| {
+            let dir = skills_root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\n\nbody-of-{name}\n"),
+            )
+            .unwrap();
+        };
+        write("git-workflow", "commit branch and push in git");
+        write("dataviz", "build charts and dashboards to visualize data");
+
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mgr_cfg = manager_cfg(tmp.path().to_path_buf());
+        mgr_cfg.skills_dir = Some(skills_root);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mgr_cfg,
+        );
+        let session = fixture_session(&db);
+
+        // Store the selector exactly as an operator would:
+        // `cclaw groups config update --field 'skills={"relevant":...}'`.
+        crate::handlers::groups::config_update(
+            &serde_json::json!({
+                "id": session.agent_group_id.as_uuid().to_string(),
+                "field": "skills",
+                "value": {"relevant": {"query": "help me commit my branch in git", "limit": 8}},
+            }),
+            &db,
+        )
+        .unwrap();
+        let cc = container_configs::get(&db, session.agent_group_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                cc.skills,
+                container_configs::SkillsSelector::Relevant { .. }
+            ),
+            "config_update must persist the Relevant selector; stored: {:?}",
+            cc.skills,
+        );
+
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(
+            cfg.system.contains("name=\"git-workflow\""),
+            "on-topic skill must survive the relevance narrowing; system was:\n{}",
+            cfg.system,
+        );
+        assert!(
+            !cfg.system.contains("name=\"dataviz\""),
+            "off-topic skill must be filtered by the relevance narrowing; system was:\n{}",
+            cfg.system,
+        );
+    }
+
+    /// The `Relevant` selector's fail-open contract: an empty stored query
+    /// (the `"relevant"` shorthand) behaves like `All` at spawn rather than
+    /// stripping every skill.
+    #[test]
+    fn runner_config_relevant_selector_empty_query_behaves_like_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+        write_coding_bundle_plus_alpha(&skills_root);
+
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mgr_cfg = manager_cfg(tmp.path().to_path_buf());
+        mgr_cfg.skills_dir = Some(skills_root);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mgr_cfg,
+        );
+        let session = fixture_session(&db);
+        let mut cc = cc_with_coding_flag(session.agent_group_id, true);
+        cc.skills = container_configs::SkillsSelector::Relevant {
+            query: String::new(),
+            limit: 8,
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(
+            cfg.system.contains("name=\"alpha\""),
+            "empty relevance query must fall back to the full skill set; system was:\n{}",
+            cfg.system,
+        );
+    }
+
     #[test]
     fn runner_config_uses_skill_dir_when_configured() {
         let td = tempfile::tempdir().unwrap();

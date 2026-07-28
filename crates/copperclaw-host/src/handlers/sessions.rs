@@ -81,6 +81,15 @@ pub fn get(
     let id = SessionId(parse_uuid(&req_str(args, "id")?)?);
     let row = sessions::get(&ctx.central, id).map_err(db_err)?;
     let mut obj = session_to_json(&row);
+    // Phase 4: resolve the spawn chain's root so an operator tracing a
+    // child/grandchild sees who ultimately owns the tree without joining
+    // tables by hand. Only attached when the session HAS a parent — a
+    // root session's chain is trivially itself.
+    if let Some(root) = resolve_root_session(&ctx.central, &row) {
+        if let Some(o) = obj.as_object_mut() {
+            o.insert("root_session_id".into(), json!(root.as_uuid().to_string()));
+        }
+    }
     if caller_may_read_messages(caller, id) {
         let paths = SessionPaths::new(&ctx.data_dir, row.agent_group_id, id);
         let inbound = read_message_rows(&paths.inbound_db, Direction::In, None, RECENT_ROWS);
@@ -526,7 +535,40 @@ fn session_to_json(s: &Session) -> Value {
         "container_status": s.container_status.as_str(),
         "last_active": s.last_active.to_rfc3339(),
         "created_at": s.created_at.to_rfc3339(),
+        // The parent chain (phase 4 of docs/plans/agent-to-agent-routing.md):
+        // the session that spawned this one via `create_agent`, or null for
+        // root sessions started from a real user channel.
+        "source_session_id": s.source_session_id.map(|p| p.as_uuid().to_string()),
     })
+}
+
+/// Cap on the `source_session_id` chain walk in [`resolve_root_session`].
+/// The spawn depth is host-capped far below this; the cap exists so a
+/// corrupted chain (cycle, self-reference) can never loop the handler.
+const ROOT_WALK_MAX_HOPS: usize = 32;
+
+/// Walk `source_session_id` links up to the ROOT session (the one a real
+/// user channel started). Returns `None` when `s` is itself a root.
+/// Best-effort: a dangling link (parent row already deleted) returns the
+/// last resolvable ancestor, which is still the most useful answer for
+/// an operator tracing "who ultimately owns this spawn tree".
+fn resolve_root_session(central: &CentralDb, s: &Session) -> Option<SessionId> {
+    let mut current = s.source_session_id?;
+    let mut seen = vec![s.id, current];
+    for _ in 0..ROOT_WALK_MAX_HOPS {
+        let Ok(parent_row) = sessions::get(central, current) else {
+            // Dangling link: report the deepest ancestor we could reach.
+            return Some(current);
+        };
+        match parent_row.source_session_id {
+            Some(next) if !seen.contains(&next) => {
+                seen.push(next);
+                current = next;
+            }
+            _ => return Some(current),
+        }
+    }
+    Some(current)
 }
 
 fn session_status_str(s: copperclaw_types::SessionStatus) -> &'static str {
@@ -612,6 +654,87 @@ mod tests {
         // No per-session DBs on disk → empty recents, never an error.
         assert_eq!(v["recent_inbound"], json!([]));
         assert_eq!(v["recent_outbound"], json!([]));
+    }
+
+    /// Create a session in `db` under group `g` with an optional parent.
+    fn session_with_parent(
+        db: &CentralDb,
+        g: AgentGroupId,
+        parent: Option<SessionId>,
+    ) -> SessionId {
+        create_session(
+            db,
+            CreateSession {
+                agent_group_id: g,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: parent,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn session_json_surfaces_source_session_id() {
+        let (db, root, g) = db_with_session();
+        let child = session_with_parent(&db, g, Some(root));
+        let rows = list(&Value::Null, &db).unwrap();
+        let rows = rows.as_array().unwrap();
+        let find = |id: SessionId| {
+            rows.iter()
+                .find(|r| r["id"] == id.as_uuid().to_string())
+                .unwrap()
+                .clone()
+        };
+        // Root: explicit null, so the column is present but empty.
+        assert!(find(root)["source_session_id"].is_null());
+        // Child: the parent's id.
+        assert_eq!(find(child)["source_session_id"], root.as_uuid().to_string());
+    }
+
+    #[test]
+    fn get_resolves_root_session_for_grandchild() {
+        // Phase 4: a grandchild's `sessions.get` must surface BOTH its
+        // direct parent (`source_session_id`) and the walked-to root
+        // (`root_session_id`) so the operator sees the whole chain.
+        let (db, root, g) = db_with_session();
+        let child = session_with_parent(&db, g, Some(root));
+        let grandchild = session_with_parent(&db, g, Some(child));
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(
+            &json!({"id": grandchild.as_uuid().to_string()}),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(v["source_session_id"], child.as_uuid().to_string());
+        assert_eq!(v["root_session_id"], root.as_uuid().to_string());
+        // A root session gets no root_session_id — its chain is itself.
+        let v = get(
+            &json!({"id": root.as_uuid().to_string()}),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap();
+        assert!(v["source_session_id"].is_null());
+        assert!(v.get("root_session_id").is_none());
+    }
+
+    #[test]
+    fn resolve_root_session_survives_dangling_parent_link() {
+        // A parent row deleted out from under its child must not error:
+        // the walk reports the deepest resolvable ancestor.
+        let (db, root, g) = db_with_session();
+        let child = session_with_parent(&db, g, Some(root));
+        let grandchild_row = {
+            let id = session_with_parent(&db, g, Some(child));
+            sessions::get(&db, id).unwrap()
+        };
+        sessions::delete(&db, child).unwrap();
+        assert_eq!(resolve_root_session(&db, &grandchild_row), Some(child));
     }
 
     #[test]

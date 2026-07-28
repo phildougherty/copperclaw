@@ -17,30 +17,42 @@ appropriate channel adapter.
 
 - `text` (required, non-blank). Whitespace-only text is rejected with
   `ToolError::Validation`.
-- `to` (optional). Three accepted shapes:
-  - String form: a fully-qualified channel id, e.g. `"telegram:chat-9"` or
-    `"slack:C01AB23"`. Treated as `{ "kind": "channel", "id": ... }`.
-  - Tagged channel: `{ "kind": "channel", "id": "telegram:chat-9" }`.
-  - Tagged agent: `{ "kind": "agent", "session_id": "sess_abc" }`.
-  - Tagged user: `{ "kind": "user", "id": "u_42" }` (host resolves the
-    route via `user_dms`).
+- `to` (optional). Accepted forms:
+
+  | Form | Meaning |
+  |---|---|
+  | omitted | Default destination: your parent agent if you were spawned by one, otherwise the originating channel. |
+  | `"user"` | The human in the ROOT conversation of the spawn chain. Works at any depth — a grandchild's `"user"` reaches the human, never a middle agent. |
+  | `"agent:parent"` | The agent that spawned you (delivered into its inbound). Errors with a clear message if you have no parent. |
+  | `"telegram:chat-9"` | A fully-qualified channel id string. Treated as `{ "kind": "channel", "id": ... }`. |
+  | `{ "kind": "channel", "id": ... }` | Tagged channel form. |
+  | `{ "kind": "agent", "session_id": ... }` | Another agent by session id. |
+  | `{ "kind": "user", "id": "u_42" }` | A specific user by user id (host resolves the DM route). |
 
   Full routing semantics (named destinations, resolution order) are in
   [[destinations]].
 
 ## When to omit `to`
 
-Omit `to` whenever you are replying to the inbound message you are
-processing. The runner reads `session_routing` and fills in the
-originating `(channel_type, platform_id, thread_id)`. This is the right
-default for almost every conversational reply.
+Omit `to` whenever you are replying to whoever sent you the inbound you
+are processing. For a normal conversational session that is the human on
+the originating channel; for a spawned child/grandchild agent it is the
+parent that spawned you (report up, let the parent decide what reaches
+the user).
 
 Only set `to` when you are deliberately routing somewhere else:
+- `"user"` — escalate to the human at the root of the spawn chain
+  (e.g. a child that needs a clarification only the human can give).
+  Use sparingly: the default for spawned agents is to report to the
+  parent, which aggregates before anything reaches the user's chat.
+- `"agent:parent"` — explicit report-up (same as the spawned-agent
+  default; useful when your inbound came from a user channel but the
+  reply belongs to your parent).
 - A different channel the agent is wired to (e.g. report a Telegram event
   in a Slack ops room).
 - Another agent by session id (delivers as a `MessageKind::Agent` row,
   bypassing channel adapters).
-- A user across all their known DMs.
+- A specific user across all their known DMs.
 
 ## Multi-line bodies
 

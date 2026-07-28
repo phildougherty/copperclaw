@@ -7,66 +7,137 @@ use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_types::{AgentGroupId, Session};
 use tracing::{info, warn};
 
+/// UTC midnight today — the day boundary for both daily caps
+/// (`daily_token_cap` and `daily_cost_cap`), matching what an operator
+/// setting a "daily" cap would naturally expect.
+fn utc_midnight_today() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc()
+}
+
+/// Which daily cap a group has breached, with the numbers behind the
+/// verdict so callers can phrase an honest refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DailyGateBreach {
+    /// `daily_token_cap`: today's input + output tokens meet/exceed it.
+    Tokens,
+    /// `daily_cost_cap`: today's *priced* spend meets/exceeds the cap.
+    Cost { spent_micros: u64, cap_micros: u64 },
+}
+
+/// Shared verdict for the two daily caps. Checked in order: token cap
+/// first (the long-established gate), then the dollar cost cap.
+///
+/// Cost-cap semantics: today's spend is rolled up with the SAME pricing
+/// arithmetic as `cclaw usage` (`handlers::usage::priced_spend_since`).
+/// Turns on unpriced models (no entry in `copperclaw_types::pricing`) are
+/// deliberately NOT counted as zero-cost spend — they are excluded from
+/// the sum, so the cap gates on what is computable. That means a group
+/// running only unpriced models is never blocked by a dollar cap (use
+/// `daily_token_cap` for those), and priced spend alone decides the
+/// verdict. Documented in `docs/observability.md`.
+fn daily_gate_breach(
+    central: &CentralDb,
+    agent_group_id: AgentGroupId,
+) -> Result<Option<DailyGateBreach>, ManagerError> {
+    use copperclaw_db::tables::{agent_turns, group_budgets};
+    let Some(budget) = group_budgets::get(central, agent_group_id).map_err(ManagerError::Db)?
+    else {
+        return Ok(None);
+    };
+    let ag_id = agent_group_id.as_uuid().to_string();
+    let midnight = utc_midnight_today();
+
+    if let Some(cap) = budget.daily_token_cap {
+        let used =
+            agent_turns::tokens_since(central, &ag_id, midnight).map_err(ManagerError::Db)?;
+        if used >= cap {
+            return Ok(Some(DailyGateBreach::Tokens));
+        }
+    }
+
+    if let Some(cap_micros) = budget
+        .daily_cost_cap
+        .and_then(crate::handlers::usage::cost_cap_micros)
+    {
+        let spend = crate::handlers::usage::priced_spend_since(central, &ag_id, midnight)
+            .map_err(ManagerError::Db)?;
+        if spend.micros >= cap_micros {
+            return Ok(Some(DailyGateBreach::Cost {
+                spent_micros: spend.micros,
+                cap_micros,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Standalone group-scoped budget verdict for the credential broker's
-/// request-time gate. Mirrors [`ContainerManager::group_over_daily_budget`]
+/// request-time gate. Mirrors [`ContainerManager::daily_budget_message`]
 /// but takes a bare [`CentralDb`] so the broker server (which has no
 /// `ContainerManager` back-reference) can call it. Returns
-/// [`BudgetVerdict::OverBudget`] when the group has a `daily_token_cap` set and
-/// today's accumulated tokens meet or exceed it; otherwise
-/// [`BudgetVerdict::WithinBudget`].
+/// [`BudgetVerdict::OverBudget`] when the group has a `daily_token_cap`
+/// or `daily_cost_cap` set and today's accumulated tokens (or priced
+/// spend) meet or exceed it; otherwise [`BudgetVerdict::WithinBudget`].
 pub(super) fn broker_budget_verdict(
     central: &CentralDb,
     agent_group_id: AgentGroupId,
 ) -> Result<BudgetVerdict, ManagerError> {
-    use copperclaw_db::tables::{agent_turns, group_budgets};
-    let Some(budget) = group_budgets::get(central, agent_group_id).map_err(ManagerError::Db)?
-    else {
-        return Ok(BudgetVerdict::WithinBudget);
-    };
-    let Some(cap) = budget.daily_token_cap else {
-        return Ok(BudgetVerdict::WithinBudget);
-    };
-    let midnight = chrono::Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("00:00:00 is a valid time")
-        .and_utc();
-    let used = agent_turns::tokens_since(central, &agent_group_id.as_uuid().to_string(), midnight)
-        .map_err(ManagerError::Db)?;
-    if used >= cap {
-        Ok(BudgetVerdict::OverBudget)
-    } else {
-        Ok(BudgetVerdict::WithinBudget)
-    }
+    Ok(match daily_gate_breach(central, agent_group_id)? {
+        Some(_) => BudgetVerdict::OverBudget,
+        None => BudgetVerdict::WithinBudget,
+    })
 }
 
 impl ContainerManager {
-    /// Returns true when the group's `daily_token_cap` is set AND
-    /// today's accumulated input + output tokens already meet or
-    /// exceed it. Day boundary = UTC midnight, matching what an
-    /// operator setting "daily" cap would naturally expect.
-    pub(super) fn is_over_budget(&self, session: &Session) -> Result<bool, ManagerError> {
-        use copperclaw_db::tables::{agent_turns, group_budgets};
-        let Some(budget) =
-            group_budgets::get(&self.central, session.agent_group_id).map_err(ManagerError::Db)?
-        else {
-            return Ok(false);
+    /// Returns `Some((notification_text, gate_label))` when the group's
+    /// `daily_token_cap` or `daily_cost_cap` is set AND today's usage
+    /// already meets or exceeds it (see [`daily_gate_breach`] for the
+    /// exact semantics, including the unpriced-model rule for the cost
+    /// cap). Day boundary = UTC midnight. The `gate_label` is one of
+    /// `copperclaw_metrics::BUDGET_GATE_DAILY_TOKENS` or
+    /// `..._DAILY_COST`; callers pipe it straight into
+    /// `copperclaw_metrics::inc_budget_exhausted` for the `gate` label.
+    pub(super) fn daily_budget_message(
+        &self,
+        session: &Session,
+    ) -> Result<Option<(String, &'static str)>, ManagerError> {
+        let Some(breach) = daily_gate_breach(&self.central, session.agent_group_id)? else {
+            return Ok(None);
         };
-        let Some(cap) = budget.daily_token_cap else {
-            return Ok(false);
-        };
-        let midnight = chrono::Utc::now()
-            .date_naive()
+        // Next midnight UTC, so the reply tells the user when the cap
+        // resets.
+        let next_reset = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
             .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is a valid time")
-            .and_utc();
-        let used = agent_turns::tokens_since(
-            &self.central,
-            &session.agent_group_id.as_uuid().to_string(),
-            midnight,
-        )
-        .map_err(ManagerError::Db)?;
-        Ok(used >= cap)
+            .expect("00:00:00 is always valid")
+            .and_utc()
+            .format("%Y-%m-%d %H:%M");
+        Ok(Some(match breach {
+            DailyGateBreach::Tokens => (
+                format!(
+                    "I have reached this agent's daily token budget. New requests will resume after {next_reset} UTC. \
+Operators can raise the cap with `cclaw groups budget set --agent-group-id <id> --daily-tokens N`."
+                ),
+                copperclaw_metrics::BUDGET_GATE_DAILY_TOKENS,
+            ),
+            DailyGateBreach::Cost {
+                spent_micros,
+                cap_micros,
+            } => (
+                format!(
+                    "I have reached this agent's daily cost budget ({} of the {} daily cap spent today). \
+New requests will resume after {next_reset} UTC. \
+Operators can raise the cap with `cclaw budgets set --agent-group-id <id> --daily-cost N`.",
+                    copperclaw_cclaw::format_cost_dollars(spent_micros),
+                    copperclaw_cclaw::format_cost_dollars(cap_micros),
+                ),
+                copperclaw_metrics::BUDGET_GATE_DAILY_COST,
+            ),
+        }))
     }
 
     /// Dedup window: if we already posted a budget-exhausted notice
@@ -82,10 +153,13 @@ impl ContainerManager {
     /// suppressed.
     const RATE_LIMIT_NOTICE_WINDOW_SECS: i64 = 60;
 
-    /// When the budget gate refuses to spawn, post an in-channel
-    /// reply telling the user the cap is hit and when it resets.
-    /// Dedups per agent-group via [`Self::last_budget_notice`]; logs
-    /// + swallows errors so the gate stays the source of truth.
+    /// When a daily budget gate (token or cost) refuses to spawn, post
+    /// an in-channel reply telling the user the cap is hit and when it
+    /// resets. The message text comes from
+    /// [`Self::daily_budget_message`], which knows which cap tripped.
+    /// Dedups per agent-group via [`Self::last_budget_notice`] (one
+    /// window shared by both daily caps); logs + swallows errors so the
+    /// gate stays the source of truth.
     ///
     /// The reply is routed via `session_routing` (the
     /// `(channel_type, platform_id, thread_id)` the router stored on
@@ -95,23 +169,12 @@ impl ContainerManager {
         &self,
         session: &Session,
         paths: &SessionPaths,
+        text: &str,
     ) -> Result<(), ManagerError> {
-        // Compute next midnight UTC so the reply tells the user when
-        // the cap resets.
-        let now = chrono::Utc::now();
-        let next_reset = (now.date_naive() + chrono::Duration::days(1))
-            .and_hms_opt(0, 0, 0)
-            .expect("00:00:00 is always valid")
-            .and_utc();
-        let text = format!(
-            "I have reached this agent's daily token budget. New requests will resume after {} UTC. \
-Operators can raise the cap with `cclaw groups budget set --agent-group-id <id> --daily-tokens N`.",
-            next_reset.format("%Y-%m-%d %H:%M"),
-        );
         self.post_cap_reply(
             session,
             paths,
-            &text,
+            text,
             &self.last_budget_notice,
             Self::BUDGET_NOTICE_WINDOW_SECS,
             "budget-exhausted",
@@ -353,6 +416,45 @@ mod tests {
         .unwrap();
     }
 
+    /// Upsert a `group_budgets` row with only the daily dollar cost cap
+    /// set (USD). Used by the cost-gate tests.
+    fn set_daily_cost_cap(db: &CentralDb, ag: AgentGroupId, cap_dollars: f64) {
+        copperclaw_db::tables::group_budgets::upsert(
+            db,
+            copperclaw_db::tables::group_budgets::UpsertGroupBudget {
+                agent_group_id: ag,
+                daily_token_cap: None,
+                daily_cost_cap: Some(cap_dollars),
+                agent_turns_per_minute_cap: None,
+                agent_turns_per_hour_cap: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Record a turn on a PRICED model (claude-sonnet-4-6 @ $3/$15 per
+    /// `MTok`) so the cost gate sees computable spend. Contrast with
+    /// [`record_today_tokens`], whose "stub" model has no known price.
+    fn record_today_priced_tokens(db: &CentralDb, ag: AgentGroupId, input: i64, output: i64) {
+        copperclaw_db::tables::agent_turns::insert(
+            db,
+            &copperclaw_db::tables::agent_turns::NewAgentTurn {
+                agent_group_id: ag.as_uuid().to_string(),
+                session_id: SessionId(uuid::Uuid::new_v4()).as_uuid().to_string(),
+                seq: 1,
+                model: "claude-sonnet-4-6".into(),
+                provider: "anthropic".into(),
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+                input_tokens: input,
+                output_tokens: output,
+                status: "ok".into(),
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+
     /// Upsert a `group_budgets` row with only the per-minute / per-hour
     /// rate caps set. Used by the rate-limit tests.
     fn set_rate_caps(
@@ -494,7 +596,14 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         seed_routing(&paths);
 
-        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+        // Breach the token cap so daily_budget_message produces the real
+        // notice text, then post it.
+        set_daily_cap(&db, session.agent_group_id, 100);
+        record_today_tokens(&db, session.agent_group_id, 150, 50);
+        let (msg, gate) = mgr.daily_budget_message(&session).unwrap().unwrap();
+        assert_eq!(gate, copperclaw_metrics::BUDGET_GATE_DAILY_TOKENS);
+        mgr.maybe_post_budget_exhausted(&session, &paths, &msg)
+            .unwrap();
 
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
@@ -515,9 +624,13 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         seed_routing(&paths);
 
-        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
-        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
-        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+        let text = "budget notice text";
+        mgr.maybe_post_budget_exhausted(&session, &paths, text)
+            .unwrap();
+        mgr.maybe_post_budget_exhausted(&session, &paths, text)
+            .unwrap();
+        mgr.maybe_post_budget_exhausted(&session, &paths, text)
+            .unwrap();
 
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
@@ -537,7 +650,8 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let _ = open_inbound(&paths).unwrap();
 
-        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+        mgr.maybe_post_budget_exhausted(&session, &paths, "budget notice text")
+            .unwrap();
 
         let replies = count_outbound_text_replies(&paths);
         assert!(replies.is_empty());
@@ -795,6 +909,163 @@ mod tests {
         assert_eq!(
             broker_budget_verdict(&db, session.agent_group_id).unwrap(),
             BudgetVerdict::OverBudget
+        );
+    }
+
+    // ---- daily cost cap (dollar) gate -------------------------------------
+
+    #[test]
+    fn cost_cap_micros_conversion_and_unset_values() {
+        use crate::handlers::usage::cost_cap_micros;
+        assert_eq!(cost_cap_micros(1.5), Some(1_500_000));
+        assert_eq!(cost_cap_micros(0.01), Some(10_000));
+        // Non-positive / non-finite caps read as "no cap".
+        assert_eq!(cost_cap_micros(0.0), None);
+        assert_eq!(cost_cap_micros(-2.0), None);
+        assert_eq!(cost_cap_micros(f64::NAN), None);
+        assert_eq!(cost_cap_micros(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn daily_budget_message_none_when_no_caps_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // No group_budgets row at all: spend freely.
+        record_today_priced_tokens(&db, session.agent_group_id, 1_000_000, 1_000_000);
+        assert!(mgr.daily_budget_message(&session).unwrap().is_none());
+        // Row exists but neither daily cap is set: still no gate.
+        set_rate_caps(&db, session.agent_group_id, Some(1000), None);
+        assert!(mgr.daily_budget_message(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn cost_cap_under_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // Cap $1.00; sonnet 100 in + 100 out = 300 + 1500 = 1800 micros.
+        set_daily_cost_cap(&db, session.agent_group_id, 1.0);
+        record_today_priced_tokens(&db, session.agent_group_id, 100, 100);
+        assert!(mgr.daily_budget_message(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn cost_cap_over_refuses_with_cost_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // Cap $0.01 = 10_000 micros; sonnet 1000 in + 500 out
+        //   = 3_000 + 7_500 = 10_500 micros >= cap.
+        set_daily_cost_cap(&db, session.agent_group_id, 0.01);
+        record_today_priced_tokens(&db, session.agent_group_id, 1_000, 500);
+        let (msg, gate) = mgr.daily_budget_message(&session).unwrap().unwrap();
+        assert_eq!(gate, copperclaw_metrics::BUDGET_GATE_DAILY_COST);
+        assert!(msg.contains("daily cost budget"), "{msg}");
+        assert!(msg.contains("$0.01"), "{msg}");
+        assert!(msg.contains("--daily-cost"), "{msg}");
+    }
+
+    /// The documented unpriced-model rule: spend the gate cannot price is
+    /// excluded from the sum, so it never trips the dollar cap — the cap
+    /// gates on what is computable (use `daily_token_cap` for unpriced
+    /// models). See `daily_gate_breach` docs.
+    #[test]
+    fn cost_cap_ignores_unpriced_model_spend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_daily_cost_cap(&db, session.agent_group_id, 0.01);
+        // Huge token volume on the unpriced "stub" model: no computable
+        // dollar spend, so the cost gate must NOT fire.
+        record_today_tokens(&db, session.agent_group_id, 5_000_000, 5_000_000);
+        assert!(mgr.daily_budget_message(&session).unwrap().is_none());
+        // The same volume on a priced model would blow far past the cap.
+        record_today_priced_tokens(&db, session.agent_group_id, 1_000, 500);
+        assert!(mgr.daily_budget_message(&session).unwrap().is_some());
+    }
+
+    #[test]
+    fn token_cap_takes_precedence_when_both_breached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        copperclaw_db::tables::group_budgets::upsert(
+            &db,
+            copperclaw_db::tables::group_budgets::UpsertGroupBudget {
+                agent_group_id: session.agent_group_id,
+                daily_token_cap: Some(100),
+                daily_cost_cap: Some(0.01),
+                agent_turns_per_minute_cap: None,
+                agent_turns_per_hour_cap: None,
+            },
+        )
+        .unwrap();
+        record_today_priced_tokens(&db, session.agent_group_id, 1_000, 500);
+        let (_, gate) = mgr.daily_budget_message(&session).unwrap().unwrap();
+        assert_eq!(gate, copperclaw_metrics::BUDGET_GATE_DAILY_TOKENS);
+    }
+
+    #[test]
+    fn broker_budget_verdict_over_on_cost_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_daily_cost_cap(&db, session.agent_group_id, 0.01);
+        // Under: 100 in + 100 out sonnet = 1_800 micros < 10_000.
+        record_today_priced_tokens(&db, session.agent_group_id, 100, 100);
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::WithinBudget
+        );
+        // Push over: + 1000 in + 500 out = 10_500 + 1_800 total.
+        record_today_priced_tokens(&db, session.agent_group_id, 1_000, 500);
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::OverBudget
+        );
+    }
+
+    /// End-to-end mirror of the daily-token metric test: an over-cost
+    /// group refuses to spawn and fires the `gate="daily_cost"` label.
+    /// Plain `#[test]` for the same `with_local_recorder` reason as the
+    /// token-cap variant above.
+    #[test]
+    fn maybe_spawn_emits_daily_cost_gate_label() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let db = CentralDb::open_in_memory().unwrap();
+                let mgr = ContainerManager::new(
+                    db.clone(),
+                    std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+                    manager_cfg(tmp.path().to_path_buf()),
+                );
+                let session = fixture_session(&db);
+                let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                paths.ensure_dirs().unwrap();
+                seed_routing(&paths);
+                seed_pending_chat_inbound(&paths);
+                set_daily_cost_cap(&db, session.agent_group_id, 0.01);
+                record_today_priced_tokens(&db, session.agent_group_id, 1_000, 500);
+                let spawned = mgr.maybe_spawn(&session).await.unwrap();
+                assert!(!spawned, "must not spawn when over the cost cap");
+            });
+            render_prometheus(&handle)
+        });
+        assert!(
+            body.contains("gate=\"daily_cost\""),
+            "daily_cost gate label missing:\n{body}"
+        );
+        assert!(
+            find_counter_value(&body, copperclaw_metrics::BUDGET_EXHAUSTED_TOTAL) == Some(1),
+            "expected exhausted_total=1 for cost gate, body:\n{body}"
         );
     }
 

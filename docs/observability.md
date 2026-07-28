@@ -95,7 +95,7 @@ are histograms; gauges are marked in the tables.
 
 | Name | Labels | Meaning |
 |---|---|---|
-| `copperclaw_budget_exhausted_total` | `agent_group_id`, `gate` | Spawn refused by a budget gate (`daily_tokens\|turns_per_minute\|turns_per_hour`). |
+| `copperclaw_budget_exhausted_total` | `agent_group_id`, `gate` | Spawn refused by a budget gate (`daily_tokens\|daily_cost\|turns_per_minute\|turns_per_hour`). |
 | `copperclaw_budget_exhausted_replies_total` | `agent_group_id` | Budget/rate-limit notice actually written to outbound (post-dedup). |
 | `copperclaw_budget_exhausted_suppressed_total` | `agent_group_id` | Refusal notice suppressed by the per-group dedup window. |
 | `copperclaw_task_budget_exhausted_total` | `agent_group_id` | The per-task token budget (`COPPERCLAW_MAX_TASK_TOKENS`) was hit. |
@@ -329,10 +329,22 @@ skills S1–S4); the metric definitions and helper docs live in
   rate-limit headers via the delivery logs.
 - `sum by (agent_group_id, gate) (rate(copperclaw_budget_exhausted_total[15m])) > 0`
   — an agent group is repeatedly hitting a budget or rate-limit gate.
-  Refusals come in three flavours via the `gate` label: `daily_tokens`
-  (the daily-token cap), `turns_per_minute`, and `turns_per_hour`. The
-  fix is operator-side: raise the cap with `cclaw budgets set --agent-group-id <id> --daily-tokens <n>` (also `--turns-per-minute` / `--turns-per-hour`) or
-  investigate why the group is burning tokens / turns so fast. Pair
+  Refusals come in four flavours via the `gate` label: `daily_tokens`
+  (the daily-token cap), `daily_cost` (the daily dollar cap,
+  `group_budgets.daily_cost_cap` in USD), `turns_per_minute`, and
+  `turns_per_hour`. The
+  fix is operator-side: raise the cap with `cclaw budgets set --agent-group-id <id> --daily-tokens <n>` (also `--daily-cost` / `--turns-per-minute` / `--turns-per-hour`) or
+  investigate why the group is burning tokens / turns so fast.
+  The `daily_cost` gate compares the group's spend since UTC midnight,
+  priced with the same table as `cclaw usage` (micro-dollar list prices
+  in `copperclaw-types/src/pricing.rs`). Turns on models with no known
+  price are deliberately excluded from that sum rather than silently
+  counted as $0 — the cap gates on what is computable, so a group
+  running only unpriced models is never blocked by a dollar cap (give
+  those groups a `daily_token_cap` instead). `cclaw budgets list`
+  shows today's priced spend next to each cap, with a trailing `+`
+  when unpriced turns make the figure a floor, and `cclaw doctor`
+  warns on any breached cap. Pair
   with `copperclaw_budget_exhausted_replies_total` (notices that actually
   went to the user) and `copperclaw_budget_exhausted_suppressed_total`
   (notices the dedup window swallowed) to see the user-visible

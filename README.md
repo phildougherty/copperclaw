@@ -514,7 +514,9 @@ cclaw approvals deny <id>
 cclaw approvals approve --channel telegram --identity 12345   # sender approvals
 
 cclaw usage --since 24h               # per-group token rollup
+cclaw budgets list                    # caps + today's spend + breach state
 cclaw budgets set --agent-group-id <id> --daily-tokens 100000
+cclaw budgets set --agent-group-id <id> --daily-cost 2.50   # USD/day; counts priced models only
 cclaw budgets set --agent-group-id <id> --turns-per-minute 4
 
 cclaw audit list --since 1h           # mutation log

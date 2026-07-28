@@ -26,7 +26,7 @@ use copperclaw_types::{
 };
 use dashmap::{DashMap, DashSet};
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -338,11 +338,18 @@ fn no_adapter_expired(
 
 /// Flatten the `content` array from an [`copperclaw_mcp::call_external_tool`]
 /// result (the serialized rmcp `CallToolResult` content blocks) into plain
-/// model-facing text. Text blocks are joined with blank lines; non-text blocks
-/// (images / resources) are rendered as a short type tag so the model at least
-/// sees they happened. Rendering host-side keeps the runner free of any rmcp
-/// content-shape knowledge — it just stores and replays this string.
-fn render_mcp_content(content: Option<&serde_json::Value>) -> String {
+/// model-facing text. Text blocks are joined with blank lines. Image blocks
+/// are decoded and saved (capped) under the session's host-side
+/// `.copperclaw/images/` dir and rendered as the in-container
+/// `/data/.copperclaw/images/<file>` path plus a `view_image` hint — the
+/// runner-side agent can open the file because the session root IS the
+/// container's `/data`. An unsavable image (oversized, undecodable,
+/// unsupported type, unwritable dir) degrades to the legacy `<image>` marker
+/// plus a reason, never an error. Other non-text blocks are rendered as a
+/// short type tag so the model at least sees they happened. Rendering
+/// host-side keeps the runner free of any rmcp content-shape knowledge — it
+/// just stores and replays this string.
+fn render_mcp_content(content: Option<&serde_json::Value>, session_root: &Path) -> String {
     let Some(serde_json::Value::Array(blocks)) = content else {
         return "(external MCP tool produced no output)".to_string();
     };
@@ -356,6 +363,7 @@ fn render_mcp_content(content: Option<&serde_json::Value>) -> String {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            Some("image") => render_mcp_image_block(block, session_root),
             Some(other) => format!("<{other}>"),
         };
         if piece.is_empty() {
@@ -371,6 +379,158 @@ fn render_mcp_content(content: Option<&serde_json::Value>) -> String {
     } else {
         out
     }
+}
+
+// ── external-MCP image passthrough (M24 U3) ────────────────────────────────
+//
+// Image blocks in external MCP results used to be collapsed to the literal
+// `<image>` tag, so a remote server's chart or screenshot could never reach
+// the agent. The host writes the decoded bytes into the session dir (which
+// the container mounts as `/data`) and hands the agent a path it can open
+// with `view_image`.
+
+/// Per-image size cap for saved external-MCP images. Matches `view_image`'s
+/// 5 MB refuse threshold — a bigger file could not be viewed anyway.
+const MCP_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Retention cap: keep at most this many saved images per session.
+const MCP_IMAGE_RETAIN: usize = 20;
+
+/// Session-relative image dir — host path `<session_root>/.copperclaw/images`,
+/// container path `/data/.copperclaw/images` (the session root is bind-mounted
+/// at `/data`). Kept identical to the runner's in-container save dir so all
+/// boundary-crossing images land in one capped place.
+const MCP_IMAGES_SUBDIR: &str = ".copperclaw/images";
+
+/// The container-visible prefix for the same dir.
+const MCP_IMAGES_CONTAINER_DIR: &str = "/data/.copperclaw/images";
+
+/// Render one serialized rmcp image block (`{"type":"image","data":..,
+/// "mimeType":..}`): save-and-reference on success, `<image> (reason)` on any
+/// failure.
+fn render_mcp_image_block(block: &serde_json::Value, session_root: &Path) -> String {
+    let mime = block
+        .get("mimeType")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(data) = block.get("data").and_then(serde_json::Value::as_str) else {
+        return "<image> (block carried no data)".to_string();
+    };
+    match save_mcp_image(&session_root.join(MCP_IMAGES_SUBDIR), mime, data) {
+        Ok(file_name) => {
+            format!("[image saved: {MCP_IMAGES_CONTAINER_DIR}/{file_name} — view with view_image]")
+        }
+        Err(reason) => format!("<image> ({reason})"),
+    }
+}
+
+/// File extension for the image MIME types `view_image` can load. `None`
+/// for anything else — saving a file the viewer refuses would be a dead end.
+fn mcp_image_ext(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => return None,
+    })
+}
+
+/// Minimal standard-base64 decode (with `=` padding). Mirrors the private
+/// `bytes_b64` helper in `copperclaw-mcp` (not public there); kept local so
+/// this crate needs no new dependency.
+fn mcp_b64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = s.trim().as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("base64 length not multiple of 4");
+    }
+    let val = |c: u8| -> Result<u8, &'static str> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 0,
+            _ => return Err("invalid base64 char"),
+        })
+    };
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let v0 = val(chunk[0])?;
+        let v1 = val(chunk[1])?;
+        let v2 = val(chunk[2])?;
+        let v3 = val(chunk[3])?;
+        let n: u32 =
+            (u32::from(v0) << 18) | (u32::from(v1) << 12) | (u32::from(v2) << 6) | u32::from(v3);
+        out.push(((n >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the oldest files in `dir` beyond `keep`. Best-effort.
+fn enforce_mcp_image_retention(dir: &Path, keep: usize) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = read
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_file() {
+                return None;
+            }
+            let modified = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    // Newest first; path as a deterministic tie-break for equal mtimes.
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, path) in files.drain(keep..) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Decode a base64 image and write it to `<images_dir>/<short-id>.<ext>`,
+/// enforcing the size and retention caps. Returns the bare file name (the
+/// caller prepends the container-visible dir); `Err` carries a
+/// human-readable degrade reason.
+fn save_mcp_image(images_dir: &Path, mime: &str, data_b64: &str) -> Result<String, String> {
+    let Some(ext) = mcp_image_ext(mime) else {
+        return Err(format!("unsupported image type `{mime}`"));
+    };
+    // Cheap pre-decode gate: base64 inflates bytes by 4/3, so the encoded
+    // length bounds the decoded size before we materialise anything.
+    let approx_bytes = data_b64.len() / 4 * 3;
+    if approx_bytes > MCP_IMAGE_MAX_BYTES {
+        return Err(format!(
+            "image is ~{approx_bytes} bytes, over the {MCP_IMAGE_MAX_BYTES}-byte save cap"
+        ));
+    }
+    let bytes = mcp_b64_decode(data_b64).map_err(|e| format!("undecodable image data ({e})"))?;
+    if bytes.is_empty() {
+        return Err("empty image data".to_string());
+    }
+    std::fs::create_dir_all(images_dir)
+        .map_err(|e| format!("cannot create {}: {e}", images_dir.display()))?;
+    let name = format!("{}.{ext}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let path = images_dir.join(&name);
+    std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    enforce_mcp_image_retention(images_dir, MCP_IMAGE_RETAIN);
+    Ok(name)
 }
 
 /// RAII guard for the per-session external-MCP drain in-flight set. Removing
@@ -988,6 +1148,9 @@ impl DeliveryService {
         // connections are reused across this session's calls, never shared
         // across sessions.
         let mcp_scope = sess.id.as_uuid().to_string();
+        // M24 U3: the session's host-side root dir (the container's `/data`)
+        // — image blocks in results are saved beneath it.
+        let session_root = inbound_pool.paths().root.clone();
 
         // Claim the guard and hand everything to a detached task. The guard is
         // cleared on drop (including panic), so a wedged task can't permanently
@@ -1010,7 +1173,7 @@ impl DeliveryService {
                     )
                     .await
                 } else {
-                    Self::execute_mcp_call_bounded(&servers, &req, &mcp_scope).await
+                    Self::execute_mcp_call_bounded(&servers, &req, &mcp_scope, &session_root).await
                 };
                 match inbound_pool.connect() {
                     Ok(inb) => {
@@ -1143,8 +1306,9 @@ impl DeliveryService {
         servers: &serde_json::Value,
         req: &mcp_calls::McpCallRequest,
         session_scope: &str,
+        session_root: &Path,
     ) -> mcp_calls::McpCallResponse {
-        let fut = Self::execute_mcp_call(servers, req, session_scope);
+        let fut = Self::execute_mcp_call(servers, req, session_scope, session_root);
         match tokio::time::timeout(Duration::from_secs(HOST_MCP_CALL_DEADLINE_SECS), fut).await {
             Ok(resp) => resp,
             Err(_) => mcp_calls::McpCallResponse {
@@ -1172,6 +1336,7 @@ impl DeliveryService {
         servers: &serde_json::Value,
         req: &mcp_calls::McpCallRequest,
         session_scope: &str,
+        session_root: &Path,
     ) -> mcp_calls::McpCallResponse {
         let Some(entry) = servers.get(&req.server) else {
             return mcp_calls::McpCallResponse {
@@ -1199,7 +1364,7 @@ impl DeliveryService {
                 mcp_calls::McpCallResponse {
                     request_id: req.request_id.clone(),
                     is_error,
-                    result: render_mcp_content(value.get("content")),
+                    result: render_mcp_content(value.get("content"), session_root),
                 }
             }
             Err(err) => mcp_calls::McpCallResponse {
@@ -9559,34 +9724,148 @@ mod tests {
 
     #[test]
     fn render_mcp_content_flattens_text_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
         let content = serde_json::json!([
             {"type": "text", "text": "line one"},
             {"type": "text", "text": "line two"}
         ]);
-        assert_eq!(render_mcp_content(Some(&content)), "line one\n\nline two");
+        assert_eq!(
+            render_mcp_content(Some(&content), tmp.path()),
+            "line one\n\nline two"
+        );
     }
 
     #[test]
     fn render_mcp_content_tags_non_text_blocks() {
+        // A resource block still collapses to its type tag; an image block
+        // with undecodable data degrades to the marker plus a reason (never
+        // an error, never a file).
+        let tmp = tempfile::tempdir().unwrap();
         let content = serde_json::json!([
             {"type": "text", "text": "see attached"},
-            {"type": "image", "data": "..."}
+            {"type": "resource", "resource": {}}
         ]);
         assert_eq!(
-            render_mcp_content(Some(&content)),
-            "see attached\n\n<image>"
+            render_mcp_content(Some(&content), tmp.path()),
+            "see attached\n\n<resource>"
         );
     }
 
     #[test]
     fn render_mcp_content_handles_empty_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            render_mcp_content(None),
+            render_mcp_content(None, tmp.path()),
             "(external MCP tool produced no output)"
         );
         assert_eq!(
-            render_mcp_content(Some(&serde_json::json!([]))),
+            render_mcp_content(Some(&serde_json::json!([])), tmp.path()),
             "(external MCP tool produced no output)"
+        );
+    }
+
+    // ── external MCP host-proxy: image passthrough (M24 U3) ──────────────────
+
+    /// A 1x1 PNG, standard base64. Small but real bytes — the test asserts a
+    /// byte-for-byte round trip to disk.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn render_mcp_content_saves_image_and_references_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = serde_json::json!([
+            {"type": "text", "text": "chart below"},
+            {"type": "image", "data": TINY_PNG_B64, "mimeType": "image/png"}
+        ]);
+        let rendered = render_mcp_content(Some(&content), tmp.path());
+        assert!(
+            rendered.starts_with("chart below\n\n[image saved: /data/.copperclaw/images/"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(" — view with view_image]"),
+            "got: {rendered}"
+        );
+        // Exactly one file landed in the host-side session images dir, with
+        // the exact decoded bytes.
+        let dir = tmp.path().join(".copperclaw/images");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let name = files[0].file_name().to_string_lossy().into_owned();
+        assert_eq!(
+            files[0].path().extension().and_then(|e| e.to_str()),
+            Some("png"),
+            "got: {name}"
+        );
+        assert!(
+            rendered.contains(&format!("/data/.copperclaw/images/{name}")),
+            "reference must carry the saved file name; got: {rendered}"
+        );
+        let mut expected = Vec::new();
+        {
+            // Decode the fixture independently of the code under test.
+            let engine = |s: &str| mcp_b64_decode(s).unwrap();
+            expected.extend(engine(TINY_PNG_B64));
+        }
+        assert_eq!(std::fs::read(files[0].path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn save_mcp_image_enforces_size_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An encoded payload whose decoded size would exceed the cap — the
+        // pre-decode gate must refuse before materialising anything.
+        let oversized = "A".repeat((MCP_IMAGE_MAX_BYTES / 3 + 2) * 4);
+        let err = save_mcp_image(tmp.path(), "image/png", &oversized).unwrap_err();
+        assert!(err.contains("over the"), "got: {err}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn save_mcp_image_enforces_retention_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut last = String::new();
+        for _ in 0..(MCP_IMAGE_RETAIN + 5) {
+            last = save_mcp_image(tmp.path(), "image/png", TINY_PNG_B64).unwrap();
+        }
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), MCP_IMAGE_RETAIN);
+        assert!(
+            names.contains(&last),
+            "newest image must survive retention; kept: {names:?}"
+        );
+    }
+
+    #[test]
+    fn render_mcp_image_degrades_on_bad_data_and_unwritable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Undecodable base64 → marker plus reason, no file.
+        let bad = serde_json::json!([{"type": "image", "data": "...", "mimeType": "image/png"}]);
+        let rendered = render_mcp_content(Some(&bad), tmp.path());
+        assert!(rendered.starts_with("<image> ("), "got: {rendered}");
+        assert!(!tmp.path().join(".copperclaw/images").exists());
+        // Unsupported MIME type → marker plus reason.
+        let tiff =
+            serde_json::json!([{"type": "image", "data": TINY_PNG_B64, "mimeType": "image/tiff"}]);
+        let rendered = render_mcp_content(Some(&tiff), tmp.path());
+        assert!(
+            rendered.contains("unsupported image type"),
+            "got: {rendered}"
+        );
+        // Unwritable images dir (a file occupies the `.copperclaw` slot) →
+        // marker plus reason, never a panic or error.
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join(".copperclaw"), b"not a dir").unwrap();
+        let good =
+            serde_json::json!([{"type": "image", "data": TINY_PNG_B64, "mimeType": "image/png"}]);
+        let rendered = render_mcp_content(Some(&good), blocked.path());
+        assert!(
+            rendered.starts_with("<image> (cannot create"),
+            "got: {rendered}"
         );
     }
 
@@ -9602,7 +9881,9 @@ mod tests {
             tool: "forecast".into(),
             input: serde_json::json!({}),
         };
-        let resp = DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r1").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let resp =
+            DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r1", tmp.path()).await;
         assert!(resp.is_error);
         assert!(resp.result.contains("ghost"), "got: {}", resp.result);
         assert_eq!(resp.request_id, "r1");
@@ -9621,7 +9902,9 @@ mod tests {
             tool: "forecast".into(),
             input: serde_json::json!({}),
         };
-        let resp = DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r2").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let resp =
+            DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r2", tmp.path()).await;
         assert!(resp.is_error);
         assert!(resp.result.contains("forecast"), "got: {}", resp.result);
     }

@@ -31,6 +31,7 @@
 //! do not double-check here.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -391,12 +392,12 @@ async fn invoke_subagent_tool(
         }
     };
     match entry.handler.call(arguments, deps.tool_ctx.as_ref()).await {
-        Ok(result) => (render_tool_result(&result), false),
+        Ok(result) => (render_tool_result(&result, &default_images_dir()), false),
         Err(err) => (format!("Tool `{}` failed: {err}", call.name), true),
     }
 }
 
-fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
+fn render_tool_result(result: &rmcp::model::CallToolResult, images_dir: &Path) -> String {
     let mut out = String::new();
     for block in &result.content {
         if !out.is_empty() {
@@ -404,7 +405,9 @@ fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
         }
         match &block.raw {
             rmcp::model::RawContent::Text(t) => out.push_str(&t.text),
-            rmcp::model::RawContent::Image(_) => out.push_str("<image>"),
+            rmcp::model::RawContent::Image(img) => {
+                out.push_str(&render_image_block(images_dir, &img.mime_type, &img.data));
+            }
             rmcp::model::RawContent::Audio(_) => out.push_str("<audio>"),
             rmcp::model::RawContent::Resource(_) => out.push_str("<resource>"),
         }
@@ -413,6 +416,157 @@ fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
         "(tool produced no output)".to_string()
     } else {
         out
+    }
+}
+
+// ── image passthrough (M24 U3) ─────────────────────────────────────────────
+//
+// Tool results that carry an image block used to be flattened to the literal
+// string `<image>` in the transcript text, so a subagent's screenshot (or any
+// image-returning tool) could never reach the parent. Instead we decode the
+// image, write it to a capped per-session directory, and replace the marker
+// with a path reference the model can act on via `view_image`. Shared by this
+// module's subagent-transcript seam and `run::tool_dispatch`'s text render.
+
+/// Per-image size cap. Matches `view_image`'s 5 MB refuse threshold — saving
+/// anything larger would produce a file the model cannot view anyway.
+pub(crate) const IMAGE_SAVE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Retention cap: keep at most this many saved images per session; the oldest
+/// beyond the cap are deleted after each save.
+pub(crate) const IMAGE_SAVE_RETAIN: usize = 20;
+
+/// Default in-container image-save directory. Resolves the data root the
+/// same way `run::project::resolve_data_root` does (`COPPERCLAW_DATA_ROOT`
+/// when set, else `/data`) so tests can redirect it.
+pub(crate) fn default_images_dir() -> PathBuf {
+    std::env::var_os("COPPERCLAW_DATA_ROOT")
+        .map_or_else(|| PathBuf::from("/data"), PathBuf::from)
+        .join(".copperclaw")
+        .join("images")
+}
+
+/// File extension for the image MIME types `view_image` can load. `None`
+/// for anything else — saving a file the viewer refuses would be a dead end.
+fn image_ext_for_mime(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => return None,
+    })
+}
+
+/// Minimal standard-base64 decode (with `=` padding). Mirrors the private
+/// `bytes_b64` helper in `copperclaw-mcp` (not public there); kept local so
+/// this crate needs no new dependency.
+fn b64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = s.trim().as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("base64 length not multiple of 4");
+    }
+    let val = |c: u8| -> Result<u8, &'static str> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 0,
+            _ => return Err("invalid base64 char"),
+        })
+    };
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let v0 = val(chunk[0])?;
+        let v1 = val(chunk[1])?;
+        let v2 = val(chunk[2])?;
+        let v3 = val(chunk[3])?;
+        let n: u32 =
+            (u32::from(v0) << 18) | (u32::from(v1) << 12) | (u32::from(v2) << 6) | u32::from(v3);
+        out.push(((n >> 16) & 0xFF) as u8);
+        if chunk[2] != b'=' {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((n & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the oldest files in `dir` beyond `keep`. Best-effort — any
+/// unreadable entry or failed delete is skipped.
+fn enforce_image_retention(dir: &Path, keep: usize) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = read
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_file() {
+                return None;
+            }
+            let modified = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    // Newest first; path as a deterministic tie-break for equal mtimes.
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, path) in files.drain(keep..) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Decode a base64 image and write it to `<images_dir>/<short-id>.<ext>`,
+/// enforcing the per-image size cap and the retention cap. `Err` carries a
+/// human-readable reason — callers degrade to a `<image> (reason)` marker,
+/// never a hard error.
+pub(crate) fn save_tool_image(
+    images_dir: &Path,
+    mime: &str,
+    data_b64: &str,
+) -> Result<PathBuf, String> {
+    let Some(ext) = image_ext_for_mime(mime) else {
+        return Err(format!("unsupported image type `{mime}`"));
+    };
+    // Cheap pre-decode gate: base64 inflates bytes by 4/3, so the encoded
+    // length bounds the decoded size before we materialise anything.
+    let approx_bytes = data_b64.len() / 4 * 3;
+    if approx_bytes > IMAGE_SAVE_MAX_BYTES {
+        return Err(format!(
+            "image is ~{approx_bytes} bytes, over the {IMAGE_SAVE_MAX_BYTES}-byte save cap"
+        ));
+    }
+    let bytes = b64_decode(data_b64).map_err(|e| format!("undecodable image data ({e})"))?;
+    if bytes.is_empty() {
+        return Err("empty image data".to_string());
+    }
+    std::fs::create_dir_all(images_dir)
+        .map_err(|e| format!("cannot create {}: {e}", images_dir.display()))?;
+    let name = format!("{}.{ext}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let path = images_dir.join(name);
+    std::fs::write(&path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    enforce_image_retention(images_dir, IMAGE_SAVE_RETAIN);
+    Ok(path)
+}
+
+/// Render one image content block for a transcript text: a saved-file
+/// reference on success, the legacy `<image>` marker plus the reason on any
+/// failure (unwritable dir, oversized, undecodable, unsupported type).
+pub(crate) fn render_image_block(images_dir: &Path, mime: &str, data_b64: &str) -> String {
+    match save_tool_image(images_dir, mime, data_b64) {
+        Ok(path) => format!("[image saved: {} — view with view_image]", path.display()),
+        Err(reason) => format!("<image> ({reason})"),
     }
 }
 
@@ -791,5 +945,106 @@ mod tests {
         let s = serde_json::to_string(&req).unwrap();
         let back: SubagentRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ── image passthrough (M24 U3) ────────────────────────────────────────
+
+    /// A 1x1 PNG, standard base64. Small but real bytes — the tests assert a
+    /// byte-for-byte round trip to disk.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn render_tool_result_saves_image_and_references_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = CallToolResult::success(vec![
+            Content::text("screenshot below"),
+            Content::image(TINY_PNG_B64.to_string(), "image/png".to_string()),
+        ]);
+        let rendered = render_tool_result(&result, tmp.path());
+        assert!(
+            rendered.starts_with("screenshot below\n\n[image saved: "),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(" — view with view_image]"),
+            "got: {rendered}"
+        );
+        // Exactly one file landed, with the exact decoded bytes, and the
+        // rendered reference names it.
+        let files: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        let path = files[0].path();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "reference must carry the saved path; got: {rendered}"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, b64_decode(TINY_PNG_B64).unwrap());
+        // PNG magic — the decode really produced image bytes, not base64.
+        assert_eq!(&bytes[..4], b"\x89PNG");
+    }
+
+    #[test]
+    fn save_tool_image_enforces_size_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An encoded payload whose decoded size would exceed the cap — the
+        // pre-decode gate must refuse before materialising anything.
+        let oversized = "A".repeat((IMAGE_SAVE_MAX_BYTES / 3 + 2) * 4);
+        let err = save_tool_image(tmp.path(), "image/png", &oversized).unwrap_err();
+        assert!(err.contains("over the"), "got: {err}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // The rendered form degrades to the legacy marker plus the reason.
+        let rendered = render_image_block(tmp.path(), "image/png", &oversized);
+        assert!(rendered.starts_with("<image> ("), "got: {rendered}");
+    }
+
+    #[test]
+    fn save_tool_image_enforces_retention_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut last = PathBuf::new();
+        for _ in 0..(IMAGE_SAVE_RETAIN + 5) {
+            last = save_tool_image(tmp.path(), "image/png", TINY_PNG_B64).unwrap();
+        }
+        let files: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(files.len(), IMAGE_SAVE_RETAIN);
+        assert!(
+            last.is_file(),
+            "newest image must survive retention: {}",
+            last.display()
+        );
+    }
+
+    #[test]
+    fn render_image_block_degrades_never_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Undecodable base64 → marker plus reason, no file written.
+        let rendered = render_image_block(tmp.path(), "image/png", "...");
+        assert!(rendered.starts_with("<image> ("), "got: {rendered}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        // Unsupported MIME type → marker plus reason.
+        let rendered = render_image_block(tmp.path(), "image/tiff", TINY_PNG_B64);
+        assert!(
+            rendered.contains("unsupported image type"),
+            "got: {rendered}"
+        );
+        // Unwritable dir (a file occupies the dir path) → marker plus
+        // reason, never a panic or error.
+        let blocked = tmp.path().join("not-a-dir");
+        std::fs::write(&blocked, b"file").unwrap();
+        let rendered = render_image_block(&blocked.join("images"), "image/png", TINY_PNG_B64);
+        assert!(
+            rendered.starts_with("<image> (cannot create"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn b64_decode_roundtrips_known_vectors() {
+        assert_eq!(b64_decode("QUJD").unwrap(), b"ABC");
+        assert_eq!(b64_decode("QQ==").unwrap(), b"A");
+        assert_eq!(b64_decode("QUI=").unwrap(), b"AB");
+        assert!(b64_decode("bad!").is_err());
+        assert!(b64_decode("abc").is_err());
     }
 }

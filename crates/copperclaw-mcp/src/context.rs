@@ -47,8 +47,18 @@ pub enum ToolEffectAck {
 /// Reference to a recipient for outbound delivery.
 ///
 /// The `to` parameter on most tools is optional and means "reply on the
-/// originating channel"; the runner is responsible for materialising that
-/// default. When the caller supplies `to`, it is one of the variants below.
+/// default destination" (the parent agent for spawned child sessions, the
+/// originating channel otherwise); the runner is responsible for
+/// materialising that default. When the caller supplies `to`, it is one of
+/// the variants below.
+///
+/// [`Recipient::Parent`] and [`Recipient::RootUser`] are *virtual*
+/// recipients (phase 2 of `docs/plans/agent-to-agent-routing.md`): the
+/// runner resolves them into a concrete route before any outbound row is
+/// written, so they never appear on the wire — `Parent` becomes an
+/// `Agent { session_id }` addressed at the session's `source_session_id`,
+/// and `RootUser` becomes a chat-kind row delivered on the root
+/// conversation's human channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Recipient {
@@ -67,6 +77,37 @@ pub enum Recipient {
         /// User id (string form of `UserId`).
         id: String,
     },
+    /// The agent that spawned this session (`to: "agent:parent"`).
+    /// Resolved by the runner against the session's `source_session_id`;
+    /// a session with no parent gets a validation error.
+    Parent,
+    /// The human in the ROOT conversation of the spawn chain
+    /// (`to: "user"`). Resolved by the runner to the originating human
+    /// channel: the triggering inbound's channel routing when present,
+    /// otherwise the session's host-written `session_routing` — which
+    /// the host copies down the spawn chain from the root session, so a
+    /// grandchild's `to: "user"` reaches the human, not a middle agent.
+    RootUser,
+}
+
+impl Recipient {
+    /// Parse the shorthand string forms of a `to` argument.
+    ///
+    /// - `"user"` -> [`Recipient::RootUser`] (the human at the root of
+    ///   the spawn chain).
+    /// - `"agent:parent"` -> [`Recipient::Parent`] (the spawning agent).
+    /// - anything else -> [`Recipient::Channel`] with the string as the
+    ///   channel id (the historical bare-string behaviour).
+    #[must_use]
+    pub fn from_to_string(s: &str) -> Self {
+        match s.trim() {
+            "user" => Self::RootUser,
+            "agent:parent" => Self::Parent,
+            other => Self::Channel {
+                id: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Where an `install_packages` request applies.
@@ -1833,12 +1874,36 @@ mod tests {
                 session_id: "sess_1".into(),
             },
             Recipient::User { id: "u_1".into() },
+            Recipient::Parent,
+            Recipient::RootUser,
         ];
         for r in recipients {
             let s = serde_json::to_string(&r).unwrap();
             let back: Recipient = serde_json::from_str(&s).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    #[test]
+    fn recipient_from_to_string_parses_special_forms() {
+        assert_eq!(Recipient::from_to_string("user"), Recipient::RootUser);
+        assert_eq!(Recipient::from_to_string(" user "), Recipient::RootUser);
+        assert_eq!(Recipient::from_to_string("agent:parent"), Recipient::Parent);
+        // Anything else keeps the historical bare-string channel form —
+        // including `agent:<name>` slugs, which the host's agent_to_agent
+        // module resolves by name.
+        assert_eq!(
+            Recipient::from_to_string("telegram:chat-9"),
+            Recipient::Channel {
+                id: "telegram:chat-9".into()
+            }
+        );
+        assert_eq!(
+            Recipient::from_to_string("agent:scout-a"),
+            Recipient::Channel {
+                id: "agent:scout-a".into()
+            }
+        );
     }
 
     #[test]

@@ -1421,7 +1421,7 @@ fn apply_send_message(
 ) -> Result<ToolEffectAck, ToolApplyError> {
     let SendMessageSpec { to, text } = spec;
     let text = strip_reasoning_blocks(&text);
-    let routed = resolve_outbound_routing(to, origin);
+    let routed = resolve_outbound_routing(to, origin)?;
     let mut body = serde_json::Map::new();
     // Slice 3.4: attach the long-output expander decorator BEFORE we
     // move `text` into the body. Only attaches on Chat-kind rows
@@ -1491,7 +1491,7 @@ fn apply_send_file(
     let target = target_dir.join(&filename);
     std::fs::write(&target, &data)?;
 
-    let mut routed = resolve_outbound_routing(to, origin);
+    let mut routed = resolve_outbound_routing(to, origin)?;
     // `send_file` cannot use the Agent-kind dispatch path: the
     // `agent_dispatch` handler only forwards the body's text into the
     // parent's inbound — it has no mechanism to copy the file bytes
@@ -1570,6 +1570,22 @@ fn apply_ask_question(
     conn: &mut Connection,
     spec: AskUserQuestionSpec,
 ) -> Result<ToolEffectAck, ToolApplyError> {
+    // The virtual recipients (phase 2 routing) never reach the host's
+    // interactive module: `to: "user"` on a question is just the default
+    // (questions already go to the human on the origin channel), and a
+    // question addressed at the parent agent is a category error — the
+    // parent is an LLM, not a choice-card reader.
+    let to = match spec.to {
+        Some(Recipient::RootUser) => None,
+        Some(Recipient::Parent) => {
+            return Err(ToolApplyError::Validation(
+                "ask_user_question cannot target the parent agent — questions go to a \
+                 human. Use send_message(to: \"agent:parent\") to ask your parent instead."
+                    .into(),
+            ));
+        }
+        other => other,
+    };
     let qid = format!("q_{}", Uuid::new_v4());
     let mut q = serde_json::Map::new();
     q.insert("id".into(), serde_json::Value::String(qid.clone()));
@@ -1583,7 +1599,7 @@ fn apply_ask_question(
                 .collect(),
         ),
     );
-    if let Some(t) = spec.to {
+    if let Some(t) = to {
         q.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
     }
     // Action name must match what `InteractiveModule::install` registers
@@ -1614,7 +1630,7 @@ fn apply_send_card(
     // be rendered by any adapter, so we fall back to Chat-style
     // delivery on the inherited channel routing. This mirrors the
     // belt-and-braces logic in `apply_send_file`.
-    let mut routed = resolve_outbound_routing(to, origin);
+    let mut routed = resolve_outbound_routing(to, origin)?;
     if matches!(routed.kind, MessageKind::Agent) {
         routed.body_to = None;
         routed.in_reply_to = origin.in_reply_to;
@@ -1675,7 +1691,7 @@ fn apply_emit_todo_list(
     // the kind back and drop the body_to so we don't try to render
     // an inter-agent TodoList. Mirrors `apply_send_card`'s
     // belt-and-braces logic.
-    let mut routed = resolve_outbound_routing(None, origin);
+    let mut routed = resolve_outbound_routing(None, origin)?;
     if matches!(routed.kind, MessageKind::Agent) {
         routed.body_to = None;
         routed.in_reply_to = origin.in_reply_to;
@@ -2024,29 +2040,79 @@ struct OutboundRouting {
 /// Decide where this outbound row should land.
 ///
 /// Rules (in order):
-/// 1. Caller passed `to: Recipient::Agent { session_id }` → kind Agent
+/// 1. Caller passed `to: "agent:parent"` ([`Recipient::Parent`]) →
+///    resolve against the runner's `source_session_id` and treat as an
+///    explicit `Recipient::Agent` addressed at the parent. A session
+///    with no parent gets a validation error with a fix hint.
+/// 2. Caller passed `to: "user"` ([`Recipient::RootUser`]) → kind Chat
+///    addressed at the ROOT conversation's human. When the triggering
+///    inbound carried channel routing we use it directly; otherwise the
+///    row's channel columns stay NULL and the host delivery loop's
+///    `session_routing` fallback fills them in — `session_routing` is
+///    host-written at spawn by copying the parent's routing down the
+///    chain (`agent_to_agent::copy_parent_session_routing`), so it IS
+///    the materialised walk to the root session's human channel. A
+///    grandchild's `to: "user"` therefore reaches the human, never a
+///    middle agent.
+/// 3. Caller passed `to: Recipient::Agent { session_id }` → kind Agent
 ///    addressed to that session. Channel columns on the row are elided
 ///    (Agent-kind dispatches via the body's `to`, not the row's
 ///    channel routing).
-/// 2. Caller passed `to: Recipient::Channel { .. }` → kind Chat. The
+/// 4. Caller passed `to: Recipient::Channel { .. }` → kind Chat. The
 ///    explicit recipient is preserved in the body for any downstream
 ///    consumer that wants to inspect the override. Channel routing on
 ///    the row stays inherited from the originating inbound: today's
 ///    delivery loop doesn't parse arbitrary channel id strings on its
 ///    own, so the row inherits routing for now.
-/// 3. Caller passed no `to:` AND the runner has a `source_session_id`
+/// 5. Caller passed no `to:` AND the runner has a `source_session_id`
 ///    AND the originating inbound had no channel routing (i.e. this is
 ///    truly an internal child→parent reply, not a direct user message
 ///    to a child session via inherited MG) → kind Agent, synthesise
 ///    the recipient pointing at the parent.
-/// 4. Otherwise → kind Chat, channel routing from the inbound. Covers
+/// 6. Otherwise → kind Chat, channel routing from the inbound. Covers
 ///    root-session "reply to user" AND the edge case where the child
 ///    session has been wired directly to a user channel and a user
 ///    message landed on it (per-thread wirings, operator-added wiring
 ///    pointing at the child's `agent_group`). In those cases the user
 ///    expects a reply, not silent siphoning up to the parent.
-fn resolve_outbound_routing(to: Option<Recipient>, origin: &OriginatingRouting) -> OutboundRouting {
+fn resolve_outbound_routing(
+    to: Option<Recipient>,
+    origin: &OriginatingRouting,
+) -> Result<OutboundRouting, ToolApplyError> {
     use copperclaw_mcp::Recipient as R;
+    // Resolve the virtual recipients into concrete routing FIRST so
+    // they never reach the wire (phase 2 of
+    // docs/plans/agent-to-agent-routing.md).
+    let to = match to {
+        Some(R::Parent) => match origin.source_session_id {
+            Some(sid) => Some(R::Agent {
+                session_id: sid.as_uuid().to_string(),
+            }),
+            None => {
+                return Err(ToolApplyError::Validation(
+                    "`to: \"agent:parent\"`: this session has no parent agent — it was \
+                     started from a user channel, not spawned via create_agent. Use \
+                     `to: \"user\"` (or omit `to`) to reply to the human instead."
+                        .into(),
+                ));
+            }
+        },
+        // RootUser resolves to "Chat on the root human channel": drop
+        // the recipient from the body and let the channel columns (or
+        // the delivery loop's `session_routing` fallback when they are
+        // NULL) carry the route.
+        Some(R::RootUser) => {
+            return Ok(OutboundRouting {
+                kind: MessageKind::Chat,
+                body_to: None,
+                channel_type: origin.channel_type.clone(),
+                platform_id: origin.platform_id.clone(),
+                thread_id: origin.thread_id.clone(),
+                in_reply_to: origin.in_reply_to,
+            });
+        }
+        other => other,
+    };
     let inbound_came_from_parent = origin.channel_type.is_none()
         && origin.platform_id.is_none()
         && origin.source_session_id.is_some();
@@ -2074,7 +2140,7 @@ fn resolve_outbound_routing(to: Option<Recipient>, origin: &OriginatingRouting) 
     // rows the row's channel columns drive delivery.
     let inherit_thread = matches!(kind, MessageKind::Agent | MessageKind::Chat);
     let _ = inherit_thread; // suppressed; reads as documentation here.
-    OutboundRouting {
+    Ok(OutboundRouting {
         kind,
         body_to,
         channel_type: origin.channel_type.clone(),
@@ -2090,7 +2156,7 @@ fn resolve_outbound_routing(to: Option<Recipient>, origin: &OriginatingRouting) 
         } else {
             origin.in_reply_to
         },
-    }
+    })
 }
 
 /// Insert an outbound chat / agent row honouring [`OutboundRouting`].
@@ -3005,6 +3071,208 @@ mod tests {
              not siphon to the parent",
         );
         assert_eq!(row.platform_id.as_deref(), Some("chat-1"));
+    }
+
+    #[tokio::test]
+    async fn to_agent_parent_resolves_to_source_session() {
+        // Phase 2: the explicit `to: "agent:parent"` form resolves
+        // against the runner's `source_session_id` — same wire shape as
+        // the implicit child default (an Agent-kind row addressed at
+        // the parent), but usable even when the triggering inbound
+        // carried user-channel routing.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: Some(Recipient::Parent),
+            text: "reporting up".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Agent);
+        assert_eq!(row.content["to"]["kind"], "agent");
+        assert_eq!(
+            row.content["to"]["session_id"],
+            parent_session.as_uuid().to_string(),
+            "`agent:parent` must resolve to this session's source session",
+        );
+    }
+
+    #[tokio::test]
+    async fn to_agent_parent_without_parent_is_validation_error() {
+        // A root session (no `source_session_id`) asking for
+        // `agent:parent` gets a clear validation error, not a silently
+        // dropped or misrouted message.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let err = ctx
+            .emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+                to: Some(Recipient::Parent),
+                text: "hello?".into(),
+            }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(
+                    msg.contains("no parent agent"),
+                    "error must say the session has no parent: {msg}"
+                );
+                assert!(
+                    msg.contains("to: \"user\""),
+                    "error must hint at the `to: \"user\"` alternative: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grandchild_to_user_routes_to_root_channel_not_middle_agent() {
+        // Phase 2's key invariant: a GRANDCHILD (spawned by a middle
+        // agent, processing an agent-dispatched inbound with no channel
+        // routing) calling `send_message(to: "user")` must produce a
+        // Chat-kind row for the ROOT conversation's human — NOT an
+        // Agent-kind row addressed at the middle agent (which is what
+        // the implicit `to: None` default would do here).
+        //
+        // The row's channel columns stay NULL; the host delivery loop's
+        // `resolve_target` fills them from this session's
+        // `session_routing`, which `agent_to_agent::
+        // copy_parent_session_routing` copied down the spawn chain from
+        // the root session at spawn — i.e. the root human channel.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let middle_agent = SessionId::new(); // the grandchild's parent
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(middle_agent);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(middle_agent),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: Some(Recipient::RootUser),
+            text: "escalating to the human".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(
+            row.kind,
+            MessageKind::Chat,
+            "`to: \"user\"` must produce a Chat-kind row for the human, \
+             never an Agent-kind row up to the middle agent",
+        );
+        assert!(
+            row.content.get("to").is_none(),
+            "the virtual RootUser recipient must not leak into the body",
+        );
+        assert!(
+            row.channel_type.is_none() && row.platform_id.is_none(),
+            "channel columns stay NULL so delivery resolves the root \
+             human channel via the session_routing fallback",
+        );
+    }
+
+    #[tokio::test]
+    async fn root_session_to_user_uses_origin_channel_routing() {
+        // At the root of the chain `to: "user"` is just an explicit
+        // spelling of "reply to the human": the originating inbound's
+        // channel routing rides on the row directly.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-42".into()),
+            thread_id: Some("t-1".into()),
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: Some(Recipient::RootUser),
+            text: "hello human".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Chat);
+        assert_eq!(row.channel_type.unwrap().as_str(), "telegram");
+        assert_eq!(row.platform_id.as_deref(), Some("chat-42"));
+        assert_eq!(row.thread_id.as_deref(), Some("t-1"));
+    }
+
+    #[tokio::test]
+    async fn ask_question_to_parent_is_validation_error() {
+        // `ask_user_question(to: "agent:parent")` is a category error:
+        // the parent is an LLM, not a choice-card reader.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(SessionId::new());
+        let err = ctx
+            .emit_outbound(OutboundToolEffect::AskUserQuestion(
+                copperclaw_mcp::AskUserQuestionSpec {
+                    title: "pick one".into(),
+                    options: vec!["a".into(), "b".into()],
+                    to: Some(Recipient::Parent),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn ask_question_to_user_drops_the_virtual_recipient() {
+        // `ask_user_question(to: "user")` is the default spelled out:
+        // the virtual recipient must not leak into the question body
+        // (the host's interactive module only understands concrete
+        // recipient forms).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.emit_outbound(OutboundToolEffect::AskUserQuestion(
+            copperclaw_mcp::AskUserQuestionSpec {
+                title: "pick one".into(),
+                options: vec!["a".into(), "b".into()],
+                to: Some(Recipient::RootUser),
+            },
+        ))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert!(
+            row.content["ask_user_question"].get("to").is_none(),
+            "the virtual RootUser recipient must be dropped, not serialised",
+        );
     }
 
     #[tokio::test]

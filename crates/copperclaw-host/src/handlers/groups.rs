@@ -7,6 +7,12 @@ use copperclaw_db::tables::{agent_groups, container_configs, sessions};
 use copperclaw_types::AgentGroupId;
 use copperclaw_types::ContainerStatus;
 use serde_json::{Value, json};
+use std::path::Path;
+
+/// Default `limit` applied when the operator picks the relevance narrowing
+/// without an explicit cap (`--field 'skills="relevant"'`, or a
+/// `{"relevant": {...}}` object that omits `limit`).
+const DEFAULT_RELEVANT_SKILLS_LIMIT: usize = 8;
 
 /// `groups.list`
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -111,6 +117,30 @@ pub fn config_get(args: &Value, central: &CentralDb) -> Result<Value, ErrorPaylo
 /// Only the fields documented below are accepted. Anything else returns
 /// `bad_request`.
 pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    // The skills registry roots come from the same env the host booted with
+    // (`.env` is dotenv-loaded into the process env before `HostConfig`
+    // parses it), mirroring `HostConfig::from_map`'s empty-means-unset rule.
+    // Only the `skills` field's explicit-name validation consults them.
+    let skills_dir = env_dir("COPPERCLAW_SKILLS_DIR");
+    let groups_dir = env_dir("COPPERCLAW_GROUPS_DIR");
+    config_update_impl(args, central, skills_dir.as_deref(), groups_dir.as_deref())
+}
+
+/// Read an env var as an optional directory path (empty / unset -> `None`),
+/// matching `HostConfig`'s treatment of the same variables.
+fn env_dir(var: &str) -> Option<std::path::PathBuf> {
+    std::env::var(var)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn config_update_impl(
+    args: &Value,
+    central: &CentralDb,
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+) -> Result<Value, ErrorPayload> {
     let id = parse_agent_group_id(args, "id")?;
     let field = req_str(args, "field")?;
     let value = args
@@ -256,6 +286,15 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                     ));
                 }
             };
+        }
+        // M24 U1: the per-group skills selector. Accepts the stored JSON
+        // forms (`"all"`, an array of names, `{"relevant": {...}}`) plus the
+        // `"relevant"` shorthand; explicit names are validated against the
+        // skills registry so a typo can't silently strip a skill at spawn.
+        // NOTE: `skills` IS a fingerprint input (`compute_fingerprint`), so a
+        // change forces an image rebuild on the next spawn.
+        "skills" => {
+            existing.skills = parse_skills_value(&value, id, skills_dir, groups_dir)?;
         }
         other => {
             return Err(ErrorPayload::new(
@@ -478,6 +517,149 @@ fn validate_egress_entry(entry: &str) -> Result<(), ErrorPayload> {
         return Err(ErrorPayload::new(
             "bad_request",
             format!("egress entry `{entry}` port must be 1–65535"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the `skills` field value of `groups.config.update` into the DB's
+/// [`container_configs::SkillsSelector`].
+///
+/// Accepted forms (a superset of the stored format — the stored value is
+/// always the complete canonical shape):
+///
+/// - `"all"` — every discovered skill (the default).
+/// - `null` — reset to `"all"`.
+/// - `"relevant"` — shorthand for `{"relevant": {"query": "",
+///   "limit": DEFAULT_RELEVANT_SKILLS_LIMIT}}`. An empty `query` behaves
+///   like `"all"` at spawn (the scorer's fail-open), so set a query for
+///   actual narrowing.
+/// - `{"relevant": {"query": "...", "limit": N}}` — FTS relevance narrowing;
+///   both keys optional (`query` defaults to `""`, `limit` to
+///   `DEFAULT_RELEVANT_SKILLS_LIMIT`; `limit` must be >= 1).
+/// - `["name", ...]` — explicit allowlist, validated against the skills
+///   registry when one is configured.
+fn parse_skills_value(
+    value: &Value,
+    group: AgentGroupId,
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+) -> Result<container_configs::SkillsSelector, ErrorPayload> {
+    const SYNTAX: &str = "`skills` must be \"all\", \"relevant\", a JSON array of skill names, \
+         {\"relevant\": {\"query\": \"...\", \"limit\": N}}, or null to reset to \"all\"";
+    match value {
+        Value::Null => Ok(container_configs::SkillsSelector::All),
+        Value::String(s) if s == "all" => Ok(container_configs::SkillsSelector::All),
+        Value::String(s) if s == "relevant" => Ok(container_configs::SkillsSelector::Relevant {
+            query: String::new(),
+            limit: DEFAULT_RELEVANT_SKILLS_LIMIT,
+        }),
+        Value::String(other) => Err(ErrorPayload::new(
+            "bad_request",
+            format!("unknown skills selector `{other}`; {SYNTAX}"),
+        )),
+        Value::Array(items) => {
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        format!("`skills` array entries must be skill-name strings; {SYNTAX}"),
+                    ));
+                };
+                names.push(name.to_owned());
+            }
+            validate_explicit_skills(&names, group, skills_dir, groups_dir)?;
+            Ok(container_configs::SkillsSelector::Explicit(names))
+        }
+        Value::Object(map) if map.contains_key("relevant") => {
+            let Some(inner) = map["relevant"].as_object() else {
+                return Err(ErrorPayload::new(
+                    "bad_request",
+                    format!("`skills.relevant` must be an object; {SYNTAX}"),
+                ));
+            };
+            let query = match inner.get("query") {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(q)) => q.clone(),
+                Some(_) => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        format!("`skills.relevant.query` must be a string; {SYNTAX}"),
+                    ));
+                }
+            };
+            let limit = match inner.get("limit") {
+                None | Some(Value::Null) => DEFAULT_RELEVANT_SKILLS_LIMIT,
+                Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                    Some(n) if n >= 1 => n,
+                    _ => {
+                        return Err(ErrorPayload::new(
+                            "bad_request",
+                            format!("`skills.relevant.limit` must be an integer >= 1; {SYNTAX}"),
+                        ));
+                    }
+                },
+            };
+            Ok(container_configs::SkillsSelector::Relevant { query, limit })
+        }
+        _ => Err(ErrorPayload::new("bad_request", SYNTAX)),
+    }
+}
+
+/// Validate an explicit skills allowlist against the discovered registry
+/// (global skills dir + this group's `<groups_dir>/<ag>/skills` override —
+/// the same roots prompt assembly scans at spawn).
+///
+/// Fail-open when there is nothing to validate against: no configured
+/// skills dir, or a registry scan error (one malformed skill on disk must
+/// not lock the operator out of setting the selector). Unknown names are a
+/// hard `bad_request` naming both the offenders and the available skills —
+/// at spawn time the registry silently warn-skips unknown names, so this is
+/// the only place a typo surfaces to the operator.
+fn validate_explicit_skills(
+    names: &[String],
+    group: AgentGroupId,
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+) -> Result<(), ErrorPayload> {
+    let Some(global) = skills_dir else {
+        return Ok(());
+    };
+    let group_override = groups_dir
+        .map(|root| root.join(group.as_uuid().to_string()).join("skills"))
+        .filter(|p| p.is_dir());
+    let registry = match copperclaw_skills::SkillRegistry::scan(
+        global,
+        group_override.as_deref().map(|p| (group, p)),
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                dir = %global.display(),
+                "skill registry scan failed; accepting explicit skills selector unvalidated"
+            );
+            return Ok(());
+        }
+    };
+    let unknown: Vec<&str> = names
+        .iter()
+        .filter(|n| registry.get(n).is_none())
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        let available = registry
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ErrorPayload::new(
+            "bad_request",
+            format!(
+                "unknown skill name(s): {}; available skills: {available}",
+                unknown.join(", ")
+            ),
         ));
     }
     Ok(())
@@ -1330,6 +1512,274 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "bad_request");
+    }
+
+    // --- skills selector (M24 U1) -------------------------------------
+
+    /// Write a minimal valid skill dir (`<parent>/<name>/SKILL.md`).
+    fn write_skill(parent: &std::path::Path, name: &str) {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: desc-of-{name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_update_skills_all_string_round_trips() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": "all"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"], "all");
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(stored.skills, container_configs::SkillsSelector::All);
+    }
+
+    #[test]
+    fn config_update_skills_relevant_shorthand_defaults() {
+        // `--field 'skills="relevant"'` -> empty query + default limit.
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": "relevant"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"]["relevant"]["query"], "");
+        assert_eq!(
+            v["skills"]["relevant"]["limit"],
+            DEFAULT_RELEVANT_SKILLS_LIMIT
+        );
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.skills,
+            container_configs::SkillsSelector::Relevant {
+                query: String::new(),
+                limit: DEFAULT_RELEVANT_SKILLS_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn config_update_skills_relevant_object_round_trips() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "field": "skills",
+                "value": {"relevant": {"query": "deploy the bot", "limit": 3}},
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"]["relevant"]["query"], "deploy the bot");
+        assert_eq!(v["skills"]["relevant"]["limit"], 3);
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.skills,
+            container_configs::SkillsSelector::Relevant {
+                query: "deploy the bot".into(),
+                limit: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn config_update_skills_relevant_object_defaults_missing_keys() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "field": "skills",
+                "value": {"relevant": {}},
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"]["relevant"]["query"], "");
+        assert_eq!(
+            v["skills"]["relevant"]["limit"],
+            DEFAULT_RELEVANT_SKILLS_LIMIT
+        );
+    }
+
+    #[test]
+    fn config_update_skills_relevant_rejects_zero_limit() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "field": "skills",
+                "value": {"relevant": {"query": "x", "limit": 0}},
+            }),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("limit"));
+    }
+
+    #[test]
+    fn config_update_skills_null_resets_to_all() {
+        let db = db();
+        let g = make_group(&db, "g");
+        config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": "relevant"}),
+            &db,
+        )
+        .unwrap();
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": null}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"], "all");
+    }
+
+    #[test]
+    fn config_update_skills_rejects_unknown_string() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": "some"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("unknown skills selector"));
+    }
+
+    #[test]
+    fn config_update_skills_rejects_non_string_array_entries() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": ["a", 5]}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_update_skills_rejects_number() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": 42}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_update_skills_explicit_without_registry_stored_verbatim() {
+        // No skills dir configured -> nothing to validate against; the
+        // allowlist is stored as-is (spawn-time selection warn-skips any
+        // name that never materializes).
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update_impl(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": ["alpha", "beta"]}),
+            &db,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["skills"], json!(["alpha", "beta"]));
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.skills,
+            container_configs::SkillsSelector::Explicit(vec!["alpha".into(), "beta".into()])
+        );
+    }
+
+    #[test]
+    fn config_update_skills_explicit_validates_against_registry() {
+        let td = tempfile::tempdir().unwrap();
+        let skills_root = td.path().join("skills");
+        write_skill(&skills_root, "alpha");
+        write_skill(&skills_root, "beta");
+
+        let db = db();
+        let g = make_group(&db, "g");
+        // Known names pass.
+        let v = config_update_impl(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": ["beta"]}),
+            &db,
+            Some(&skills_root),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["skills"], json!(["beta"]));
+        // An unknown name is a clear bad_request naming the offender and
+        // the available skills.
+        let err = config_update_impl(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": ["alpha", "ghost"]}),
+            &db,
+            Some(&skills_root),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("unknown skill name(s): ghost"));
+        assert!(err.message.contains("available skills: alpha, beta"));
+        // The failed update must not have clobbered the stored selector.
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.skills,
+            container_configs::SkillsSelector::Explicit(vec!["beta".into()])
+        );
+    }
+
+    #[test]
+    fn config_update_skills_explicit_validates_group_override_dir() {
+        // A skill that only exists in `<groups_dir>/<ag>/skills` must count
+        // as known for that group.
+        let td = tempfile::tempdir().unwrap();
+        let skills_root = td.path().join("skills");
+        write_skill(&skills_root, "alpha");
+        let db = db();
+        let g = make_group(&db, "g");
+        let groups_root = td.path().join("groups");
+        let override_dir = groups_root.join(g.id.as_uuid().to_string()).join("skills");
+        write_skill(&override_dir, "group-only");
+
+        let v = config_update_impl(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": ["group-only", "alpha"]}),
+            &db,
+            Some(&skills_root),
+            Some(&groups_root),
+        )
+        .unwrap();
+        assert_eq!(v["skills"], json!(["group-only", "alpha"]));
+    }
+
+    #[test]
+    fn config_update_skills_empty_array_is_valid_explicit_none() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "skills", "value": []}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["skills"], json!([]));
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.skills,
+            container_configs::SkillsSelector::Explicit(vec![])
+        );
     }
 
     #[test]
