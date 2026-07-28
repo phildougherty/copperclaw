@@ -227,29 +227,62 @@ zero or more `Mismatch { path, expected, actual }` entries.
 
 ---
 
-## Capturing new fixtures
+## Authoring new fixtures
 
-When a real platform interaction reveals a bug, capture it for the
-replay suite:
+There is no automatic capture pipeline. (Earlier revisions of this doc
+described a `COPPERCLAW_FIXTURE_CAPTURE` env var and a
+`crates/copperclaw-host/src/fixture/redact.rs` redaction pass; neither
+was ever implemented. Live capture-from-a-running-host remains a
+deferred candidate — an M25 card per
+`docs/plans/m24-debt-and-unlock-program.md` T2.) Fixtures are
+hand-authored, with one mechanical assist for the `expected/` streams:
 
-1. **Record.** Run the host with `COPPERCLAW_FIXTURE_CAPTURE=<dir>` —
-   the channel adapter and router will tee inbound bodies, the
-   Anthropic provider will tee the SSE stream, and the database
-   layer will tee writes. The directory ends up with the same shape
-   as a hand-authored fixture.
-2. **Redact.** `target/fixture-capture/...` will contain bearer
-   tokens, signing secrets, and personal text. The redaction pass
-   lives at `crates/copperclaw-host/src/fixture/redact.rs` but is not
-   wired to a CLI subcommand — write a small one-shot Rust binary
-   or shell script that walks the capture dir and feeds each file
-   through `redact::redact_bytes` (see the unit tests in that file
-   for usage). Manual review is still required.
-3. **Stabilise.** Add substitutions to `manifest.toml` for any
-   field that varies between recordings (timestamps, generated
-   ids, server-side message ids).
-4. **Bisect to minimum.** Drop steps until the bug still
+1. **Author the inputs by hand.** Create
+   `fixtures/<channel>/<scenario>/` with `manifest.json`,
+   `central.sql`, `inbound/NNN-*.json`, and `claude/NNN-turn.json` —
+   copy a neighbouring fixture for the same channel as a skeleton.
+   Base payload shapes on real platform payloads where you have them
+   (a webhook body from logs, an SSE trace), redacted and trimmed by
+   hand.
+2. **Register a test** in `crates/copperclaw-host/tests/replay.rs`.
+   Fixtures only run through their registered test — there is no
+   directory auto-discovery.
+3. **Generate the expected streams from a real harness run.** Rather
+   than hand-guessing `expected/*.jsonl`, most registered tests carry
+   a generate path guarded by a per-card env var: when the var is set,
+   the test runs the fixture through the harness and calls
+   `ReplayHarness::dump_expected_jsonl()` instead of asserting the
+   diff. The dump prints each captured stream as JSONL fenced with
+   `===DUMP <stream>===` / `===END <stream>===` markers, with the
+   manifest's substitutions already applied (so lines carry the
+   `<UUID>` / `<TS>` placeholders the diff expects); slice each block
+   into the matching `expected/<stream>.jsonl`. For example:
+
+   ```
+   COPPERCLAW_M22W0_GENERATE=1 cargo test -p copperclaw-host \
+       --test replay cli_tool_use_shell -- --nocapture
+   ```
+
+   The guard vars are per card-family, not global. As of M24 the
+   registered ones are `COPPERCLAW_X2_GENERATE`,
+   `COPPERCLAW_XR1_GENERATE`, `COPPERCLAW_XR2_GENERATE`,
+   `COPPERCLAW_XR3_GENERATE`, `COPPERCLAW_CX_GENERATE`,
+   `COPPERCLAW_M21F2_GENERATE`, `COPPERCLAW_M21X1_GENERATE`,
+   `COPPERCLAW_M21X2_GENERATE`, `COPPERCLAW_M21X3_GENERATE`,
+   `COPPERCLAW_M22W0_GENERATE`, and `COPPERCLAW_M23W3_GENERATE` —
+   grep `_GENERATE` in `tests/replay.rs` for the current list and
+   which tests each one gates. When registering a new fixture's test,
+   add the same guard shape so its streams can be regenerated after
+   intentional pipeline changes.
+4. **Stabilise.** Add `substitutions` to `manifest.json` for any field
+   that varies between runs (timestamps, generated ids). Never
+   substitute a field the fixture is asserting on.
+5. **Review the generated streams.** The dump is captured output, not
+   an oracle — read the JSONL and confirm it shows the behaviour the
+   fixture exists to pin before committing it as expected.
+6. **Bisect to minimum.** Drop steps until the behaviour still
    reproduces. Smaller fixtures fail faster and survive refactors.
-5. **Commit.** Land in `fixtures/<channel>/<scenario>/` with a
+7. **Commit.** Land in `fixtures/<channel>/<scenario>/` with a
    one-paragraph README explaining what the fixture asserts and
    what bug (if any) it captured. CI re-plays every fixture on
    every PR.
@@ -261,10 +294,11 @@ replay suite:
 - One fixture per behaviour, not per platform. A telegram fixture
   that asserts "long-poll resume after restart" and a separate one
   for "webhook with media" both pull their weight.
-- Fixtures are **not** mocks — they are captured reality plus a
-  redaction pass. Hand-authored fixtures are allowed only when no
-  real recording is available (typically for error paths, e.g. a
-  429 with a specific `Retry-After`).
+- Fixtures are hand-authored today, but they should mirror captured
+  reality: base payload shapes on real platform payloads (redacted by
+  hand) wherever a recording exists, and reserve invented shapes for
+  paths reality can't produce on demand (typically error paths, e.g.
+  a 429 with a specific `Retry-After`).
 - The Claude stub is allowed to be hand-authored. The container's
   Claude calls are not platform-level reality; they are responses
   to whatever the fixture sets up, and tightly-controlled stubs are

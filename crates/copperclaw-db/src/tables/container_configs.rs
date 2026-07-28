@@ -181,9 +181,11 @@ pub struct ContainerConfig {
     /// This is the host-side FUEL for the runner's layered `ToolPolicy`
     /// (`copperclaw-runner::policy`): the runner-config assembler writes
     /// it into `runner.json`, the runner parses it into the positive
-    /// allow-list ceiling for every tool dispatch (beneath the host-owned
-    /// `DISALLOWED_TOOLS` floor). A `messaging`-profile group has shell /
-    /// file-mutation / self-mod tools denied at the runner.
+    /// allow-list ceiling for every tool dispatch — the profiles are the
+    /// enforcement mechanism (the old host-owned deny-list floor was
+    /// removed in M18 R0; see the `copperclaw-runner::policy` module
+    /// docs). A `messaging`-profile group has shell / file-mutation /
+    /// self-mod tools denied at the runner.
     ///
     /// Runner-config-only (mirrors `surface_thinking`): changing it
     /// rewrites `runner.json` but not the image, so it stays OUTSIDE

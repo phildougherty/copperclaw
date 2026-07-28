@@ -75,7 +75,9 @@ pub(crate) struct RunnerConfigForFile {
     /// `coding` / `full`). The FUEL for the runner's layered `ToolPolicy`:
     /// plumbed in from `container_configs.tool_profile`, parsed by the
     /// runner into the positive allow-list ceiling enforced at every tool
-    /// dispatch (beneath the host-owned `DISALLOWED_TOOLS` floor). Skipped
+    /// dispatch — the profiles are the enforcement mechanism (the old
+    /// host-owned deny-list floor was removed in M18 R0; see the
+    /// `copperclaw-runner::policy` module docs). Skipped
     /// when None / unset so an unconfigured group's `runner.json` shape
     /// stays bit-identical to the pre-fuel shape — the runner then falls
     /// back to its permissive `full` default, preserving the historical
