@@ -33,7 +33,7 @@ cheaper, and skips the parsing.
   `*.rs` and `crates/**/*.rs` work without surprises.
 - `path` (optional). Search root. Defaults to the runner's
   cwd. Absolute paths produce absolute results; relative roots
-  produce workspace-relative results.
+  produce results relative to the search root.
 - `max_results` (optional). Hard ceiling 10000. Above that the
   agent should narrow the pattern.
 - `no_ignore` (optional). Bypass `.gitignore` / `.ignore`. The
@@ -52,13 +52,14 @@ cheaper, and skips the parsing.
 
 - `paths` is sorted ascending.
 - `truncated: true` means more files matched than the cap allowed.
-  `total_matched` reports how many we counted before stopping.
+  `total_matched` reports the full match count regardless.
 
 ## When to prefer other tools
 
-- **Searching file contents**: use `grep`. `glob` does NOT open
-  any file; it only matches names.
-- **Reading a single known path**: use `read_file` directly.
+- **Searching file contents**: use `grep` (see [[grep]]). `glob`
+  does NOT open any file; it only matches names.
+- **Reading a single known path**: use `read_file` directly
+  (see [[read-file]]).
 - **Listing only the immediate directory** (`ls`): use
   `shell { command: "ls" }` — `glob` is recursive by design and
   there's no flag to disable that.

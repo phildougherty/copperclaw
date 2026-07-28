@@ -26,16 +26,24 @@ grouped roughly:
 - **Messaging core** — `send_message`, `send_file`, `edit_message`,
   `add_reaction`.
 - **Interactive UI** — `ask_user_question`, `send_card`.
-- **Agent lifecycle** — `create_agent`.
-- **Self-modification (gated)** — `install_packages`, `add_mcp_server`.
+- **Agent lifecycle** — `create_agent`, `delegate`, `delegate_batch`.
+- **Self-modification** — `install_packages`, `add_mcp_server`.
 - **Scheduling** — `schedule_task`, `list_tasks`, `cancel_task`,
-  `pause_task`, `resume_task`, `update_task`.
+  `pause_task`, `resume_task`, `update_task`; plus goal-tracking and
+  condition-wake tools (create/list/update goals, register conditions,
+  set condition flags).
 - **Computer use** — `shell`, `read_file`, `write_file`, `edit_file`,
-  `web_fetch`, `artifact_path`.
-- **Code navigation** — `grep`, `glob`, `git_status`, `git_diff`,
-  `git_log`, `git_blame`.
-- **Research** — `web_search`, `explore` (read-only subagent).
-- **Skill catalogue** — `load_skill`.
+  `multi_edit`, `apply_patch`, `copy_file`, `web_fetch`,
+  `artifact_path`.
+- **Code navigation** — `grep`, `glob`, `find_symbol`, `git_status`,
+  `git_diff`, `git_log`, `git_blame`.
+- **Research** — `web_search`, `explore` (read-only subagent),
+  `browser_render`.
+- **UI verification / diagnostics** — `ui_screenshot`, `ui_inspect`,
+  `diagnostics`, `self_review`, `view_image`.
+- **Group memory** — `memory_search`, `memory_get`, `memory_save`.
+- **Skill catalogue** — `load_skill`, `save_skill`, and a read-only
+  lister of this group's saved skills.
 - **Planning scratchpad** — `todo_add`, `todo_list`, `todo_update`,
   `todo_delete`.
 - **Session control** — `compact_now`, `clear_history`.

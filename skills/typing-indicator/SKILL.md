@@ -51,8 +51,9 @@ The throttle is in-memory on the host and resets on host restart.
 
 ## What each adapter does
 
-- **Slack**: calls `chat.startTyping` (the post-2024 SCIM-aware
-  variant) on the destination channel.
+- **Slack**: calls `assistant.threads.setStatus`, which only renders
+  on assistant-thread surfaces (a thread in the bot's own DM);
+  everywhere else the adapter skips the call as a silent no-op.
 - **Telegram**: calls `sendChatAction(action="typing")`.
 - **Discord**: calls `POST /channels/{id}/typing`.
 - **CLI**: silent no-op; the indicator would not be visible on stdio.
@@ -85,4 +86,6 @@ because:
   without an agent decision.
 
 The right pattern is: do your work normally; the host signals
-typing on your behalf.
+typing on your behalf. For long-running work where a typing hint is
+not enough, send an explicit status message or card — see
+[[native-ui]].

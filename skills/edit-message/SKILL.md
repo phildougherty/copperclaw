@@ -46,15 +46,12 @@ Not every channel can edit a delivered message. Behaviour by channel:
 - Slack: supports `chat.update` indefinitely on most channel types.
 - Discord: supports `PATCH /channels/{id}/messages/{id}` indefinitely
   on the author's own messages.
-- CLI / stdio: prints the new text as a fresh line (best-effort
-  fallback; the original is not retroactively rewritten).
-- Webhook-only channels: typically unsupported, returns
-  `AdapterError::Unsupported`.
+- CLI / webhook-only channels: no native edit API.
 
-When the channel cannot edit, the tool ack still succeeds (the row is
-written) but the delivery loop surfaces an `Unsupported` failure that
-gets retried until `MAX_DELIVERY_ATTEMPTS`. Treat persistent edit
-failures as "channel does not support this" and stop retrying.
+When the channel cannot edit, nothing fails: the delivery loop falls
+back to posting a fresh chat line `(edit) <new text>` and marks the
+row delivered. The original message is not rewritten. You do not need
+to detect or retry anything.
 
 ## Edge cases
 
@@ -65,13 +62,17 @@ failures as "channel does not support this" and stop retrying.
   as `BadRequest`.
 - **Edit removed by moderation.** Same path. Do not panic; surface a
   user-facing apology via `send_message` if relevant.
-- **You did not actually send the original.** The seq does not belong
-  to this session. The tool will write the row but the host's
-  delivery loop will fail to locate the original; the request is
-  dropped.
+- **You did not actually send the original.** No outbound row with that
+  seq exists (or it was never delivered), so the delivery loop cannot
+  locate a platform message id; it falls back to posting the text as a
+  fresh `(edit) …` chat line.
 
 ## Example
 
 ```json
 { "message_id": 13, "text": "Update: build is green now." }
 ```
+
+Prefer editing over posting a fresh status message when updating
+something you already said — see [[native-ui]]. For reacting instead of
+rewriting, see [[add-reaction]].

@@ -6,6 +6,69 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M23 — software-architect capability, wave 1)
+
+- **`skills/architecture` (new).** System-level design discipline for
+  multi-component builds: requirements before structure, contracts at the
+  seams, single-owner data, data-model-first, recording irreversible choices
+  in `.copperclaw/DECISIONS.md` at decision time, right-sizing with an
+  explicit upgrade path, and a pre-build premortem. Routed from the
+  callable-skill index in `container_manager/prompt.rs` ("designing a
+  multi-component system") and cross-linked from `coding-task`/`web-backend`.
+- **`skills/databases` (new).** Verified in-container run-books for real
+  database servers under session-container constraints (uid 1000, no
+  systemd, no passwd entry, only `/data` writable/persistent): Postgres via
+  `libnss-wrapper` + `initdb`/`pg_ctl` with socket + datadir under `/data`;
+  MariaDB with `--socket`/`--pid-file` under `/data` (default `/run/mysqld`
+  is a silent post-startup death); Redis daemonized with a `/data` dir;
+  MongoDB via the official Debian tarball (not in Debian repos). Teaches
+  the bake-at-next-spawn `install_packages` flow and the
+  daemons-die-at-idle-stop / `/data`-survives restart pattern
+  (`/data/start-dbs.sh`). Each run-book was exercised end-to-end in a
+  `debian:trixie-slim` container as uid 1000 before being written down.
+- **Coding bundle grew to six skills.** `CODING_SKILL_NAMES`
+  (`container_manager/spawn.rs`) now includes `architecture` and
+  `databases`, so both stay behind the per-group `coding_enabled` cap like
+  the rest of the bundle; `cclaw groups enable-coding` help text and
+  `container_configs` docs updated.
+- **M23 program plan** at `docs/plans/m23-software-architect-program.md` —
+  wave 1 (this change) plus the next waves: baking `libnss-wrapper`/a
+  backend profile into the image, a runner cold-boot service-restart hook,
+  egress presets for Mongo tarballs, verify-gate DB health inference, a
+  design-review critic, and a database replay fixture.
+
+### Changed (M23 — skill review sweep)
+
+- **All 42 pre-existing skills reviewed against the MCP tool
+  implementations** (four parallel disjoint scopes); factual drift fixed,
+  when-to-use guidance and `[[skill]]` cross-links tightened. Notable
+  corrections: `read-file` claimed a 1 MiB cap and a result shape that no
+  longer exists (actual: 128 KiB cap, `offset`/`limit`/`mode` paging);
+  `web-fetch` claimed a 256 KiB body cap and a `headers` result map
+  (actual: 16 KiB, no headers); `approvals` still described
+  `install_packages`/`add_mcp_server` as approval-gated (both apply
+  directly at delivery now) and denied the existence of `cclaw approvals
+  approve-id/deny/revoke`; `destinations` described the live named-
+  destinations table as "planned"; `ask-user-question` claimed no
+  expiry (actual: 24 h TTL swept to `status = "expired"`);
+  `typing-indicator` cited a nonexistent Slack `chat.startTyping` API
+  (actual: `assistant.threads.setStatus`); `schedule-task` invented a
+  once-per-minute cron cap and omitted the approval-gated `grant`
+  argument; `edit-message`/`add-reaction` documented retry-until-failure
+  where the delivery loop actually falls back to a fresh `(edit)`/
+  `(reaction:)` line; `create-agent` referenced a nonexistent
+  `cclaw groups update --system-prompt` flag; `customize` had the wrong
+  behavior-file name (it is `COPPERCLAW.md`); `explore` claimed a
+  `cli_scope` gate the subagent path never consults;
+  `write-file`/`edit-file` now route middle-of-file edits at
+  `edit_file`/`multi_edit`/`apply_patch` instead of `sed -i`;
+  `discovering-tools` caught up with the registry's growth
+  (`delegate`, `multi_edit`, `find_symbol`, `memory_*`, UI-verification
+  tools). `coding-task`, `web-backend`, `install-packages`, and `shell`
+  cross-link the new `architecture`/`databases` skills (`shell` also
+  documents the background-daemon lifecycle); `coding-task` trimmed back
+  under the 8 KiB skill-body cap.
+
 ### Added (M22 — Claude Code-style transcript UI across channels)
 
 - **Live tool-step transcript in the Task HUD.** The HUD now accumulates the

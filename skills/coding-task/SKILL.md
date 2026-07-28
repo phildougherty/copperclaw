@@ -13,9 +13,8 @@ ships `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`, `jq`,
 
 Need a toolchain in neither (Go, Rust, a JVM)? Don't call
 `install_packages` and wait — it only rebuilds the image for a *future*
-session. Download into `/data` instead (Go: `curl -fsSL <tarball-url> |
-tar -C /data -xz`, then `export PATH=/data/go/bin:$PATH`) — no root, no
-apt. See [[install-packages]].
+session. Untar the official build into `/data` and extend `PATH` — no
+root, no apt. See [[install-packages]].
 
 ## Every project is a git repo (do this first)
 
@@ -43,6 +42,10 @@ Refine the inferred `.copperclaw/verify` — you own it after attach.
 
 ## Decompose before you build
 
+Multiple moving pieces (frontend + API + DB, services)? Run
+[[architecture]] first — requirements, seams, data model, DECISIONS.md
+— then decompose files inside those components.
+
 Name the modules/files and each one's single responsibility BEFORE
 writing code — "build X" as the whole plan becomes a god-file nobody
 can safely edit in parallel.
@@ -69,12 +72,10 @@ can safely edit in parallel.
    hashing) — don't hand-roll bcrypt.
 3. **Hand-rolled last**, only for glue logic specific to this app.
 
-Probe before depending on an image tool (`command -v eslint`) — an
-absent tool just fails cold.
-
 - **Databases & APIs:** load [[web-backend]] when an app needs a server,
   API, or persistence — datastore choice (not always SQLite), endpoint
-  design, layout. Inline rule: a `/data` SQLite DB uses
+  design, layout; [[databases]] runs a real DB server in-container.
+  Inline rule: a `/data` SQLite DB uses
   `journal_mode = DELETE`, never WAL (a killed WAL corrupts).
 
 ## Robustness: handle what a user can actually hit
@@ -93,7 +94,7 @@ prototype:
 
 Out of scope: a null only your call sites pass, a format you control.
 
-## Verify before you claim done — `.copperclaw/verify` and the gate (NOT OPTIONAL)
+## Verify before you claim done — `.copperclaw/verify` (NOT OPTIONAL)
 
 "Production-ready" / "complete" / "working" are claims about evidence,
 not vibes. Run it — `python3 x.py` (exit 0), `node x.js` + `curl` for a
@@ -131,10 +132,8 @@ there is genuinely no UI to look at:
 
 1. After the first visual milestone, `ui_screenshot` the running app.
 2. **Look** at the image — don't just note the call succeeded.
-3. `load_skill("frontend-design")` and run its `## Critique checklist`
-   against what you see.
-4. Fix the worst two things the checklist surfaces.
-5. `ui_screenshot` again to confirm the fix landed.
+3. `load_skill("frontend-design")`, run its `## Critique checklist`.
+4. Fix the worst two findings, then `ui_screenshot` to confirm.
 
 One full cycle before the delivery todo. See [[web-app-scaffold]].
 
@@ -144,13 +143,13 @@ Files under `/data/` are invisible to the operator unless you do one
 of these — pick one per artifact: **`send_file`** (small files),
 **`artifact_path`** (host `/data` path, paste verbatim; many-file
 projects), or a live preview link (`expose_preview`, send
-the URL verbatim — see [[preview]]). Without one, `/data` is the
-*container*'s path, not theirs — you've delivered nothing usable.
+the URL verbatim — see [[preview]]). Without one, you've delivered
+nothing usable — `/data` is the *container*'s path, not theirs.
 
 **End every build with the "prototype ready" close.** Last todo: ONE
 `send_card` — title, one-line summary, a "What to try" bullet, an
-**Open preview** `url` button (exact `expose_preview` URL, only if the
-app serves HTTP), a **Download** button (`value: "download"` — ships
+**Open preview** `url` button (exact `expose_preview` URL, HTTP apps
+only), a **Download** button (`value: "download"` — ships
 the `git archive` zip via `send_file` next turn), `artifact_path` in a
 footer field, and the screenshot via its own `send_file`. Degrades by
 capability — no preview → no button, never a dead link. Full card:
@@ -158,28 +157,26 @@ capability — no preview → no button, never a dead link. Full card:
 
 ## Don't fabricate
 
-If `web_search` got 12 results, say "12 results" — never invent numbers
-you didn't compute.
-
-**Code fabrication is the same sin, worse.** Concrete rules:
+If `web_search` got 12 results, say "12 results" — never invent
+numbers. **Code fabrication is the same sin, worse:**
 
 1. **Never mark a todo `completed` for code you didn't write** —
    confirm with `git_status` / `glob` / `read_file` first; if not
    there, stay `in_progress` and say so.
 2. **Never document code that doesn't exist yet.** Build it first.
-3. **Never write a `docker-compose.yml` / `Makefile`** referencing a
-   directory that doesn't exist — vapor fails on a fresh checkout.
+3. **Never reference a directory that doesn't exist** in a compose
+   file / Makefile — vapor fails on a fresh checkout.
 4. **"Done" means the artifact is on disk and passes `ls`**, and any
    claimed commit shows up in `git log`.
 
 ## Knowing when to stop
 
-- Match the change to what was asked. No drive-by refactors.
-- Don't half-finish. If you can't complete in one pass, stop and
-  say what's left.
+Match the change to what was asked — no drive-by refactors. Don't
+half-finish: if you can't complete in one pass, stop and say what's
+left.
 
 ## Related skills
 
-- [[git-commit]], [[code-review]], [[testing]], [[todo-tracker]],
-  [[agent-memory]], [[install-packages]], [[frontend-design]],
-  [[web-app-scaffold]]
+- [[architecture]], [[git-commit]], [[code-review]], [[testing]],
+  [[todo-tracker]], [[agent-memory]], [[install-packages]],
+  [[frontend-design]], [[web-app-scaffold]], [[databases]]

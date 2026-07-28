@@ -54,10 +54,8 @@ context with the file contents).
 Don't widen the allowlist without a concrete reason. Adding `shell` or
 `write_file` is a footgun: destructive changes you can't audit because
 the subagent's work is invisible. If you need writes, have the subagent
-return data and write it yourself.
-
-The host's `cli_scope` can refuse to widen the allowlist entirely — if
-scope is `disabled`, only the read-only defaults pass through.
+return data and write it yourself — or spawn a full sibling via
+`create_agent` (see [[create-agent]]) when the work is substantive.
 
 ## Bounds the host enforces (you can't override)
 

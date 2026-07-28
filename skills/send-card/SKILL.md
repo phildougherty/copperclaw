@@ -1,14 +1,14 @@
 ---
 name: send-card
-description: Emit a portable structured Card — rendered natively on Telegram (inline_keyboard), Slack (Block Kit), and Discord (embeds + components), with formatted-text fallback on every other channel.
+description: Emit a portable structured Card — rendered natively on Telegram (inline_keyboard), Slack (Block Kit), Discord (embeds + components), Google Chat (cards v2), and other card-capable adapters, with formatted-text fallback everywhere else.
 ---
 
 # send-card
 
 `send_card` emits ONE portable Card. The host renders it natively where
-the adapter supports it (Telegram, Slack, Discord today) and falls back
-to deterministic formatted text elsewhere — the same card works on every
-channel.
+the adapter supports it (Telegram, Slack, Discord, Google Chat, Matrix,
+and other card-capable adapters) and falls back to deterministic
+formatted text elsewhere — the same card works on every channel.
 
 ## Schema
 
@@ -44,7 +44,8 @@ The validator names the offending field.
 | Telegram | Native: MarkdownV2 + `inline_keyboard`. `image_url` rides as `sendPhoto` caption. |
 | Slack | Native Block Kit: `header` / `section` / `image` / `actions`. `value` buttons honour `style: primary | danger`. |
 | Discord | Native embed + `ActionRow`s of `Button`s (chunked at 5/row). `value` styles map primary→1, success→3, danger→4, else→2; URL→5. |
-| All others | Text fallback: bold title, body, `Label: value` rows, then `[Label] -> callback:value` / `-> url` lines. |
+| Other card-capable adapters (gchat, matrix, ...) | Native via each adapter's own card renderer. |
+| Everything else | Text fallback: bold title, body, `Label: value` rows, then `[Label] -> callback:value` / `-> url` lines. |
 
 On Telegram, Slack, and Discord, `value` buttons round-trip taps back as
 inbound chat (see Callback flow). `url` buttons always open the link.
@@ -137,6 +138,8 @@ valid close; a card with a dead link is not.
   comparisons), sticky actions a user might tap repeatedly.
 - `send_message`: conversational prose. A card with no buttons/fields
   is usually a `send_message` in disguise.
+
+The full shape-picking decision tree is in [[native-ui]].
 
 ## Anti-patterns
 

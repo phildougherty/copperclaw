@@ -46,15 +46,17 @@ items; the chip is the user's window into your plan.
    `todo_update({"id": N, "status": "in_progress"})`. Only one item
    should be `in_progress` at a time.
 3. **When you finish an item:** flip it to `completed` AND pass an
-   `evidence` field naming the specific files / commands / outputs
-   that prove the work is done:
+   `evidence` field (at least 40 characters) naming the specific files
+   you wrote AND the verification step that actually ran:
    `todo_update({"id": N, "status": "completed", "evidence":
    "wrote backend/server.rs (148 lines) + ran cargo test (all pass)"})`.
    Generic phrases like `"done"` / `"finished"` / `"all set"` are
-   **rejected** by the tool — it's an anti-fabrication guard. If you
-   can't cite concrete evidence, don't mark it completed; leave it
-   `in_progress` and either finish the work or say what blocked you.
-   Don't batch completions — flip each as soon as that step is done.
+   **rejected** by the tool, and for build / implement / verify items
+   pure delivery claims ("wrote 5 files") are too — it's an
+   anti-fabrication guard. If you can't cite a check that ran, don't
+   mark it completed; leave it `in_progress` and either finish the work
+   or say what blocked you. Don't batch completions — flip each as soon
+   as that step is done.
 4. **If a step turned out unnecessary:** `todo_delete({"id": N})`.
    Don't leave dead items behind to clutter the list.
 
@@ -66,13 +68,16 @@ Each entry looks like:
 {
   "id": 3,
   "text": "Reply with order status",
-  "status": "pending",          // or "in_progress" / "completed"
+  "status": "pending",          // or "in_progress" / "completed" / "blocked"
   "created_at": "2026-05-22T14:08:01.103Z",
   "updated_at": "2026-05-22T14:08:01.103Z"
 }
 ```
 
-Ids are monotonic but sparse (deleted ids are not reused).
+Ids are monotonic but sparse (deleted ids are not reused). `blocked`
+is set only by the host's verification gate (a project that stayed
+dirty through the fix-cycle cap) — you cannot set it yourself; a
+`blocked_reason` carries the failure tail.
 
 ## Common pitfalls
 

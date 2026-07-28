@@ -9,11 +9,18 @@ A persistent, file-based memory built up across conversations. Lives
 under `/data/memory/` inside your container, bind-mounted per agent
 group — every session of this group reads and writes the same files.
 Use the existing `read_file` and `write_file` tools; no special tool
-required.
+required for the file side.
 
-If `/data/memory/` does not exist when you reach for it, the operator
-has not configured `groups_dir`. Behave as a stateless agent and don't
-fabricate continuity.
+If `/data/memory/UNAVAILABLE.md` exists, the per-group mount could not
+be configured for this session (the marker says why) — anything you
+write under `/data/memory/` will NOT persist to other sessions. Behave
+as a stateless agent and don't fabricate continuity.
+
+A separate, searchable memory store also exists: `memory_save` writes
+a keyed fact into the group's memory DB, and `memory_search` /
+`memory_get` retrieve it with provenance tags. Prefer the DB tools for
+discrete facts you'll want to search for later; use the files below
+for narrative notes you'll re-read whole.
 
 ## Types of memory
 
@@ -36,6 +43,8 @@ One file per entry, categorised by frontmatter `type`:
   patterns, file paths, git history — read the source).
 - Ephemeral state ("currently working on X") — that's [[todo-tracker]],
   scoped to one session.
+- Repeatable multi-step procedures — that's [[save-skill]] (a durable
+  playbook), not a memory fact.
 - Conversation transcripts — the runner already persists chat history.
 
 These hold even when the user says "remember this." If what they're

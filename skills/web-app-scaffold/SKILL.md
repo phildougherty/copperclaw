@@ -69,8 +69,8 @@ npm run dev &                      # or vite --port <n>
 Then run `ui_screenshot` against `http://127.0.0.1:<port>` (loopback only —
 that's the point) before calling any visual milestone done. Load
 `load_skill("frontend-design")` for the critique checklist to run against
-what you see — that skill (landing separately) is the depth reference for
-*what* to fix; this skill only teaches *when* to look. Screenshot again after
+what you see — [[frontend-design]] is the depth reference for *what* to
+fix; this skill only teaches *when* to look. Screenshot again after
 fixing the worst offenders. Ship the final screenshot alongside the
 prototype-ready card with `send_file` per [[coding-task]]'s delivery ritual.
 

@@ -107,5 +107,7 @@ expansion.
 
 ## Related skills
 
+- [[git]] — the read-only `git_status` / `git_log` / `git_diff` /
+  `git_blame` tools this discipline builds on.
 - [[coding-task]] — what to do *before* the commit (tests, lint).
 - [[code-review]] — checking a diff before deciding it's ready to ship.

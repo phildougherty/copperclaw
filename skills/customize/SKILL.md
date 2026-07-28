@@ -45,8 +45,10 @@ Use `ask_user_question` if the channel renders buttons; plain
 
 ### Tools
 
-- **Package**: call `install_packages`. Explain the package lands
-  after the next container rebuild.
+- **Package**: call `install_packages`. With `scope: "session"`,
+  pip/npm packages install into `/data` NOW and work this turn (apt
+  still waits for the rebuild); the default `scope: "image"` bakes
+  everything at the next container rebuild.
 - **MCP server**: call `add_mcp_server`. If the server needs a
   binary, install the package first.
 - Show what's already configured first: read `/data/runner.json` if
@@ -55,19 +57,19 @@ Use `ask_user_question` if the channel renders buttons; plain
 
 ### Behavior
 
-1. Read `/data/group/CLAUDE.md` if present (the conventional
-   container path); if absent, tell the user the group has no
-   override yet.
+1. Read `/data/COPPERCLAW.md` if present (the operator briefing the
+   host prepends to your system prompt); if absent, tell the user the
+   group has no override yet.
 2. Propose the edit verbatim; ask the operator to confirm.
 3. On confirmation, instruct:
 
    ```
-   $EDITOR <data_dir>/groups/<folder>/CLAUDE.md
+   $EDITOR <groups_dir>/<agent_group_id>/COPPERCLAW.md
    cclaw groups restart <agent_group_id>
    ```
 
-   Do **not** `write_file` blindly into `/data/group/...` — behavior
-   changes should be auditable on the host.
+   Do **not** `write_file` the briefing yourself — behavior changes
+   should be auditable on the host.
 
 ### Budgets
 
@@ -105,5 +107,8 @@ Or `copperclaw stop && copperclaw start` for a full host bounce.
   (Anthropic, OpenRouter, Ollama have different catalogues).
 - Request changes needing root inside the container unless the
   operator said they're running as root.
-- Bundle multiple changes into one approval — one `install_packages`
-  per logical step so the operator can accept/reject each cleanly.
+- Bundle multiple changes into one call — one `install_packages`
+  per logical step so the operator can audit (and undo) each cleanly.
+
+See [[install-packages]] and [[add-mcp-server]] for the full tool
+semantics.

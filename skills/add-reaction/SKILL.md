@@ -6,8 +6,10 @@ description: React to a previously sent message with add_reaction, including per
 # add-reaction
 
 `add_reaction` attaches an emoji reaction to a message you have already
-sent. Like `edit_message`, it identifies the target by outbound `seq`,
-not by platform id.
+sent. Like `edit_message` (see [[edit-message]]), it identifies the
+target by outbound `seq`, not by platform id — it only works on your
+own messages. To acknowledge someone else's message, use a short
+`send_message` instead.
 
 ## Schema
 
@@ -25,10 +27,9 @@ not by platform id.
 The tool layer does not validate the emoji content — the channel
 adapter does. Each platform expects a different format:
 
-- **Slack**: short name with no colons, e.g. `"thumbsup"`,
-  `"heavy_check_mark"`. The adapter calls `reactions.add` with this
-  value verbatim. Custom workspace emoji are valid (`":my-custom:"`
-  in Slack speak becomes `"my-custom"` here).
+- **Slack**: short name, e.g. `"thumbsup"`, `"heavy_check_mark"`. The
+  adapter calls `reactions.add`, stripping any surrounding colons for
+  you. Custom workspace emoji names are valid.
 - **Telegram**: a single Unicode emoji character, e.g. `"\u{1f44d}"`
   (the actual character, not the codepoint string). Telegram restricts
   bots to a small list of recognised reactions; unknown emoji bounce
@@ -36,11 +37,9 @@ adapter does. Each platform expects a different format:
 - **Discord**: a Unicode emoji character or a custom-emoji reference of
   the form `"name:id"`. The adapter URL-encodes before calling the
   REST endpoint.
-- **CLI / stdio**: emitted as a line `reacted: <emoji>` next to the
-  original (best-effort cosmetic; the line in the transcript is not
-  retroactively changed).
-- Channels that do not support reactions return
-  `AdapterError::Unsupported` at delivery time.
+- Channels without a reaction API (CLI, webhook-only, …) do not fail:
+  the host falls back to posting a fresh chat line
+  `(reaction: <emoji>)` next to the original.
 
 When in doubt, use the short Unicode form (`"\u{1f44d}"`). Adapters
 that need a shortcode normalise both directions.
@@ -77,3 +76,6 @@ Or on Telegram (Unicode form):
 ```json
 { "message_id": 5, "emoji": "\u{2705}" }
 ```
+
+For choosing between a reaction, an edit, and a fresh message, see
+[[native-ui]].

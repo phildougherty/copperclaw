@@ -11,6 +11,10 @@ the current one. The new agent has its own session, its own
 shares the calling agent's group config (skills, MCP servers, packages)
 unless an admin moves it to a different group later.
 
+Use it for substantive parallel work or independent research. For a
+quick read-only lookup that shares your live workspace in-process,
+prefer `explore` (see [[explore]]) — no container spawn, no merge-back.
+
 ## Workspace the sibling sees
 
 A sibling boots with its own empty `/data`. To let it work on *your* code,
@@ -100,8 +104,9 @@ byte-identical to calling `delegate_batch` without them.
 
 The text becomes the new agent's persistent system prompt. Describe
 the persona, the scope / constraints, and what tools and channels it
-owns. Admins can rewrite later via `cclaw groups update <id>
---system-prompt '<text>'`.
+owns. Admins can adjust behavior later by editing the group's
+`COPPERCLAW.md` briefing at `<groups_dir>/<agent-group-id>/` (picked
+up at the next spawn).
 
 ## Channel routing
 

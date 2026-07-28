@@ -18,8 +18,9 @@ either *retryable* (transient) or *non-retryable* (request is broken).
   blank `to.id`, missing required field. Fix the call.
 - `Context(String)` — host could not service it (DB write failed,
   scheduler unreachable). **Sometimes retryable** after a brief pause.
-- `Internal(String)` — tool panicked. **Not retryable.** Surface to
-  user; do not loop.
+- `Internal(String)` — unexpected internal failure (a bug, or an
+  upstream error such as a failed HTTP request inside `web_fetch`).
+  **Not retryable verbatim.** Surface to user; do not loop.
 
 Validation errors arrive on the tool-result content with `is_error =
 true` and a message. Read it, adjust, do not re-issue verbatim.
@@ -72,8 +73,9 @@ For tool-result `is_error = true`:
 
 Delivery failures are mostly invisible to the agent. The host records
 `delivered.status` rows; admins inspect via `cclaw dropped-messages
-list`. If a critical send is gating your workflow (e.g. an
-`ask_user_question`), schedule a follow-up with `schedule_task`.
+outbound-list`. If a critical send is gating your workflow (e.g. an
+`ask_user_question`), schedule a follow-up with `schedule_task` (see
+[[schedule-task]]).
 
 ## Idempotency
 

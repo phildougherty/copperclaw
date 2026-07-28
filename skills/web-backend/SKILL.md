@@ -23,14 +23,17 @@ Choose by the shape of the data and who writes it, then commit:
   `SQLITE_IOERR_SHORT_READ`. Keep the file under `/data/<project>/data/`.
 - **Postgres** — reach for it when the app has concurrent writers, real
   relational integrity, multiple clients, or is meant to look production-shaped.
-  Run it as a service the app connects to over `DATABASE_URL`. If the image has
-  no `psql`/server, say so and either bake it (`install_packages`) or fall back
-  to SQLite with a note — don't silently hand-roll a fake.
+  Run it as a service the app connects to over `DATABASE_URL`. [[databases]]
+  has the verified in-container run-book (bake via `install_packages`, run as
+  non-root with data under `/data`) — same for MariaDB/MySQL and Mongo. If the
+  server isn't baked yet and you can't wait a session, fall back to SQLite
+  with a note — don't silently hand-roll a fake.
 - **A JSON/flat file** — fine only for tiny, single-writer config/state. If you
   find yourself writing query/filter logic by hand over a JSON blob, you needed
   a database; stop and use one.
 - **Redis / a KV store** — only for cache/session/ephemeral data, alongside a
-  real DB, never as the system of record for a prototype.
+  real DB, never as the system of record for a prototype. Run-book in
+  [[databases]].
 
 Rules that hold for every choice:
 
@@ -117,6 +120,8 @@ you claim it does. See [[testing]] for reading a failing stage's tail.
 
 ## Related skills
 
-[[web-app-scaffold]] (the frontend half this pairs with), [[coding-task]] (the
-verify gate + delivery ritual), [[testing]] (verify output), [[preview]]
-(serving the running stack), [[debug]] (chasing a 500 to its cause).
+[[web-app-scaffold]] (the frontend half this pairs with), [[databases]]
+(running a real DB server in-container), [[architecture]] (the system-level
+design pass that precedes this), [[coding-task]] (the verify gate + delivery
+ritual), [[testing]] (verify output), [[preview]] (serving the running
+stack), [[debug]] (chasing a 500 to its cause).

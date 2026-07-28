@@ -238,7 +238,7 @@ impl ContainerManager {
         });
         // The coding-skills cap. When the per-group `coding_enabled`
         // flag is false (the default) AND the selector is the catch-all
-        // `All`, the four coding bundle skills are filtered from the
+        // `All`, the coding bundle skills are filtered from the
         // resolved set. Explicit selector lists are honoured as-is —
         // an operator who listed a coding skill by name picked it
         // deliberately. New groups (`cc == None`) get the same default
@@ -1305,7 +1305,7 @@ mod tests {
         );
     }
 
-    /// Helper: build a `ContainerConfig` populated with the four coding
+    /// Helper: build a `ContainerConfig` populated with the coding
     /// skill names available, the `coding_enabled` flag set as requested,
     /// and an otherwise-default shape. Used by the three filter tests below.
     fn cc_with_coding_flag(
@@ -1341,7 +1341,7 @@ mod tests {
         }
     }
 
-    /// Writes the four coding-bundle skill stubs plus one non-coding
+    /// Writes the coding-bundle skill stubs plus one non-coding
     /// `alpha` skill into `<root>` so the registry sees them.
     fn write_coding_bundle_plus_alpha(skills_root: &std::path::Path) {
         std::fs::create_dir_all(skills_root).unwrap();

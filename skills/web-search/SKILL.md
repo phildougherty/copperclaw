@@ -18,7 +18,7 @@ semantic search even though Tavily is the default).
 ```json
 {
   "query": "string, non-empty",
-  "max_results": "integer (optional, 1-25, default 10)",
+  "max_results": "integer (optional, 1-25, default 5)",
   "provider": "string (optional - tavily | exa | brave | serpapi)",
   "search_type": "string (optional - provider-specific hint)"
 }
@@ -26,7 +26,7 @@ semantic search even though Tavily is the default).
 
 - `query` (required). Phrasing matters less for neural providers
   (Exa), more for keyword providers (Brave).
-- `max_results` (optional). Capped at 25; default 10.
+- `max_results` (optional). Capped at 25; default 5.
 - `provider` (optional). Validation error when the chosen provider's
   API key isn't set in the container env.
 - `search_type` (optional). Provider-specific hint, ignored when not
@@ -59,7 +59,7 @@ Every provider's response is normalised:
 }
 ```
 
-Snippets are capped at 4 KiB per result with a trailing `…` so a
+Snippets are capped at 400 bytes per result with a trailing `…` so a
 verbose provider can't blow your context window. `score` is
 provider-specific and omitted when the backend doesn't expose one
 (Brave omits entirely; SerpAPI derives `1/position`).
@@ -100,7 +100,7 @@ unset, default order is `tavily, exa, brave, serpapi`.
 
 ## Pair with `web_fetch`
 
-Two calls per question:
+See [[web-fetch]] for the fetch half. Two calls per question:
 
 1. `web_search { "query": "..." }` — get a candidate URL.
 2. `web_fetch { "url": "..." }` — read the page.

@@ -146,9 +146,10 @@ pub struct ContainerConfig {
     /// Per-group resource caps forwarded to the container runtime.  The
     /// recognised JSON keys are `"cpus"`, `"memory_mb"`, `"pids_limit"`.
     pub resource_limits: serde_json::Value,
-    /// When false (the default), the four coding-bundle skills
-    /// (`coding-task`, `git-commit`, `code-review`, `testing`) are
-    /// filtered out by the container manager before prompt assembly.
+    /// When false (the default), the coding-bundle skills
+    /// (`CODING_SKILL_NAMES` in the host's container manager: `coding-task`,
+    /// `git-commit`, `code-review`, `testing`, `architecture`, `databases`)
+    /// are filtered out by the container manager before prompt assembly.
     /// Acts as a cap on `SkillsSelector::All`; explicit selector lists
     /// are honoured as-is.
     pub coding_enabled: bool,
@@ -826,9 +827,9 @@ pub fn get_resource_limits(
 
 /// Narrow setter for the per-group `coding_enabled` flag.
 ///
-/// Toggles whether the four coding-bundle skills (`coding-task`,
-/// `git-commit`, `code-review`, `testing`) are visible to this group's
-/// agent. The container manager treats the flag as a cap on
+/// Toggles whether the coding-bundle skills (`coding-task`,
+/// `git-commit`, `code-review`, `testing`, `architecture`, `databases`)
+/// are visible to this group's agent. The container manager treats the flag as a cap on
 /// `SkillsSelector::All` — when off, the coding names are filtered out
 /// of the assembled prompt and `skills.json`. Explicit selector lists
 /// are honoured as-is regardless of this flag.

@@ -9,8 +9,8 @@ description: HTTP GET or POST a URL from inside the container with the web_fetch
 container and returns the response. URL → body pipe without `shell
 curl`.
 
-You need the URL already. To discover URLs, use `web_search`, ask the
-user, or consult an MCP server.
+You need the URL already. To discover URLs, use `web_search` (see
+[[web-search]]), ask the user, or consult an MCP server.
 
 ## Schema
 
@@ -28,8 +28,9 @@ user, or consult an MCP server.
 - `method` (optional). `GET` (default) or `POST`. Other verbs are a
   validation error — use `shell curl` for PATCH/PUT/DELETE.
 - `body` (optional, POST). Sent as the request body as-is; no
-  Content-Type is set automatically. If the server requires one (most
-  JSON APIs do), set `Content-Type` yourself via `headers`.
+  Content-Type is set automatically and there is no headers field. If
+  the server requires a specific Content-Type (most JSON APIs do), use
+  `shell curl -H 'Content-Type: ...'` instead.
 - `timeout_secs` (optional). Default 30s, ceiling 120s.
 - `raw` (optional). True returns response body bytes unmodified for
   HTML. Default false converts HTML→markdown.
@@ -54,16 +55,19 @@ non-HTML responses are returned as-is regardless of `raw`.
 
 ## Output limits
 
-Response body capped at 256 KiB. Larger responses truncate at a UTF-8
-char boundary. Result has `truncated`, `size_bytes`.
+Response body capped at 16 KiB (~4k tokens). Larger responses truncate
+at a UTF-8 char boundary with `truncated: true`. For full-page
+extraction beyond the cap, `shell curl` and pipe through `head -c` /
+`grep` for the section you need.
 
 ## Result shape
 
 ```json
 {
   "url": "https://api.example.com/v1/items",
+  "method": "GET",
   "status": 200,
-  "headers": { "content-type": "application/json", "...": "..." },
+  "content_type": "application/json",
   "body": "...",
   "size_bytes": 1421,
   "truncated": false,
@@ -71,11 +75,17 @@ char boundary. Result has `truncated`, `size_bytes`.
 }
 ```
 
+Full response headers are NOT surfaced (a single CSP / Set-Cookie
+header can be tens of KiB) — only `status` and `content_type`. When
+you need headers, use `shell curl -I`.
+
 ## Egress allow-list interaction
 
 `container_configs.egress_allow` restricts outbound network. Off-list
 hosts fail with a connection error — the tool doesn't pre-validate;
-it trusts the runtime's policy.
+it trusts the runtime's policy. Separately, an SSRF guard rejects URLs
+whose host resolves to loopback / link-local / private (RFC1918)
+addresses before any socket opens, and re-checks every redirect hop.
 
 Network error on a URL that "should" work → almost always the
 allow-list. Ask the operator to add the host, or use an MCP server
