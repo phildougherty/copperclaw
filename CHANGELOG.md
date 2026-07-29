@@ -113,7 +113,14 @@ of everything that went into 0.1.0 is preserved below under
   `std::env::temp_dir()` sits under `/var/folders/…` and `/var` is a
   symlink to `/private/var` — the validator correctly flagged the
   test's own scaffolding as `SymlinkInPath`; the helper canonicalizes
-  now.
+  now. (5) `typing_ticker`'s run-loop test slept 75ms of *wall* time
+  against a 20ms interval and asserted at least three ticks — really an
+  assertion about how much a loaded runner gets done in 75ms, which
+  macOS CI lost at 2 of 3; it runs on a paused clock now and asserts
+  exactly three. (6) both image-retention tests asserted "the newest
+  survives" while retention only guarantees that when mtimes differ,
+  so a tight write loop left the outcome to a random filename
+  tie-break; the files now get strictly increasing mtimes.
 - **CI reports every failing crate instead of only the first.** The
   workflow ran `cargo test --workspace --locked` without
   `--no-fail-fast`, so cargo stopped at the first failing test binary —
