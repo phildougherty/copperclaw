@@ -9825,8 +9825,22 @@ mod tests {
     fn save_mcp_image_enforces_retention_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let mut last = String::new();
-        for _ in 0..(MCP_IMAGE_RETAIN + 5) {
+        for i in 0..(MCP_IMAGE_RETAIN + 5) {
             last = save_mcp_image(tmp.path(), "image/png", TINY_PNG_B64).unwrap();
+            // Stamp a strictly increasing mtime. Retention orders by mtime
+            // and only falls back to the (random) filename for exact ties,
+            // so writes landing in the same clock tick — likely in a loop
+            // this tight — would otherwise make "the newest survives" a
+            // coin flip rather than the property under test.
+            let f = std::fs::File::options()
+                .write(true)
+                .open(tmp.path().join(&last))
+                .unwrap();
+            f.set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_000 + i as u64),
+            )
+            .unwrap();
         }
         let names: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
