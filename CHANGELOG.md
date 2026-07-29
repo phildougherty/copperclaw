@@ -69,6 +69,22 @@ of everything that went into 0.1.0 is preserved below under
   tunnels; `unknown_sender_policy` is enforced at the sender gate;
   task capability grants are operator-revocable (`cclaw grants`).
 
+### Fixed
+
+- **The test suite is green on both CI platforms for the first time.**
+  Two long-standing failures kept `main` red: (1) the replay harness's
+  four `cli/prototype-*` fixtures hard-coded Linux-only shell output —
+  macOS bash omits the `line 1: ` prefix in its `/data/.shell_state`
+  error and macOS resolves `/tmp` to `/private/tmp`, so 5 fixture tests
+  failed on every macOS run; both are now normalized via manifest
+  substitutions. (2) `f5_thinking_frame_posts_after_threshold_via_run_loop`
+  was racy under the paused clock: it hand-drove `tokio::time::advance`
+  after a fixed 64-yield "settle", so when the HUD ticker armed after
+  the advance its 6s threshold ran from the advanced clock and the
+  frame posted at t=11, failing the assertion. Both F5 tests now sleep
+  instead — under `start_paused` the clock only auto-advances once
+  every task is parked, which orders arming before the clock moves.
+
 ### Known limitations
 
 - `mattermost`, `line`, and generic `webhooks` bind an OS-assigned

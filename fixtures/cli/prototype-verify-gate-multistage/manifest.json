@@ -15,7 +15,8 @@
     "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
     "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
     "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
-    "bash: line 1: /data/\\.shell_state: [A-Za-z ]+": "<SHELL_STATE_NOISE>",
-    "fatal: unable to get current working directory: [A-Za-z ]+": "<SHELL_STATE_NOISE>"
+    "bash: (line 1: )?/data/\\.shell_state: [A-Za-z ]+": "<SHELL_STATE_NOISE>",
+    "fatal: unable to get current working directory: [A-Za-z ]+": "<SHELL_STATE_NOISE>",
+    "/private/tmp/": "/tmp/"
   }
 }

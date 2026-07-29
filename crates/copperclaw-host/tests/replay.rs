@@ -2074,14 +2074,6 @@ async fn f5_build(
     (deps, outbound)
 }
 
-/// Yield repeatedly so spawned tasks (the HUD ticker, the `run_loop` task)
-/// can make progress under the paused clock between `advance` calls.
-async fn f5_settle() {
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-}
-
 /// Snapshot the session's outbound `Breadcrumb`-kind rows via a fresh read
 /// connection (the runner holds its own write handle).
 fn f5_breadcrumb_summaries(paths: &copperclaw_db::session::SessionPaths) -> Vec<String> {
@@ -2114,14 +2106,19 @@ async fn f5_thinking_frame_posts_after_threshold_via_run_loop() {
     let (deps, _outbound) = f5_build(&paths, std::time::Duration::from_secs(300)).await;
 
     let handle = tokio::spawn(run_loop(deps));
-    // Let run_loop reach `drive_turn` (arm the HUD ticker) and park on the
-    // provider's pure-reasoning sleep before we touch the clock.
-    f5_settle().await;
 
+    // Sleep rather than `advance()`: under `start_paused` the clock only
+    // auto-advances once every task is parked on a timer, so sleeping
+    // guarantees run_loop has reached `drive_turn`, armed the HUD ticker
+    // (starting its threshold at t=0) and parked on the provider's
+    // reasoning sleep before time moves. Hand-driving the clock after a
+    // fixed yield count raced: when `arm()` landed after the advance, the
+    // 6s threshold ran from the advanced clock and the frame posted at
+    // t=11, so this test saw zero frames.
+    //
     // Just before the threshold: nothing has posted — a fast turn would
     // have finalized by now and stayed byte-stable.
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
-    f5_settle().await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert!(
         f5_breadcrumb_summaries(&paths).is_empty(),
         "no HUD frame may post before the {}s thinking threshold",
@@ -2129,9 +2126,9 @@ async fn f5_thinking_frame_posts_after_threshold_via_run_loop() {
     );
 
     // Past the threshold: exactly one "thinking…" breadcrumb chip posts,
-    // even though no tool has run yet.
-    tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    f5_settle().await;
+    // even though no tool has run yet. (The ticker's next edit is a full
+    // `edit_interval` out, well past this wake.)
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let summaries = f5_breadcrumb_summaries(&paths);
     assert_eq!(
         summaries.len(),
@@ -2145,8 +2142,7 @@ async fn f5_thinking_frame_posts_after_threshold_via_run_loop() {
     );
 
     // Let the reasoning wait elapse; the turn answers and run_loop returns.
-    tokio::time::advance(std::time::Duration::from_secs(300)).await;
-    f5_settle().await;
+    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     handle.await.expect("run_loop task").expect("run_loop ok");
 
     // The thinking frame did not dangle: finalize collapsed it to a
@@ -2207,13 +2203,11 @@ async fn f5_fast_turn_posts_no_thinking_frame_via_run_loop() {
     let (deps, _outbound) = f5_build(&paths, std::time::Duration::ZERO).await;
 
     let handle = tokio::spawn(run_loop(deps));
-    f5_settle().await;
     handle.await.expect("run_loop task").expect("run_loop ok");
 
-    // Advance well past the threshold to prove the aborted ticker is truly
+    // Sleep well past the threshold to prove the aborted ticker is truly
     // dead and never fires a late frame.
-    tokio::time::advance(std::time::Duration::from_secs(30)).await;
-    f5_settle().await;
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
     assert!(
         f5_breadcrumb_summaries(&paths).is_empty(),
