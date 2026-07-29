@@ -1057,6 +1057,14 @@ pub mod write_file {
             f.write_all(&bytes).await.map_err(|e| {
                 ToolError::Internal(format!("write_file({}) append: {e}", path.display()))
             })?;
+            // `tokio::fs::File` does NOT flush on drop — unlike `std::fs::File`,
+            // buffered bytes are silently discarded if the handle is dropped
+            // with a write still in flight. Without this the append can appear
+            // to succeed (Ok returned, breadcrumb emitted) while the tail of
+            // the agent's data never reaches the file.
+            f.flush().await.map_err(|e| {
+                ToolError::Internal(format!("write_file({}) append flush: {e}", path.display()))
+            })?;
         } else {
             tokio::fs::write(&path, &bytes)
                 .await
@@ -2270,11 +2278,17 @@ mod tests {
         assert!(body.contains("\"truncated\": false"), "got: {body}");
     }
 
+    /// Each append must be on disk by the time the call returns — a
+    /// `tokio::fs::File` dropped without a flush discards buffered bytes,
+    /// which showed up as an append that "succeeded" while its data never
+    /// landed. Reading back after every write (rather than only at the
+    /// end) makes that loss deterministic to catch instead of a flake.
     #[tokio::test]
     async fn write_file_append_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.txt");
-        for line in ["one\n", "two\n"] {
+        let mut want = String::new();
+        for line in ["one\n", "two\n", "three\n", "four\n"] {
             write_file::handle(
                 Some(
                     json!({
@@ -2290,9 +2304,13 @@ mod tests {
             )
             .await
             .unwrap();
+            want.push_str(line);
+            let got = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                got, want,
+                "append of {line:?} must be on disk when it returns"
+            );
         }
-        let got = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(got, "one\ntwo\n");
     }
 
     /// Append-mode writes intentionally skip the diff-card emit —

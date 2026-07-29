@@ -6,6 +6,146 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-07-29
+
+First tagged release. Copperclaw is a self-hosted Rust runtime for
+Claude-style agents: one Linux container per session, brokered by a
+host that wires 21 messaging-channel adapters into an inbound router
+and an outbound delivery loop. Four binaries ship in this release —
+the host (`copperclaw`), the admin client (`cclaw`), the setup wizard
+(`copperclaw-setup`), and the in-container agent (`copperclaw-runner`).
+
+This section is a summary; the complete milestone-by-milestone record
+of everything that went into 0.1.0 is preserved below under
+"Development log".
+
+### Added
+
+- **21 channel adapters**: Telegram, Slack, Discord, Matrix, Microsoft
+  Teams, Google Chat, Mattermost, LINE, Webex, WhatsApp Cloud, Signal,
+  Delta Chat, iMessage, WeChat Work, Emacs, X/Twitter, Linear, GitHub,
+  Resend, generic HMAC-signed webhooks, and a local `cli` channel.
+  Coverage varies per adapter — `docs/channels/` documents what each
+  one implements vs. returns as Unsupported.
+- **Container-per-session runtime.** Sessions are durable, containers
+  ephemeral. Host and container communicate over SQLite-on-bind-mount
+  (`inbound.db` / `outbound.db`) plus a central identity/wiring DB.
+  Per-group image baking with fingerprint-triggered rebuilds and
+  last-known-good fallback.
+- **51 in-tree agent tools** (plus an opt-in interactive browser and
+  host-brokered web previews): messaging, scheduling backed by a real
+  cron sweep, delegation and subagents (`delegate`, `explore`,
+  `create_agent` with agent-to-agent addressing), self-modification
+  (`install_packages`, `add_mcp_server`, `save_skill`), computer use,
+  read-only git inspection, multi-provider `web_search`, vision and
+  UI screenshotting, diagnostics and enforced self-review, persistent
+  memory, and session control (`compact_now`, `clear_history`).
+- **Multiple providers with failover**: Anthropic native (with prompt
+  caching), Anthropic-compatible gateways, Ollama, and Codex/OpenCode
+  subprocess bridges; ordered fallback chain with per-provider health
+  tracking, key rotation, and mid-session failover.
+- **Operator surface**: `cclaw` dashboard, `doctor` composite health
+  check with fix hints, audit log of every host mutation, per-group
+  token and dollar budgets with enforcement gates, sender approvals,
+  dead-letter inspection and replay, Prometheus metrics, log rotation,
+  SIGHUP secret rotation, central-DB backup/restore, and a
+  differential replay-fixture harness pinning the full pipeline for 11
+  of the 21 channels.
+- **Skills system**: discovery, validation, container
+  materialization, and per-group relevance selection (`all` /
+  `relevant` / explicit allow-list).
+
+### Security
+
+- Hardened container boundary: tool-policy engine with a
+  provenance/taint gate on untrusted input (with an operator
+  fresh-approval route), opt-in deny-default egress with per-group
+  allow-lists, mention gating and DM pairing, and a credential broker
+  that keeps long-lived secrets out of the container environment.
+- Public-tunnel previews require nonce-scoped, fail-closed,
+  single-use approvals; `preview_enabled=false` tears down live
+  tunnels; `unknown_sender_policy` is enforced at the sender gate;
+  task capability grants are operator-revocable (`cclaw grants`).
+
+### Fixed
+
+- **`write_file(append: true)` could silently lose the appended data.**
+  The append path wrote through a `tokio::fs::File` and dropped it
+  without flushing. Unlike `std::fs::File`, tokio's file discards
+  buffered bytes when the handle is dropped with a write still in
+  flight — so the call returned `Ok` and emitted its breadcrumb while
+  the tail of the agent's data never reached disk. Now flushed before
+  return, matching the rule `run/services.rs::append_log` already
+  documents. Surfaced as an intermittent macOS CI failure.
+- **Symbol indexing was silently dead on macOS hosts, and
+  `find_symbol`'s on-demand tier spawned a ctags that cannot work.**
+  Both ctags call sites — `find_symbol`'s on-demand tier and the
+  runner's `run/lsp.rs` index builder — accepted any binary named
+  `ctags`. macOS ships BSD ctags at `/usr/bin/ctags`, which rejects the
+  `--recurse` / `--fields=+n` flags both pass, so on a macOS host the
+  index build could only ever fail (degrading to no index at all) and
+  the on-demand tier wasted an exec before falling through to grep.
+  Discovery now gates on `--version` announcing Universal or Exuberant
+  ctags, and `run/lsp.rs` delegates to the same probe so the two call
+  sites cannot drift.
+- **The test suite is green on both CI platforms for the first time.**
+  Two long-standing failures kept `main` red: (1) the replay harness's
+  four `cli/prototype-*` fixtures hard-coded Linux-only shell output —
+  macOS bash omits the `line 1: ` prefix in its `/data/.shell_state`
+  error and macOS resolves `/tmp` to `/private/tmp`, so 5 fixture tests
+  failed on every macOS run; both are now normalized via manifest
+  substitutions. (2) `f5_thinking_frame_posts_after_threshold_via_run_loop`
+  was racy under the paused clock: it hand-drove `tokio::time::advance`
+  after a fixed 64-yield "settle", so when the HUD ticker armed after
+  the advance its 6s threshold ran from the advanced clock and the
+  frame posted at t=11, failing the assertion. Both F5 tests now sleep
+  instead — under `start_paused` the clock only auto-advances once
+  every task is parked, which orders arming before the clock moves.
+  (3) `compact_now` / `clear_history` / `sentinel` unit tests each set
+  the same process-global sentinel-dir override without holding the
+  serialising lock `sentinel::tests` already had, so concurrent tests
+  clobbered each other's tempdir; the guard is now a shared
+  `sentinel::test_support::OverrideGuard` every caller holds.
+  (4) `mount_security`'s test scratch dir was handed to
+  `validate_mount_target` uncanonicalized, so on macOS — where
+  `std::env::temp_dir()` sits under `/var/folders/…` and `/var` is a
+  symlink to `/private/var` — the validator correctly flagged the
+  test's own scaffolding as `SymlinkInPath`; the helper canonicalizes
+  now. (5) `typing_ticker`'s run-loop test slept 75ms of *wall* time
+  against a 20ms interval and asserted at least three ticks — really an
+  assertion about how much a loaded runner gets done in 75ms, which
+  macOS CI lost at 2 of 3; it runs on a paused clock now and asserts
+  exactly three. (6) both image-retention tests asserted "the newest
+  survives" while retention only guarantees that when mtimes differ,
+  so a tight write loop left the outcome to a random filename
+  tie-break; the files now get strictly increasing mtimes.
+- **CI reports every failing crate instead of only the first.** The
+  workflow ran `cargo test --workspace --locked` without
+  `--no-fail-fast`, so cargo stopped at the first failing test binary —
+  which is why a platform-specific break surfaced one crate per run and
+  each fix revealed the next. It now matches the gate `CLAUDE.md`
+  documents for local runs.
+
+### Known limitations
+
+- `mattermost`, `line`, and generic `webhooks` bind an OS-assigned
+  port by default — pin a stable `port` before fronting with a
+  reverse proxy.
+- The replay-fixture capture pipeline is design-only; fixtures are
+  hand-authored (see `docs/replay-fixtures.md`).
+- Setup's interactive channel pairing wizard covers Telegram only;
+  other channels land via `cclaw messaging-groups create` +
+  `cclaw wirings create` after setup.
+- `docs/cutover.md`'s migrator copies the central DB only; per-session
+  DBs must be moved by hand.
+
+## Development log — the road to 0.1.0
+
+Everything below is the full pre-release record, kept verbatim from
+the development period. Newest first.
+
 ### Added (M24 — unlock wave)
 
 - **Skill-relevance selection is operator-reachable.** The M22 S2
@@ -10334,4 +10474,5 @@ prompt is unchanged.
   `docs/replay-fixtures.md` but the in-tree harness and captured
   fixtures are not yet committed.
 
-[Unreleased]: https://github.com/phildougherty/copperclaw/compare/v0.0.0...HEAD
+[Unreleased]: https://github.com/phildougherty/copperclaw/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/phildougherty/copperclaw/releases/tag/v0.1.0

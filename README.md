@@ -6,10 +6,11 @@ into a router on the inbound side and a delivery loop on the outbound
 side. An admin client (`cclaw`) and a setup wizard (`copperclaw-setup`)
 live alongside the host binary (`copperclaw`).
 
-Written in Rust. Pre-1.0 — no tagged releases yet, no prebuilt binary
-artifacts, install path is `cargo install --git` until the first tag
-lands. Works end-to-end against any Anthropic-API-compatible provider.
-Rough edges noted in [What's rough](#whats-rough).
+Written in Rust. Pre-1.0. Prebuilt binaries for Linux and macOS ship
+with each tagged release; `install.sh` fetches the latest tarball and
+falls back to building from source. Works end-to-end against any
+Anthropic-API-compatible provider. Rough edges noted in
+[What's rough](#whats-rough).
 
 ```
 > What's the capital of France? One word only.
@@ -103,9 +104,6 @@ agent> Boxes hold the world,
 
 Honest list of things that exist but aren't polished:
 
-- **No tagged release yet.** The one-line `curl | bash` install
-  currently falls through to `cargo install --git`; prebuilt
-  tarballs land with the first `v0.x.y` tag.
 - **`mattermost`, `line`, and `webhooks` (generic) bind to an
   OS-assigned port by default** — pin a stable `port` in the channel
   config before fronting them with a reverse proxy.
@@ -126,11 +124,11 @@ See [`docs/plans/`](docs/plans/) for tracked follow-ups.
 
 ## Install
 
-> **Pre-1.0.** No tagged releases yet, so the install script currently
-> falls through to building from source. You need the Rust toolchain
-> (1.85+) installed before the one-liner below will work end-to-end.
-> Prebuilt tarballs land with the first `v0.x.y` tag — see
-> [`docs/release-checklist.md`](docs/release-checklist.md).
+> **Pre-1.0.** Prebuilt tarballs are published with each `v0.x.y` tag
+> on the [Releases page](https://github.com/phildougherty/copperclaw/releases);
+> the install script fetches the latest one for your platform. If no
+> tarball matches (or you're on a fork without releases), it falls back
+> to building from source, which needs the Rust toolchain (1.85+).
 
 One command, on Linux or macOS:
 
@@ -145,9 +143,8 @@ What it does:
    tells you what to install).
 3. Installs `copperclaw`, `cclaw`, and `copperclaw-setup` to `~/.local/bin`.
    The script tries three strategies in order: (a) prebuilt release
-   tarball from GitHub Releases — 404s until the first tag; (b)
-   `cargo install --git` — this is the path that works today;
-   (c) from inside a checkout, `cargo install --path`.
+   tarball from GitHub Releases; (b) `cargo install --git` (needs the
+   Rust toolchain); (c) from inside a checkout, `cargo install --path`.
 4. Launches `copperclaw-setup` to walk provider credentials, the data
    directory, and the first channel.
 

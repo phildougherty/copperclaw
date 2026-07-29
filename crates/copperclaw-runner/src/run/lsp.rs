@@ -133,12 +133,16 @@ fn available_language_server(repo: &Path) -> Option<&'static str> {
         .map(|_| fit.name)
 }
 
-/// Locate a `ctags` binary on `PATH`, if any.
+/// Locate a `ctags` binary on `PATH` that understands the flags
+/// [`run_ctags_index`] passes.
+///
+/// Delegates to the MCP `find_symbol` probe so both ctags call sites
+/// agree on what counts as usable. A bare PATH lookup is not enough:
+/// macOS ships BSD ctags at `/usr/bin/ctags`, which rejects `--recurse`
+/// and `--fields=+n`, so accepting it left symbol indexing spawning a
+/// process that could only ever fail.
 fn ctags_on_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("ctags"))
-        .find(|c| c.is_file())
+    copperclaw_mcp::tools::find_symbol::ctags_on_path()
 }
 
 /// Build (or refresh) the symbol index for `repo`.

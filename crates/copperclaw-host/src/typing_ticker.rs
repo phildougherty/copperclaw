@@ -626,7 +626,12 @@ mod tests {
         assert_eq!(ticker.tick(), 0);
     }
 
-    #[tokio::test]
+    /// Paused clock on purpose: the runtime advances time only once every
+    /// task is parked, so 75ms of virtual time against a 20ms interval is
+    /// exactly three ticks. Against the real clock this asserted "however
+    /// many ticks a runner managed in 75ms of wall time", which a loaded
+    /// macOS CI box lost (2 of 3).
+    #[tokio::test(start_paused = true)]
     async fn run_loop_fires_repeatedly_until_shutdown() {
         let (tmp, central) = fresh_central();
         let _s = make_running_session_with_pending(&central, tmp.path(), "telegram");
@@ -643,13 +648,17 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(Arc::clone(&ticker).run_loop(cancel.clone()));
 
-        // ~3 ticks in 75ms.
+        // Ticks land at 20ms, 40ms and 60ms; the loop is parked until 80ms
+        // when this wakes at 75ms and cancels.
         tokio::time::sleep(Duration::from_millis(75)).await;
         cancel.cancel();
         task.await.unwrap();
 
         let n = mock.typing_calls.lock().unwrap().len();
-        assert!(n >= 3, "expected at least 3 ticks, got {n}");
+        assert_eq!(
+            n, 3,
+            "expected exactly 3 ticks in 75ms at a 20ms interval, got {n}"
+        );
     }
 
     #[test]

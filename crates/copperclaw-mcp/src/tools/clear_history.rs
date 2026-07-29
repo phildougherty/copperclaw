@@ -63,17 +63,13 @@ pub fn entry() -> ToolEntry {
 mod tests {
     use super::*;
     use crate::context::MockToolContext;
-    use crate::tools::sentinel::{
-        sentinel_dir_test_override_clear, sentinel_dir_test_override_set,
-    };
+    use crate::tools::sentinel::test_support::OverrideGuard;
 
     #[tokio::test]
     async fn writes_sentinel_file() {
-        let td = tempfile::tempdir().unwrap();
-        sentinel_dir_test_override_set(td.path().to_path_buf());
+        let g = OverrideGuard::new();
         let ctx = MockToolContext::new();
         let _ = handle(None, &ctx).await.unwrap();
-        assert!(td.path().join(".history_clear_pending").exists());
-        sentinel_dir_test_override_clear();
+        assert!(g.path().join(".history_clear_pending").exists());
     }
 }
