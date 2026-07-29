@@ -496,15 +496,36 @@ fn normalise_kind(kind: Option<&str>) -> Option<String> {
 // ── on-demand ctags ──────────────────────────────────────────────────────
 
 /// Locate a `ctags` binary on `PATH`, if any.
+/// Locate a ctags binary that actually understands the flags
+/// [`run_ctags_stdout`] passes.
+///
+/// A bare PATH lookup is not enough: macOS ships BSD ctags at
+/// `/usr/bin/ctags`, which rejects `--recurse` / `--fields=+n` outright.
+/// Accepting it meant the on-demand tier spawned a process that could
+/// only ever fail before falling through to the grep tier. Gate on
+/// `--version` announcing Universal or Exuberant ctags — the two
+/// implementations whose flags we use.
 fn ctags_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("ctags");
-        if candidate.is_file() {
+        if candidate.is_file() && ctags_is_compatible(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+/// True when `bin --version` identifies a Universal/Exuberant ctags.
+fn ctags_is_compatible(bin: &Path) -> bool {
+    let Ok(output) = std::process::Command::new(bin).arg("--version").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let banner = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    banner.contains("universal ctags") || banner.contains("exuberant ctags")
 }
 
 /// Run `ctags` over `root`, emitting the index to stdout (`-f -`) so we

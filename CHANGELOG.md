@@ -71,6 +71,20 @@ of everything that went into 0.1.0 is preserved below under
 
 ### Fixed
 
+- **`write_file(append: true)` could silently lose the appended data.**
+  The append path wrote through a `tokio::fs::File` and dropped it
+  without flushing. Unlike `std::fs::File`, tokio's file discards
+  buffered bytes when the handle is dropped with a write still in
+  flight — so the call returned `Ok` and emitted its breadcrumb while
+  the tail of the agent's data never reached disk. Now flushed before
+  return, matching the rule `run/services.rs::append_log` already
+  documents. Surfaced as an intermittent macOS CI failure.
+- **`find_symbol`'s on-demand ctags tier no longer spawns a ctags that
+  cannot work.** `ctags_on_path` accepted any binary named `ctags`, but
+  macOS ships BSD ctags at `/usr/bin/ctags`, which rejects the
+  `--recurse` / `--fields=+n` flags the tier passes; the exec could
+  only ever fail before falling through to the grep tier. Discovery now
+  gates on `--version` announcing Universal or Exuberant ctags.
 - **The test suite is green on both CI platforms for the first time.**
   Two long-standing failures kept `main` red: (1) the replay harness's
   four `cli/prototype-*` fixtures hard-coded Linux-only shell output —
@@ -84,6 +98,11 @@ of everything that went into 0.1.0 is preserved below under
   frame posted at t=11, failing the assertion. Both F5 tests now sleep
   instead — under `start_paused` the clock only auto-advances once
   every task is parked, which orders arming before the clock moves.
+  (3) `compact_now` / `clear_history` / `sentinel` unit tests each set
+  the same process-global sentinel-dir override without holding the
+  serialising lock `sentinel::tests` already had, so concurrent tests
+  clobbered each other's tempdir; the guard is now a shared
+  `sentinel::test_support::OverrideGuard` every caller holds.
 
 ### Known limitations
 

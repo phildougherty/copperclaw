@@ -57,6 +57,55 @@ fn sentinel_dir_test_override() -> Option<PathBuf> {
     None
 }
 
+/// Serialised access to the process-global override above.
+///
+/// The override is one static shared by the whole test binary, and cargo
+/// runs unit tests on a multi-threaded scheduler — so any two tests that
+/// set it concurrently race, and the loser sees the winner's tempdir (or
+/// a cleared override) and fails to find its sentinel. Every test that
+/// touches the override must hold [`OverrideGuard`], which owns both the
+/// lock and the tempdir for its lifetime and clears the override on drop.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Holds the `MutexGuard` as a field rather than a local so clippy's
+    /// `await_holding_lock` is satisfied — the guard's lifetime otherwise
+    /// straddles every `.await` in the test body.
+    pub(crate) struct OverrideGuard {
+        dir: tempfile::TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    fn lock() -> &'static Mutex<()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+    }
+
+    impl OverrideGuard {
+        pub(crate) fn new() -> Self {
+            let lock = lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            super::sentinel_dir_test_override_set(dir.path().to_path_buf());
+            Self { dir, _lock: lock }
+        }
+
+        /// The tempdir the override points at — where sentinels land.
+        pub(crate) fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            super::sentinel_dir_test_override_clear();
+        }
+    }
+}
+
 /// Resolve the directory sentinels are dropped in. Production: `/data`.
 /// Operators can override via `COPPERCLAW_SENTINEL_DIR`. Tests install a
 /// per-fixture tempdir via the `OnceLock` above.
@@ -93,43 +142,7 @@ pub async fn drop_sentinel(name: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Serialise tests against the process-global override. Same pattern
-    /// as `load_skill::tests::CatalogueGuard` — the guard struct holds
-    /// the `MutexGuard` as a field rather than as a local so clippy's
-    /// `await_holding_lock` lint is satisfied; tokio runs unit tests on
-    /// a multi-threaded scheduler, so the guard's lifetime would
-    /// otherwise straddle every `.await` in the test body.
-    struct OverrideGuard {
-        _dir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    fn lock() -> &'static Mutex<()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-    }
-
-    impl OverrideGuard {
-        fn new() -> Self {
-            let lock = lock()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = tempfile::tempdir().expect("tempdir");
-            sentinel_dir_test_override_set(dir.path().to_path_buf());
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for OverrideGuard {
-        fn drop(&mut self) {
-            sentinel_dir_test_override_clear();
-        }
-    }
+    use test_support::OverrideGuard;
 
     #[tokio::test]
     async fn drop_sentinel_writes_dotfile_under_dir() {
