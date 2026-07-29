@@ -936,10 +936,10 @@ The five highest-impact items from the prior list landed in
 earlier slices; the M11 acceptance gate landed in this slice. The
 remaining items, ranked:
 
-1. **Release 0.1.0**. Cut the tag, bump
-   `workspace.package.version`, publish release notes from
-   `CHANGELOG.md`. With the replay harness landed the candidate
-   status in README can flip to a real release. _(M11)_
+1. **Release 0.1.0** — LANDED 2026-07-29. Tag `v0.1.0` cut from
+   `main` post-M24; release notes are the curated `[0.1.0]` section
+   in `CHANGELOG.md`; prebuilt tarballs published by
+   `.github/workflows/release.yml`; `main` bumped to `0.2.0-dev`.
 
 2. **Grow the fixture suite.** The first cli fixture proves the
    harness works end-to-end, but the suite has real value only

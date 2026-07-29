@@ -6,6 +6,87 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-07-29
+
+First tagged release. Copperclaw is a self-hosted Rust runtime for
+Claude-style agents: one Linux container per session, brokered by a
+host that wires 21 messaging-channel adapters into an inbound router
+and an outbound delivery loop. Four binaries ship in this release —
+the host (`copperclaw`), the admin client (`cclaw`), the setup wizard
+(`copperclaw-setup`), and the in-container agent (`copperclaw-runner`).
+
+This section is a summary; the complete milestone-by-milestone record
+of everything that went into 0.1.0 is preserved below under
+"Development log".
+
+### Added
+
+- **21 channel adapters**: Telegram, Slack, Discord, Matrix, Microsoft
+  Teams, Google Chat, Mattermost, LINE, Webex, WhatsApp Cloud, Signal,
+  Delta Chat, iMessage, WeChat Work, Emacs, X/Twitter, Linear, GitHub,
+  Resend, generic HMAC-signed webhooks, and a local `cli` channel.
+  Coverage varies per adapter — `docs/channels/` documents what each
+  one implements vs. returns as Unsupported.
+- **Container-per-session runtime.** Sessions are durable, containers
+  ephemeral. Host and container communicate over SQLite-on-bind-mount
+  (`inbound.db` / `outbound.db`) plus a central identity/wiring DB.
+  Per-group image baking with fingerprint-triggered rebuilds and
+  last-known-good fallback.
+- **51 in-tree agent tools** (plus an opt-in interactive browser and
+  host-brokered web previews): messaging, scheduling backed by a real
+  cron sweep, delegation and subagents (`delegate`, `explore`,
+  `create_agent` with agent-to-agent addressing), self-modification
+  (`install_packages`, `add_mcp_server`, `save_skill`), computer use,
+  read-only git inspection, multi-provider `web_search`, vision and
+  UI screenshotting, diagnostics and enforced self-review, persistent
+  memory, and session control (`compact_now`, `clear_history`).
+- **Multiple providers with failover**: Anthropic native (with prompt
+  caching), Anthropic-compatible gateways, Ollama, and Codex/OpenCode
+  subprocess bridges; ordered fallback chain with per-provider health
+  tracking, key rotation, and mid-session failover.
+- **Operator surface**: `cclaw` dashboard, `doctor` composite health
+  check with fix hints, audit log of every host mutation, per-group
+  token and dollar budgets with enforcement gates, sender approvals,
+  dead-letter inspection and replay, Prometheus metrics, log rotation,
+  SIGHUP secret rotation, central-DB backup/restore, and a
+  differential replay-fixture harness pinning the full pipeline for 11
+  of the 21 channels.
+- **Skills system**: discovery, validation, container
+  materialization, and per-group relevance selection (`all` /
+  `relevant` / explicit allow-list).
+
+### Security
+
+- Hardened container boundary: tool-policy engine with a
+  provenance/taint gate on untrusted input (with an operator
+  fresh-approval route), opt-in deny-default egress with per-group
+  allow-lists, mention gating and DM pairing, and a credential broker
+  that keeps long-lived secrets out of the container environment.
+- Public-tunnel previews require nonce-scoped, fail-closed,
+  single-use approvals; `preview_enabled=false` tears down live
+  tunnels; `unknown_sender_policy` is enforced at the sender gate;
+  task capability grants are operator-revocable (`cclaw grants`).
+
+### Known limitations
+
+- `mattermost`, `line`, and generic `webhooks` bind an OS-assigned
+  port by default — pin a stable `port` before fronting with a
+  reverse proxy.
+- The replay-fixture capture pipeline is design-only; fixtures are
+  hand-authored (see `docs/replay-fixtures.md`).
+- Setup's interactive channel pairing wizard covers Telegram only;
+  other channels land via `cclaw messaging-groups create` +
+  `cclaw wirings create` after setup.
+- `docs/cutover.md`'s migrator copies the central DB only; per-session
+  DBs must be moved by hand.
+
+## Development log — the road to 0.1.0
+
+Everything below is the full pre-release record, kept verbatim from
+the development period. Newest first.
+
 ### Added (M24 — unlock wave)
 
 - **Skill-relevance selection is operator-reachable.** The M22 S2
@@ -10334,4 +10415,5 @@ prompt is unchanged.
   `docs/replay-fixtures.md` but the in-tree harness and captured
   fixtures are not yet committed.
 
-[Unreleased]: https://github.com/phildougherty/copperclaw/compare/v0.0.0...HEAD
+[Unreleased]: https://github.com/phildougherty/copperclaw/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/phildougherty/copperclaw/releases/tag/v0.1.0
