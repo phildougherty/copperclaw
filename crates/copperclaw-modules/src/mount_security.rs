@@ -338,6 +338,14 @@ mod tests {
     }
 
     // Tiny tempdir helper (no `tempfile` dep available in this crate's deps).
+    /// A scratch dir with every symlink already resolved.
+    ///
+    /// Canonicalizing matters on macOS, where `std::env::temp_dir()` is
+    /// under `/var/folders/…` and `/var` is itself a symlink to
+    /// `/private/var`. Handing that raw path to `validate_mount_target`
+    /// makes it (correctly) report `SymlinkInPath` for the test's own
+    /// scaffolding, so tests that mean to exercise something else fail
+    /// on the platform's temp layout rather than on their subject.
     fn tempdir() -> PathBuf {
         let pid = std::process::id();
         let now = std::time::SystemTime::now()
@@ -347,6 +355,6 @@ mod tests {
         let name = format!("copperclaw-mount-test-{pid}-{now}");
         let p = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&p).unwrap();
-        p
+        std::fs::canonicalize(&p).unwrap_or(p)
     }
 }

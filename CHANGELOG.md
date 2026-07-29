@@ -79,12 +79,17 @@ of everything that went into 0.1.0 is preserved below under
   the tail of the agent's data never reached disk. Now flushed before
   return, matching the rule `run/services.rs::append_log` already
   documents. Surfaced as an intermittent macOS CI failure.
-- **`find_symbol`'s on-demand ctags tier no longer spawns a ctags that
-  cannot work.** `ctags_on_path` accepted any binary named `ctags`, but
-  macOS ships BSD ctags at `/usr/bin/ctags`, which rejects the
-  `--recurse` / `--fields=+n` flags the tier passes; the exec could
-  only ever fail before falling through to the grep tier. Discovery now
-  gates on `--version` announcing Universal or Exuberant ctags.
+- **Symbol indexing was silently dead on macOS hosts, and
+  `find_symbol`'s on-demand tier spawned a ctags that cannot work.**
+  Both ctags call sites — `find_symbol`'s on-demand tier and the
+  runner's `run/lsp.rs` index builder — accepted any binary named
+  `ctags`. macOS ships BSD ctags at `/usr/bin/ctags`, which rejects the
+  `--recurse` / `--fields=+n` flags both pass, so on a macOS host the
+  index build could only ever fail (degrading to no index at all) and
+  the on-demand tier wasted an exec before falling through to grep.
+  Discovery now gates on `--version` announcing Universal or Exuberant
+  ctags, and `run/lsp.rs` delegates to the same probe so the two call
+  sites cannot drift.
 - **The test suite is green on both CI platforms for the first time.**
   Two long-standing failures kept `main` red: (1) the replay harness's
   four `cli/prototype-*` fixtures hard-coded Linux-only shell output —
@@ -103,6 +108,18 @@ of everything that went into 0.1.0 is preserved below under
   serialising lock `sentinel::tests` already had, so concurrent tests
   clobbered each other's tempdir; the guard is now a shared
   `sentinel::test_support::OverrideGuard` every caller holds.
+  (4) `mount_security`'s test scratch dir was handed to
+  `validate_mount_target` uncanonicalized, so on macOS — where
+  `std::env::temp_dir()` sits under `/var/folders/…` and `/var` is a
+  symlink to `/private/var` — the validator correctly flagged the
+  test's own scaffolding as `SymlinkInPath`; the helper canonicalizes
+  now.
+- **CI reports every failing crate instead of only the first.** The
+  workflow ran `cargo test --workspace --locked` without
+  `--no-fail-fast`, so cargo stopped at the first failing test binary —
+  which is why a platform-specific break surfaced one crate per run and
+  each fix revealed the next. It now matches the gate `CLAUDE.md`
+  documents for local runs.
 
 ### Known limitations
 

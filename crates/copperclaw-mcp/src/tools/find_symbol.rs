@@ -505,7 +505,7 @@ fn normalise_kind(kind: Option<&str>) -> Option<String> {
 /// only ever fail before falling through to the grep tier. Gate on
 /// `--version` announcing Universal or Exuberant ctags — the two
 /// implementations whose flags we use.
-fn ctags_on_path() -> Option<PathBuf> {
+pub fn ctags_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("ctags");
